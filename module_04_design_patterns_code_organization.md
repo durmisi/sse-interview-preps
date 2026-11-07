@@ -750,6 +750,124 @@ public sealed class ShippedOrderState : IOrderState
 
 ---
 
+### 4.4 Command, Mediator, Observer & State Patterns in Modern C#
+
+#### Custom Lightweight Mediator & Command Pipeline with `IPipelineBehavior<TRequest, TResponse>`
+Understanding how an in-process **Command** and **Mediator** pipeline works under the hood demystifies libraries like MediatR and Wolverine. A request is modeled as an immutable **Command** object (`IRequest<TResponse>`), dispatched through a reverse-folded chain of `IPipelineBehavior<TRequest, TResponse>` wrappers (Chain of Responsibility) before reaching the single `IRequestHandler<TRequest, TResponse>`.
+
+```csharp
+public interface IRequest<out TResponse>;
+
+public interface IRequestHandler<in TRequest, TResponse>
+    where TRequest : IRequest<TResponse>
+{
+    Task<TResponse> HandleAsync(TRequest request, CancellationToken ct);
+}
+
+public delegate Task<TResponse> RequestHandlerContinuation<TResponse>();
+
+public interface IPipelineBehavior<in TRequest, TResponse>
+    where TRequest : notnull
+{
+    Task<TResponse> HandleAsync(
+        TRequest request,
+        RequestHandlerContinuation<TResponse> next,
+        CancellationToken ct);
+}
+
+// Lightweight Russian-Doll Pipeline Executor
+public sealed class LightweightCommandBus(IServiceProvider serviceProvider)
+{
+    public Task<TResponse> SendAsync<TRequest, TResponse>(TRequest request, CancellationToken ct)
+        where TRequest : IRequest<TResponse>
+    {
+        var handler = serviceProvider.GetRequiredService<IRequestHandler<TRequest, TResponse>>();
+        var behaviors = serviceProvider.GetServices<IPipelineBehavior<TRequest, TResponse>>().Reverse();
+
+        RequestHandlerContinuation<TResponse> pipeline = () => handler.HandleAsync(request, ct);
+
+        foreach (var behavior in behaviors)
+        {
+            var currentBehavior = behavior;
+            var nextContinuation = pipeline;
+            pipeline = () => currentBehavior.HandleAsync(request, nextContinuation, ct);
+        }
+
+        return pipeline();
+    }
+}
+```
+
+#### Observer Pattern & Why Classic C# `event` Leaks Memory (The Lapsed Listener Problem)
+The **Observer Pattern** establishes a one-to-many pub/sub dependency where a *Subject* notifies registered *Observers* of state changes.
+In C#, the `event` keyword compiles into a multicast delegate field on the publisher (`Subject`). When a subscriber executes `publisher.PriceChanged += OnPriceChanged;`, the publisher's internal invocation list stores a **strong GC reference** (`new EventHandler(subscriberInstance, methodPtr)`) pointing directly to the subscriber!
+
+```text
+[GC Root] ---> [Singleton Publisher] --(Strong Delegate Ref)--> [Scoped/Transient Subscriber] (LEAKED!)
+```
+
+- **The Lapsed Listener Trap:** If the **Publisher** has a longer lifetime than the **Subscriber** (e.g., a `Singleton` cache or event aggregator publishing C# `event` notifications to `Scoped` or `Transient` components), and the subscriber forgets to unsubscribe (`-=`) in `Dispose()`, the garbage collector **can never collect the subscriber**. Over thousands of requests, the heap fills with zombie subscribers and every event invocation gets progressively slower ($O(N)$ dead handlers).
+- **Modern .NET Remedies:**
+  1. Prefer `System.Threading.Channels.Channel<T>` or `IObservable<T>` (`IDisposable` subscription tokens) over raw C# `event` fields in backend services.
+  2. In desktop/UI scenarios (WPF/MAUI), use `WeakEventManager<TEventSource, TEventArgs>` so the publisher holds a `WeakReference` to the listener.
+
+#### Modern C# Pattern-Matching State Machine
+When state transitions do not require polymorphic dependency injection per state, modern C# tuple switch expressions express a deterministic **Finite State Machine (FSM)** in a single, auditable table with compile-time exhaustiveness checking:
+
+```csharp
+public enum SubscriptionState { Trial, Active, PastDue, Suspended, Cancelled }
+public enum SubscriptionTrigger { PayInvoice, PaymentFailed, GracePeriodExpired, CancelRequest }
+
+public static class SubscriptionStateMachine
+{
+    public static SubscriptionState Transition(SubscriptionState current, SubscriptionTrigger trigger) =>
+        (current, trigger) switch
+        {
+            (SubscriptionState.Trial,     SubscriptionTrigger.PayInvoice)         => SubscriptionState.Active,
+            (SubscriptionState.Trial,     SubscriptionTrigger.GracePeriodExpired) => SubscriptionState.Cancelled,
+            (SubscriptionState.Active,    SubscriptionTrigger.PayInvoice)         => SubscriptionState.Active,
+            (SubscriptionState.Active,    SubscriptionTrigger.PaymentFailed)      => SubscriptionState.PastDue,
+            (SubscriptionState.PastDue,   SubscriptionTrigger.PayInvoice)         => SubscriptionState.Active,
+            (SubscriptionState.PastDue,   SubscriptionTrigger.GracePeriodExpired) => SubscriptionState.Suspended,
+            (SubscriptionState.Suspended, SubscriptionTrigger.PayInvoice)         => SubscriptionState.Active,
+            (_,                           SubscriptionTrigger.CancelRequest)      => SubscriptionState.Cancelled,
+            _ => throw new InvalidOperationException(
+                $"Illegal state transition: cannot apply trigger '{trigger}' while in state '{current}'.")
+        };
+}
+```
+
+---
+
+### Section 4 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions & Model Answers
+
+**Q1: When you inject `IEnumerable<IDiscountStrategy>` into `DiscountCalculator`, what is the performance pitfall if there are 25 strategies and each strategy injects heavy dependencies?**
+> **Model Answer:**
+> Resolving `IEnumerable<IDiscountStrategy>` causes the DI container to **instantiate all 25 concrete strategy classes** and their entire transitive dependency graphs on every single scope/resolution, even though `strategies.FirstOrDefault(s => s.Tier == tier)` only uses **one** of them and discards the other 24!
+> Additionally, scanning the list linearly is $O(N)$.
+> **Senior Fix:**
+> 1. In .NET 8+, register strategies as **Keyed Services** (`builder.Services.AddKeyedScoped<IDiscountStrategy, VipDiscountStrategy>(CustomerTier.Vip)`) and resolve only the single matching strategy via `IServiceProvider.GetRequiredKeyedService<IDiscountStrategy>(tier)` inside a factory delegate.
+> 2. If strategies are stateless (`Singleton`), index them once at startup into a `FrozenDictionary<CustomerTier, IDiscountStrategy>` for $O(1)$ zero-allocation lookup.
+
+**Q2: Compare the classic OOP State Pattern (`IOrderState` classes) against a C# tuple-switch State Machine (`(state, trigger) switch`). When should you choose each?**
+> **Model Answer:**
+> - **Tuple-Switch State Machine:** Best when transitions are pure rules over enum/record states and you want to see the **entire transition matrix in one place** on a single screen. It has zero heap allocations and guarantees exhaustiveness at compile time.
+> - **OOP Polymorphic State Pattern (`IOrderState`):** Best when *each state has rich, distinct behavior across 5+ methods* or carries state-specific data (e.g., `ShippedState` requires a `TrackingNumber` and `ShippedAtUtc`, whereas `DraftState` does not). Using a discriminated union record hierarchy (`abstract record OrderState` with `sealed record DraftState`, `sealed record ShippedState(string TrackingNo)`) combines the best of both worlds.
+
+**Q3: Explain how the Lapsed Listener memory leak occurs in .NET and how you diagnose and fix it in production.**
+> **Model Answer:**
+> A Lapsed Listener leak occurs when a short-lived object (`Scoped` or `Transient`) subscribes to a standard C# `event` on a long-lived object (`Singleton`). Because multicast delegates store a strong reference to the target object (`Delegate.Target`), the `Singleton` roots the short-lived subscriber in the GC graph indefinitely unless `publisher.SomeEvent -= handler` is explicitly executed.
+> In production, a `dotnet-gcdump` or WinDbg `!dumpheap -stat` / `!gcroot` analysis reveals tens of thousands of live instances of the short-lived service all rooted by an `EventHandler[]` invocation array inside the singleton. The fix is either strict `IDisposable` unsubscription or replacing in-memory events with `Channel<T>` or scoped message dispatch.
+
+#### Practice Exercises
+
+1. **Zero-Allocation Strategy Lookup:** Refactor `DiscountCalculator` from Section 4.1 to use `FrozenDictionary<CustomerTier, IDiscountStrategy>` (.NET 8 `System.Collections.Frozen`) initialized once, and write a test asserting that registering two strategies for the same `CustomerTier` throws an explicit startup configuration exception rather than silently picking the first or last.
+2. **Pipeline Short-Circuiting:** Add an `IdempotencyBehavior<TRequest, TResponse>` to `LightweightCommandBus` (Section 4.4) that checks an `IDistributedCache` for `IIdempotentCommand.RequestId`. Verify that when a duplicate `RequestId` arrives, the behavior returns the cached `TResponse` directly and **never invokes** `next()`.
+
+---
+
 ## Section 5 — Dependency Injection as an Architectural Discipline
 
 ### 5.1 The Composition Root & Keyed Services (.NET 8+)
@@ -798,6 +916,77 @@ builder.Services.AddOptions<PaymentGatewayOptions>()
     .ValidateDataAnnotations()
     .ValidateOnStart(); // Crashes immediately if config is missing or invalid!
 ```
+
+---
+
+### 5.3 Keyed Services (`.AddKeyedScoped`), Open Generics & Why Service Locator Is an Anti-Pattern
+
+#### Open Generic Registration (`typeof(IPipelineBehavior<,>)`)
+When an abstraction is generic across dozens of command or entity types (e.g., `IValidator<T>`, `IPipelineBehavior<TRequest, TResponse>`, or `IEventHandler<TEvent>`), registering each closed generic type manually is brittle. .NET's built-in DI container natively resolves **Open Generics**:
+
+```csharp
+// Register open generic once:
+builder.Services.AddScoped(typeof(IPipelineBehavior<,>), typeof(LoggingBehavior<,>));
+builder.Services.AddScoped(typeof(IPipelineBehavior<,>), typeof(ValidationBehavior<,>));
+
+// When the container resolves IPipelineBehavior<PlaceOrderCommand, Result<OrderId>>,
+// it automatically closes the generic type and constructs LoggingBehavior<PlaceOrderCommand, Result<OrderId>>.
+```
+
+#### `IOptions<T>` vs `IOptionsSnapshot<T>` vs `IOptionsMonitor<T>`
+Choosing the wrong Options interface is a common source of production configuration bugs and Captive Dependency exceptions:
+
+| Interface | DI Lifetime | Reloads on `appsettings.json` Change? | Named Options Support? | Primary Use Case |
+|---|---|---|---|---|
+| `IOptions<T>` | **Singleton** | **No** (Cached once at app startup) | No | Static startup settings that require a process restart to change. |
+| `IOptionsSnapshot<T>` | **Scoped** | **Yes** (Recomputed once per HTTP request scope) | Yes (`Get(name)`) | Scoped request handlers needing consistent config across a single request. **Cannot be injected into a Singleton!** |
+| `IOptionsMonitor<T>` | **Singleton** | **Yes** (Live `.CurrentValue` + `.OnChange()` callback) | Yes (`Get(name)`) | Singleton background workers, circuit breakers, or dynamic feature flags. |
+
+> **AOT & Compile-Time `[OptionsValidator]` Source Generator (.NET 8+):**
+> Calling `.ValidateDataAnnotations()` uses runtime reflection (`Validator.TryValidateObject`), which is incompatible with Native AOT trimming. In .NET 8+, define a partial validator class decorated with `[OptionsValidator]`:
+> ```csharp
+> [OptionsValidator]
+> public partial class ValidatePaymentGatewayOptions : IValidateOptions<PaymentGatewayOptions>;
+> // Register: builder.Services.AddSingleton<IValidateOptions<PaymentGatewayOptions>, ValidatePaymentGatewayOptions>();
+> ```
+
+#### Why Service Locator Is an Anti-Pattern (vs Legitimate Factory Use)
+Calling `serviceProvider.GetRequiredService<IBillingEngine>()` inside a domain or application method violates the **Explicit Dependencies Principle**:
+1. **Dishonest API Contract:** Looking at `public OrderProcessor(IServiceProvider sp)` gives callers and unit tests zero visibility into whether `OrderProcessor` requires 1 dependency or 15 dependencies.
+2. **Runtime Bomb:** Missing registrations fail midway through executing a business flow at runtime instead of failing at container validation (`ValidateOnBuild = true` / `ValidateScopes = true`).
+3. **The Only Legitimate Exception:** Resolving `IServiceScopeFactory` or `IServiceProvider` *strictly inside a thin infrastructure Factory or Middleware adapter* located at the boundary of the Composition Root.
+
+---
+
+### Section 5 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions & Model Answers
+
+**Q1: What happens if a `Singleton` service injects `IOptionsSnapshot<T>`, and why does ASP.NET Core throw an `InvalidOperationException` in the `Development` environment?**
+> **Model Answer:**
+> `IOptionsSnapshot<T>` is registered with a **Scoped** lifetime so that configuration changes are bound once per HTTP request and remain consistent throughout that request. Injecting a `Scoped` service into a `Singleton` creates a **Captive Dependency**: the `Singleton` captures the very first request's `IOptionsSnapshot<T>` instance forever, turning it into a stale singleton and holding onto any scoped resources.
+> In `Development`, `WebApplication.CreateBuilder` enables `ValidateScopes = true` and `ValidateOnBuild = true` by default on `ServiceProviderOptions`, which inspects the dependency graph at startup and immediately throws `InvalidOperationException: Cannot consume scoped service 'IOptionsSnapshot<...>' from singleton`. The fix is to inject `IOptionsMonitor<T>` (which is a `Singleton` and exposes `.CurrentValue`).
+
+**Q2: Why should you enable `ValidateOnBuild = true` and `ValidateScopes = true` in all environments (or CI integration tests), and what edge cases does `ValidateOnBuild` NOT catch?**
+> **Model Answer:**
+> `ValidateOnBuild = true` verifies at `builder.Build()` time that every registered descriptor's constructor dependencies can be resolved and have legal lifetimes. However, `ValidateOnBuild` intentionally **cannot validate**:
+> 1. **Open Generic Types** (`typeof(IValidator<>)`), because the container does not know which closed type arguments will be requested at runtime.
+> 2. **Factory Delegates** (`services.AddScoped<IFoo>(sp => new Foo(sp.GetRequiredService<IBar>()))`), because the lambda body is opaque to static constructor inspection until invoked.
+> 3. **Controllers** (unless `.AddControllersAsServices()` is called), because MVC constructs controllers via `IControllerActivator` rather than resolving the controller type directly from the root container.
+
+**Q3: How do you resolve a Keyed Service dynamically when the key (`string` or `enum`) is only known at runtime from an HTTP request header?**
+> **Model Answer:**
+> Constructor `[FromKeyedServices("key")]` only works for compile-time constant keys. When the key arrives dynamically at runtime (e.g., `X-Payment-Provider: stripe`), inject a narrow factory delegate `Func<string, IPaymentGateway>` registered in the Composition Root:
+> ```csharp
+> builder.Services.AddScoped<Func<string, IPaymentGateway>>(sp =>
+>     providerKey => sp.GetRequiredKeyedService<IPaymentGateway>(providerKey));
+> ```
+> This keeps `IServiceProvider` confined to `Program.cs` while giving the application service a clean, mockable `Func<string, IPaymentGateway>` dependency.
+
+#### Practice Exercises
+
+1. **Compile-Time Options Validation Drill:** Create a `ResiliencePolicyOptions` class with `[Range(1, 5)] int MaxRetries`, `[Required] string FallbackEndpoint`, and implement a custom `IValidateOptions<ResiliencePolicyOptions>` that cross-validates two properties (e.g., `CircuitBreakerThreshold` must be strictly greater than `MaxRetries`). Register it with `.ValidateOnStart()` and write an xUnit test asserting `OptionsValidationException` is thrown when the host starts with invalid configuration.
+2. **Captive Dependency Detector:** Write an xUnit test that loads your application's `IServiceCollection` and builds a `ServiceProvider` with `new ServiceProviderOptions { ValidateOnBuild = true, ValidateScopes = true }` so any future PR introducing a captive dependency or missing registration fails CI immediately.
 
 ---
 
