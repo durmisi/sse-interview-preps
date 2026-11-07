@@ -115,7 +115,7 @@ Every section in Part II provides comprehensive senior-level instruction:
 - 12.2 OpenTelemetry in ASP.NET Core: .NET `Activity` and `ActivitySource`; correlating HTTP logs, database queries, and downstream calls under a unified Trace ID.
 
 ## Section 13 — Senior Scenarios, API Governance & Capstone
-- 13.1 Capstone Scenario: End-to-end architectural design of a mission-critical public payment processing API handling $10M daily volume with strict idempotency, rate limiting, and zero-downtime contract deprecation.
+- 13.1 Capstone Scenario: End-to-end architectural design of a mission-critical public payment processing API handling \$10M daily volume with strict idempotency, rate limiting, and zero-downtime contract deprecation.
 
 ---
 
@@ -137,6 +137,30 @@ Understanding method semantics according to RFC 9110 is foundational for designi
 | **DELETE** | No | **Yes** | No | Remove all current representations of the target resource. Deleting an already-deleted resource returns 200 or 204. |
 | **OPTIONS**| **Yes** | **Yes** | No | Query communication capabilities available for the target URI (used heavily in CORS pre-flight). |
 
+#### HTTP Status Code Taxonomy (RFC 9110)
+
+| Range | Code | Semantic Meaning & Production Guidance |
+|---|---|---|
+| **2xx Success** | `200 OK` | Request succeeded; payload contains representation of target resource or action result. |
+| | `201 Created` | New resource created. **Must** include `Location: /v1/orders/{id}` header. |
+| | `202 Accepted` | Request validated and queued for asynchronous processing; include `Location` to status monitor resource. |
+| | `204 No Content` | Succeeded with empty response body (common for `DELETE` or `PUT` when client already holds state). |
+| **3xx Redirection** | `301` / `308` | Moved Permanently (`308` strictly forbids changing HTTP method from `POST` to `GET`; `301` historically allowed it). |
+| | `302` / `307` | Found / Temporary Redirect (`307` preserves original HTTP method and body). |
+| | `304 Not Modified` | Conditional `GET`/`HEAD` (`If-None-Match`) matched current `ETag`; no body transmitted. |
+| **4xx Client Error** | `400 Bad Request` | Malformed syntax, invalid JSON framing, or missing required query/header parameter. |
+| | `401 Unauthorized` | **Unauthenticated** — missing, expired, or cryptographically invalid credentials (`WWW-Authenticate` header required). |
+| | `403 Forbidden` | **Unauthorized** — identity is known, but principal lacks permission/scope or fails BOLA ownership check. |
+| | `404 Not Found` | Resource does not exist (or deliberately masked `403` to prevent tenant resource enumeration). |
+| | `409 Conflict` | State conflict (e.g., duplicate business key, order already cancelled, or idempotency key currently in-flight). |
+| | `412 Precondition Failed` | Optimistic concurrency failure (`If-Match` ETag did not match current database row version). |
+| | `422 Unprocessable Content` | Syntactically valid JSON, but fails domain validation invariants (RFC 9110 / WebDAV origin). |
+| | `429 Too Many Requests` | Rate limit or quota exceeded; always include `Retry-After` (delta-seconds or HTTP-date). |
+| **5xx Server Error** | `500 Internal Server Error` | Unhandled fault in server code; never leak stack traces or SQL text in production. |
+| | `502 Bad Gateway` | Reverse proxy / API gateway received an invalid response from an upstream server. |
+| | `503 Service Unavailable` | Server overloaded, in maintenance mode, or circuit breaker open; include `Retry-After`. |
+| | `504 Gateway Timeout` | Upstream dependency failed to respond within the gateway's configured timeout window. |
+
 ---
 
 ### 1.2 HTTP Caching and Conditional Requests (ETags)
@@ -153,6 +177,70 @@ To prevent the **Lost Update Problem** in concurrent REST APIs without holding d
    If-Match: "v4-a9f83b"
    ```
 3. If another user modified the order in the interim, its ETag changed to `"v5-bb123"`. The server detects the mismatch and rejects the update with **`412 Precondition Failed`**, completely preventing accidental data overwrites!
+
+#### Cache-Control Directives & Strong vs Weak Validators
+- **`Cache-Control: private, max-age=60, must-revalidate`**: Only the end-user browser may cache; shared CDN/reverse-proxy caches (Cloudflare, YARP) must not store it.
+- **`Cache-Control: public, s-maxage=300, stale-while-revalidate=30`**: Shared CDN caches may serve the representation for 300s and asynchronously refresh stale content in the background for 30s without blocking client requests.
+- **`Cache-Control: no-store`**: Strictly forbids writing the response to any volatile or non-volatile cache (mandatory for sensitive PII/PCI responses).
+- **`Cache-Control: no-cache`**: Allows caching the representation, but forces the client/CDN to revalidate with the origin server via `If-None-Match` before serving it.
+- **Strong ETag (`"v4-a9f83b"`) vs Weak ETag (`W/"v4-a9f83b"`)**: A strong ETag guarantees byte-for-byte identity (including compression/encoding), required for byte-range requests and `If-Match` concurrency checks. A weak ETag indicates semantic equivalence only and **cannot** be used with `If-Match` according to RFC 9110.
+
+---
+
+### 1.3 HTTP/1.1 vs HTTP/2 vs HTTP/3 (QUIC) & TLS 1.3 Handshake Mechanics
+
+#### Head-of-Line (HoL) Blocking: Application Layer vs Transport Layer
+
+```text
+HTTP/1.1 (TCP) — Application-Layer HoL Blocking:
+[Conn 1] === Req 1 (Slow 500ms) ===>[blocks Req 2]===>[Req 2]
+(Workaround: Browsers open 6 parallel TCP connections per origin, multiplying TLS handshakes & TCP slow-start)
+
+HTTP/2 (Single TCP Connection) — Binary Framing & Stream Multiplexing:
+[TCP Conn] --[Frame: Stream 1][Frame: Stream 3][Frame: Stream 1][Frame: Stream 2]-->
+(Problem: If 1 TCP packet is dropped on the network, the OS kernel stalls ALL HTTP/2 streams until TCP retransmission completes!)
+
+HTTP/3 (QUIC over UDP) — Independent Stream Loss Recovery:
+[UDP Socket] ==(QUIC Stream 1: Packet Lost -> Only Stream 1 waits)==
+             ==(QUIC Stream 2: Delivered immediately to application!)==
+             ==(QUIC Stream 3: Delivered immediately to application!)==
+```
+
+| Protocol Feature | HTTP/1.1 (RFC 9112) | HTTP/2 (RFC 9113) | HTTP/3 (RFC 9114) |
+|---|---|---|---|
+| **Underlying Transport** | TCP | TCP (single persistent connection) | **QUIC over UDP** |
+| **Wire Framing** | Newline-delimited ASCII text | Binary frames (`HEADERS`, `DATA`, `RST_STREAM`, `WINDOW_CONTROL`) | QUIC binary frames in encrypted UDP datagrams |
+| **Multiplexing** | No (pipelining broken in practice; requires connection pools) | Yes (interleaved streams over 1 TCP connection) | Yes (native independent streams in QUIC) |
+| **HTTP HoL Blocking** | **Yes** — slow response blocks subsequent requests on same socket | **Solved** via stream multiplexing | **Solved** via QUIC streams |
+| **Transport (TCP) HoL Blocking** | Yes | **Yes** — single lost TCP segment stalls all multiplexed streams | **Solved** — packet loss only stalls the affected QUIC stream |
+| **Header Compression** | None (redundant cookies/headers sent verbatim) | **HPACK** (static + dynamic lookup tables + Huffman coding) | **QPACK** (adapted for out-of-order UDP delivery without HoL blocking) |
+| **Connection Migration** | No (IP change drops TCP 4-tuple) | No | **Yes** via 64-bit **Connection ID** (seamless Wi-Fi $\to$ 5G handoff) |
+| **TLS Handshake** | TCP (1 RTT) + TLS 1.2 (2 RTT) = **3 RTT** (or 2 RTT with TLS 1.3) | TCP + TLS 1.3 ALPN `h2` = **2 RTT** ($\approx 1$ RTT TCP + 1 RTT TLS) | Integrated QUIC + TLS 1.3 = **1-RTT** cold start, **0-RTT** resumption |
+
+#### TLS 1.3 Handshake & 0-RTT Replay Danger
+In TLS 1.2, establishing a secure session required 2 full network round-trips after the TCP 3-way handshake. **TLS 1.3 (RFC 8446)** deprecates legacy cipher suites (RSA key transport, CBC mode, SHA-1), mandates **Perfect Forward Secrecy (PFS)** via ephemeral Diffie-Hellman (`X25519` or `P-256`), and embeds the key share inside the initial `ClientHello`, completing the handshake in **1-RTT**.
+- **QUIC 0-RTT Early Data:** When resuming a previous session using a Pre-Shared Key (PSK), HTTP/3 clients can send encrypted application data in the very first packet (`0-RTT`).
+- **Senior Security Warning:** If an attacker captures and replays a `0-RTT` UDP packet, the server will execute it twice. Therefore, **never allow non-idempotent requests (`POST`) in 0-RTT early data**; Kestrel and Cloudflare reject 0-RTT upgrades with **`425 Too Early`** when replay risk exists.
+
+---
+
+### Section 1 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions
+
+1. **Q: Why is `PUT` considered idempotent while `PATCH` is not, and under what conditions can a `PATCH` endpoint be made idempotent?**
+   - **Model Answer:** By RFC 9110, `PUT` replaces the entire target resource representation with the enclosed payload ($f(x) = s$); applying that replacement 1 or 100 times results in the exact same resource state. `PATCH` describes a set of instructions to modify a resource. If a JSON Patch document contains `[{ "op": "add", "path": "/balance", "value": 10 }]` or increments a counter, executing it twice mutates the state twice. However, `PATCH` *can* be made idempotent if restricted to **JSON Merge Patch (RFC 7396)** setting absolute field values (e.g., `{"status": "Shipped"}`) combined with an `If-Match` ETag header so concurrent or duplicate applications against a stale version fail deterministically with `412 Precondition Failed`.
+
+2. **Q: HTTP/2 introduced stream multiplexing to solve Head-of-Line (HoL) blocking. Why can switching from 6 HTTP/1.1 connections to 1 HTTP/2 connection actually *degrade* throughput on a lossy 2% packet-loss mobile network, and how does HTTP/3 solve this?**
+   - **Model Answer:** HTTP/2 solves *application-layer* HoL blocking by interleaving frames from multiple streams over a single TCP connection. However, the OS kernel's TCP stack knows nothing about HTTP/2 streams—it only sees a single contiguous byte sequence. When a single TCP packet is dropped on a lossy link, the kernel holds back all subsequent out-of-order TCP segments in the receive buffer until the missing segment is retransmitted, stalling *every* active HTTP/2 stream simultaneously. Furthermore, a single TCP connection experiences multiplicative congestion window (`cwnd`) reduction across all streams upon packet loss, whereas 6 HTTP/1.1 connections only throttled $1/6$th of traffic. HTTP/3 replaces TCP with **QUIC over UDP**, moving stream awareness into the transport layer so a dropped UDP datagram only delays the specific stream whose bytes were in that packet.
+
+3. **Q: Explain the semantic difference between `401 Unauthorized` and `403 Forbidden`, and when a Senior Engineer should deliberately return `404 Not Found` instead of `403 Forbidden`.**
+   - **Model Answer:** Despite its historical name, `401 Unauthorized` means **unauthenticated**—the caller has not provided valid identity credentials (or the JWT is expired/tampered), and the server must include a `WWW-Authenticate` challenge header. `403 Forbidden` means **unauthorized**—the caller's identity is authenticated, but their scopes, roles, or tenant policies prohibit access, and re-authenticating will not help. In multi-tenant APIs (e.g., `GET /v1/invoices/{id}`), returning `403 Forbidden` when Tenant A requests Tenant B's invoice ID leaks the existence of that resource (an enumeration oracle). Returning `404 Not Found` when the query `WHERE Id = @id AND TenantId = @callerTenantId` returns zero rows masks cross-tenant existence completely.
+
+#### Practice Exercises
+
+1. **Exercise 1 — Optimistic Concurrency ETag Flow in Minimal APIs:** Implement a `PUT /api/v1/inventory/{sku}` endpoint in ASP.NET Core that reads the `If-Match` request header, compares it against a PostgreSQL `xmin` or SQL Server `rowversion` converted to base64 ETag, returns `428 Precondition Required` if `If-Match` is missing, and returns `412 Precondition Failed` if the row was concurrently updated.
+2. **Exercise 2 — Kestrel HTTP/3 Configuration:** Configure Kestrel in .NET 9 to listen on port 5001 with `HttpProtocols.Http1AndHttp2AndHttp3`, inspect the `Alt-Svc: h3=":5001"; ma=86400` response header using `curl --http3`, and verify QUIC stream multiplexing in Wireshark.
 
 ---
 
@@ -175,7 +263,110 @@ ORDER BY CreatedAt DESC, OrderId DESC;
 
 ---
 
+### 2.2 Richardson Maturity Model, Resource URI Design & Asynchronous Operations (`202 Accepted`)
+
+#### The Richardson Maturity Model (RMM)
+
+| RMM Level | Name | Characteristics | Enterprise Reality Check |
+|---|---|---|---|
+| **Level 0** | **The Swamp of POX** | Single URI (`/api/service`), single HTTP method (`POST`), payload encodes RPC method name (`{"action": "getOrder", "id": 101}`). | Legacy SOAP/XML-RPC or anti-pattern REST wrappers. |
+| **Level 1** | **Resources** | Distinct URIs per domain entity (`/orders/101`, `/customers/42`), but still tunnels operations through `POST` (`/orders/101/update`). | Improves routing, but breaks HTTP caching and idempotency guarantees. |
+| **Level 2** | **HTTP Verbs & Status Codes** | Standard HTTP methods (`GET`, `POST`, `PUT`, `DELETE`) paired with granular RFC 9110 status codes (`201`, `409`, `412`, `422`). | **The pragmatic industry sweet spot** for 95% of production OpenAPI services. |
+| **Level 3** | **Hypermedia Controls (HATEOAS)** | Responses embed hypermedia links (`_links`) advertising valid state transitions dynamically based on domain state. | Useful for state-driven workflows (e.g., Stripe/PayPal payment links) so clients don't hardcode state machines. |
+
+#### Modeling Non-CRUD State Transitions as Sub-Resources
+Beginner engineers often struggle when an action doesn't fit `Create/Read/Update/Delete` (e.g., cancelling an order, issuing a refund, or locking a user account).
+- **Anti-Pattern (RPC Query Parameter):** `GET /api/v1/orders/101?action=cancel` (Violates `GET` safety; web crawlers or pre-fetchers will cancel orders!).
+- **Pragmatic REST Pattern 1 (State Resource Collection):** Model the domain event as a sub-resource creation: `POST /api/v1/orders/101/cancellation` or `POST /api/v1/orders/101/refunds` (returns `201 Created` with the refund resource).
+- **Pragmatic REST Pattern 2 (Controller Action Verb Sub-URI):** When no subordinate entity exists, Microsoft & Google REST Guidelines permit a clear action verb at the leaf of the URI: `POST /api/v1/orders/101:cancel` or `POST /api/v1/orders/101/cancel`.
+
+#### Asynchronous Long-Running Operations (`202 Accepted` Polling Pattern)
+When an operation takes longer than ~2–5 seconds (e.g., generating a 500,000-row financial audit export, provisioning cloud infrastructure, or running a batch reconciliation), holding an HTTP connection open risks **API Gateway timeouts (`504 Gateway Timeout` at 29–60s)** and exhausts connection pools.
+
+```text
+Client                                   API Server                        Background Worker
+  |                                          |                                     |
+  |--- POST /v1/reports/exports ------------>|                                     |
+  |                                          |-- 1. Create Operation Row (Pending) |
+  |                                          |-- 2. Enqueue to Service Bus ------->|
+  |<-- 202 Accepted -------------------------|                                     |
+  |    Location: /v1/operations/op_99a1      |                                     |-- 3. Generate PDF/CSV
+  |    Retry-After: 5                        |                                     |-- 4. Upload to Blob
+  |                                          |                                     |-- 5. Mark Completed
+  |--- GET /v1/operations/op_99a1 ---------->|                                     |
+  |<-- 200 OK { "status": "Running",         |                                     |
+  |             "percentComplete": 45 }      |                                     |
+  |    Retry-After: 5                        |                                     |
+  |                                          |                                     |
+  |--- GET /v1/operations/op_99a1 ---------->|                                     |
+  |<-- 200 OK (or 303 See Other) ------------|                                     |
+  |    { "status": "Succeeded",              |                                     |
+  |      "resourceLocation": "/v1/exports/e1"|                                     |
+  |    }                                     |                                     |
+```
+
+```csharp
+public sealed record AsyncOperationStatus(
+    string OperationId,
+    string Status,          // "Pending" | "Running" | "Succeeded" | "Failed"
+    int? PercentComplete,
+    string? ResourceUrl,
+    ProblemDetails? Error);
+
+app.MapPost("/api/v1/reports/exports", async (
+    ExportRequest request,
+    IOperationTracker tracker,
+    ChannelWriter<ExportJob> queue,
+    HttpContext http) =>
+{
+    string opId = $"op_{Guid.NewGuid():N}";
+    await tracker.CreatePendingAsync(opId, http.RequestAborted);
+    await queue.WriteAsync(new ExportJob(opId, request), http.RequestAborted);
+
+    http.Response.Headers.RetryAfter = "5";
+    return TypedResults.Accepted($"/api/v1/operations/{opId}",
+        new AsyncOperationStatus(opId, "Pending", 0, null, null));
+});
+
+app.MapGet("/api/v1/operations/{opId}", async (
+    string opId,
+    IOperationTracker tracker,
+    HttpContext http) =>
+{
+    var status = await tracker.GetStatusAsync(opId, http.RequestAborted);
+    if (status is null) return Results.NotFound();
+
+    if (status.Status is "Pending" or "Running")
+    {
+        http.Response.Headers.RetryAfter = "5";
+    }
+
+    return Results.Ok(status);
+});
+```
+
+---
+
+### Section 2 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions
+
+1. **Q: Why is a single-column cursor like `WHERE CreatedAt < @CursorDate` broken in production keyset pagination, and how do you fix it?**
+   - **Model Answer:** Timestamps (`CreatedAt`) are not guaranteed to be unique when multiple rows are inserted within the same millisecond or clock tick. If 5 orders share the exact timestamp `10:00:00.123Z` and the page boundary cuts after the 2nd order, using strictly `< @CursorDate` on the next page will permanently skip the remaining 3 orders with that timestamp, whereas using `<= @CursorDate` will return duplicate rows already shown on page 1. The fix is a **composite tie-breaker cursor** combining the sort column with a guaranteed unique monotonic column: `WHERE (CreatedAt < @CursorDate) OR (CreatedAt = @CursorDate AND OrderId < @CursorId) ORDER BY CreatedAt DESC, OrderId DESC`, backed by a composite database index on `(CreatedAt DESC, OrderId DESC)`.
+
+2. **Q: Compare the `202 Accepted` status polling pattern against Webhooks for long-running asynchronous API operations. When should you provide both?**
+   - **Model Answer:** `202 Accepted` with a `Location: /v1/operations/{id}` header and `Retry-After` works universally for browsers, mobile apps, and clients behind NAT/firewalls that cannot expose public HTTPS endpoints. However, polling wastes bandwidth if intervals are too aggressive or adds latency if intervals are too wide. Webhooks push completion events immediately to a registered server URL with zero wasted polls, making them superior for server-to-server B2B integrations. Enterprise APIs (like Stripe or Azure ARM) expose **both**: `202 Accepted` polling for immediate UI progress bars and signed Webhooks for reliable backend state reconciliation.
+
+#### Practice Exercises
+
+1. **Exercise 1 — Opaque Base64Url Cursor Encoder:** Write a C# generic `CursorToken<TKey1, TKey2>` struct that serializes `(DateTimeOffset CreatedAt, Guid Id)` into a URL-safe Base64 string, signs or validates its structure, and returns `400 Bad Request` ProblemDetails if a client tampers with the cursor string.
+2. **Exercise 2 — HATEOAS Order State Machine:** Implement an `OrderResponseDto` generator that emits `_links` containing `cancel` and `pay` links when `Status == OrderStatus.Pending`, only `refund` when `Status == OrderStatus.Paid`, and only `self` when `Status == OrderStatus.Cancelled`.
+
+---
+
 ## Section 3 — Standardized Error Handling & Problem Details (RFC 9457)
+
+### 3.1 RFC 9457 Problem Details Specification & Registration
 
 ```csharp
 // Program.cs: Centralized Problem Details in ASP.NET Core 8+
@@ -201,6 +392,122 @@ builder.Services.AddProblemDetails(options =>
   "errorCode": "FUNDS_004"
 }
 ```
+
+---
+
+### 3.2 Centralized Exception Mapping with `IExceptionHandler` (.NET 8/9)
+
+In .NET 8+, `IExceptionHandler` replaces ad-hoc try/catch middleware by chaining strongly-typed exception handlers into the built-in `UseExceptionHandler()` pipeline and writing responses via `IProblemDetailsService` with content negotiation (`application/problem+json`).
+
+```csharp
+using System.Diagnostics;
+using Microsoft.AspNetCore.Diagnostics;
+using Microsoft.AspNetCore.Mvc;
+
+public sealed class GlobalDomainExceptionHandler(
+    IProblemDetailsService problemDetailsService,
+    ILogger<GlobalDomainExceptionHandler> logger,
+    IHostEnvironment environment) : IExceptionHandler
+{
+    public async ValueTask<bool> TryHandleAsync(
+        HttpContext httpContext,
+        Exception exception,
+        CancellationToken cancellationToken)
+    {
+        var (statusCode, typeUri, title, detail, errorCode, validationErrors) = exception switch
+        {
+            DomainValidationException valEx => (
+                StatusCodes.Status422UnprocessableEntity,
+                "https://api.company.com/errors/validation-failed",
+                "Domain Validation Failed",
+                valEx.Message,
+                "DOMAIN_VALIDATION_ERROR",
+                valEx.Errors),
+
+            ConcurrencyConflictException concEx => (
+                StatusCodes.Status409Conflict,
+                "https://api.company.com/errors/concurrency-conflict",
+                "Resource State Conflict",
+                concEx.Message,
+                "CONCURRENCY_CONFLICT",
+                null),
+
+            ResourceNotFoundException notFoundEx => (
+                StatusCodes.Status404NotFound,
+                "https://api.company.com/errors/resource-not-found",
+                "Resource Not Found",
+                notFoundEx.Message,
+                "RESOURCE_NOT_FOUND",
+                null),
+
+            _ => (
+                StatusCodes.Status500InternalServerError,
+                "https://api.company.com/errors/internal-server-error",
+                "An unexpected fault occurred",
+                environment.IsDevelopment()
+                    ? exception.ToString()
+                    : "An internal error occurred. Reference the traceId when contacting support.",
+                "INTERNAL_ERROR",
+                null)
+        };
+
+        if (statusCode == StatusCodes.Status500InternalServerError)
+        {
+            logger.LogError(exception, "Unhandled exception on {Method} {Path}",
+                httpContext.Request.Method, httpContext.Request.Path);
+        }
+        else
+        {
+            logger.LogWarning("Domain exception {ErrorCode} ({StatusCode}) on {Method} {Path}: {Message}",
+                errorCode, statusCode, httpContext.Request.Method, httpContext.Request.Path, exception.Message);
+        }
+
+        httpContext.Response.StatusCode = statusCode;
+
+        var problemDetails = new ProblemDetails
+        {
+            Status = statusCode,
+            Type = typeUri,
+            Title = title,
+            Detail = detail,
+            Instance = $"{httpContext.Request.Method} {httpContext.Request.Path}"
+        };
+
+        problemDetails.Extensions["traceId"] = Activity.Current?.Id ?? httpContext.TraceIdentifier;
+        problemDetails.Extensions["errorCode"] = errorCode;
+        problemDetails.Extensions["timestamp"] = DateTimeOffset.UtcNow;
+
+        if (validationErrors is not null)
+        {
+            problemDetails.Extensions["errors"] = validationErrors;
+        }
+
+        return await problemDetailsService.TryWriteAsync(new ProblemDetailsContext
+        {
+            HttpContext = httpContext,
+            Exception = exception,
+            ProblemDetails = problemDetails
+        });
+    }
+}
+```
+
+---
+
+### Section 3 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions
+
+1. **Q: What did RFC 9457 improve over RFC 7807 for Problem Details, and why should client SDKs branch on `type` or `errorCode` rather than `title` or `detail`?**
+   - **Model Answer:** RFC 9457 obsoleted RFC 7807 by clarifying how multiple problems should be represented via typed extension members, formalizing the URI registry for problem types, and advising against coupling human-readable `detail` strings to programmatic logic. Client code must never regex-parse `detail` (which may change phrasing or be localized via `Accept-Language`). Instead, clients must branch on the immutable `type` URI (`https://api.company.com/errors/insufficient-funds`) or a structured machine-readable extension (`errorCode: "FUNDS_004"`).
+
+2. **Q: When designing error handling in a high-throughput .NET API, when should you use the Result pattern (`Result<T, DomainError>`) vs throwing exceptions caught by `IExceptionHandler`?**
+   - **Model Answer:** Throwing and unwinding the stack in .NET incurs significant CPU and allocation overhead ($\approx 5\text{--}20\ \mu\text{s}$ per exception) to capture stack frames. Expected business outcomes—such as invalid user input, insufficient balance, or duplicate email registration—should be modeled via the **Result Pattern** and mapped directly to `TypedResults.Problem(...)` or `TypedResults.UnprocessableEntity(...)` without throwing exceptions. `IExceptionHandler` serves as the safety net for truly exceptional infrastructure failures (deadlocks, network drops, unexpected invariant breaches) ensuring no unhandled exception ever escapes without an RFC 9457 envelope and `traceId`.
+
+#### Practice Exercises
+
+1. **Exercise 1 — Multi-Error Validation ProblemDetails:** Extend `GlobalDomainExceptionHandler` so that when a request fails multiple field validations (e.g., invalid IBAN and negative transfer amount), it populates `extensions["errors"]` as a `Dictionary<string, string[]>` matching ASP.NET Core's `HttpValidationProblemDetails` schema.
+2. **Exercise 2 — Information Disclosure Audit:** Write an integration test using `WebApplicationFactory<Program>` in `"Production"` environment mode that triggers a `SqlException` and asserts the HTTP 500 `ProblemDetails` response contains `traceId` but zero SQL table names or stack trace strings.
 
 ---
 

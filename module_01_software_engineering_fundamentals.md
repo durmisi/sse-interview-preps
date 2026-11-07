@@ -620,6 +620,58 @@ public sealed class CustomerEntity : IEquatable<CustomerEntity>
 }
 ```
 
+#### Customizing Equality Externally with `IEqualityComparer<T>`
+While `IEquatable<T>` defines a type's *intrinsic* equality, enterprise applications often require *extrinsic* or context-specific equality—such as comparing third-party DTOs you do not own, or matching domain identifiers using normalized, case-insensitive rules in a `Dictionary<TKey, TValue>` or `HashSet<T>`. `IEqualityComparer<T>` decouples comparison strategy from the type itself.
+
+```csharp
+public sealed record TaxRegistrationCode(string CountryIso, string RawIdentifier);
+
+public sealed class NormalizedTaxCodeComparer : IEqualityComparer<TaxRegistrationCode>
+{
+    public static readonly NormalizedTaxCodeComparer Instance = new();
+
+    public bool Equals(TaxRegistrationCode? x, TaxRegistrationCode? y)
+    {
+        if (ReferenceEquals(x, y)) return true;
+        if (x is null || y is null) return false;
+
+        return string.Equals(x.CountryIso, y.CountryIso, StringComparison.OrdinalIgnoreCase)
+            && Normalize(x.RawIdentifier).SequenceEqual(Normalize(y.RawIdentifier));
+    }
+
+    public int GetHashCode(TaxRegistrationCode obj)
+    {
+        ArgumentNullException.ThrowIfNull(obj);
+        var hash = new HashCode();
+        hash.Add(obj.CountryIso, StringComparer.OrdinalIgnoreCase);
+
+        foreach (char c in obj.RawIdentifier)
+        {
+            if (char.IsLetterOrDigit(c))
+            {
+                hash.Add(char.ToUpperInvariant(c));
+            }
+        }
+
+        return hash.ToHashCode();
+    }
+
+    private static string Normalize(string input) =>
+        string.Create(input.Length, input, static (span, src) =>
+        {
+            int idx = 0;
+            foreach (char c in src)
+            {
+                if (char.IsLetterOrDigit(c))
+                    span[idx++] = char.ToUpperInvariant(c);
+            }
+        }).TrimEnd('\0');
+}
+
+// Usage: "de-123 456" and "DE123-456" resolve to the exact same dictionary bucket and key!
+var registry = new Dictionary<TaxRegistrationCode, string>(NormalizedTaxCodeComparer.Instance);
+```
+
 ---
 
 ### Section 1 Review: Interview Questions & Practice Exercises
@@ -746,6 +798,49 @@ public class CustomCollection<T> : IList<T>
 }
 ```
 *Correction:* Segregate interfaces. A read-only collection must implement `IReadOnlyList<T>`, not `IList<T>`.
+
+#### Return Covariance (`out T`) and Parameter Contravariance (`in T`)
+Liskov Substitution governs how generic interfaces and delegates preserve subtyping across type arguments:
+1. **Covariance (`out T` — Producer / Return Position):**
+   If `Derived` is a subtype of `Base` ($\text{Derived} \le \text{Base}$), a generic interface `IFoo<out T>` preserves the subtyping direction: `IFoo<Derived>` is substitutable for `IFoo<Base>`.
+   - **Rule:** `T` can **only** appear in output (return) positions.
+   - **.NET Examples:** `IEnumerable<out T>`, `IReadOnlyList<out T>`, `Func<out TResult>`.
+   - **Why it is LSP-safe:** A caller expecting a stream of `Base` entities (`IEnumerable<Base>`) is completely safe receiving `IEnumerable<Derived>`, because every item produced out of the iterator satisfies the `Base` contract.
+2. **Contravariance (`in T` — Consumer / Parameter Position):**
+   A generic interface `IBar<in T>` *reverses* the subtyping direction: `IBar<Base>` is substitutable for `IBar<Derived>`.
+   - **Rule:** `T` can **only** appear in input (method parameter) positions.
+   - **.NET Examples:** `IComparable<in T>`, `IEqualityComparer<in T>`, `Action<in T>`.
+   - **Why it is LSP-safe:** If a caller needs a handler that can validate a `VipCustomer` (`Action<VipCustomer>`), you can safely pass an `Action<Customer>` that knows how to validate *any* `Customer`. Because `Action<Customer>` demands *weaker* preconditions (only base `Customer` properties), passing a `VipCustomer` into it never violates LSP.
+3. **Invariance (`T` — Both Input and Output):**
+   Mutable collections like `IList<T>` are invariant because `T` is both consumed (`Add(T)`) and produced (`T this[int index]`). If `List<Dog>` were assignable to `IList<Animal>`, a caller could invoke `animals.Add(new Cat())`, corrupting the underlying `Dog` memory buffer at runtime (which is why C# array covariance `Animal[] a = new Dog[1]` was a historical design mistake that requires expensive runtime type-checks on every array write, throwing `ArrayTypeMismatchException`).
+
+```csharp
+public abstract record DomainEvent(Guid EventId, DateTimeOffset OccurredAt);
+public sealed record OrderShippedEvent(Guid EventId, DateTimeOffset OccurredAt, Guid OrderId)
+    : DomainEvent(EventId, OccurredAt);
+
+// Contravariant consumer: accepts T in input positions only
+public interface IEventHandler<in TEvent> where TEvent : DomainEvent
+{
+    void Handle(TEvent domainEvent);
+}
+
+public sealed class GlobalAuditEventHandler : IEventHandler<DomainEvent>
+{
+    public void Handle(DomainEvent domainEvent) =>
+        Console.WriteLine($"[AUDIT] Event {domainEvent.EventId} at {domainEvent.OccurredAt:O}");
+}
+
+// LSP Contravariance in action:
+// A handler for the BASE type (DomainEvent) can safely substitute for a handler of the DERIVED type!
+IEventHandler<OrderShippedEvent> shippedHandler = new GlobalAuditEventHandler();
+shippedHandler.Handle(new OrderShippedEvent(Guid.CreateVersion7(), DateTimeOffset.UtcNow, Guid.CreateVersion7()));
+
+// LSP Covariance in action:
+// A producer of DERIVED types can safely substitute for a producer of BASE types!
+IReadOnlyList<OrderShippedEvent> shippedEvents = [new(Guid.CreateVersion7(), DateTimeOffset.UtcNow, Guid.CreateVersion7())];
+IEnumerable<DomainEvent> baseEvents = shippedEvents;
+```
 
 ---
 
@@ -912,6 +1007,95 @@ public readonly struct Result<TValue>
 
 ---
 
+### 3.6 Nullability, NRT Attributes & The Null-Object / Option Pattern
+
+#### Nullable Reference Types (NRT) & Roslyn Static Flow Analysis
+In modern .NET (`<Nullable>enable</Nullable>`), reference types are non-nullable by default (`Customer` vs `Customer?`). Crucially, **NRT is a compile-time static flow analysis feature, not a runtime guarantee** (`Customer` and `Customer?` compile to the exact same IL metadata type, annotated with `[Nullable]`). If external callers (or JSON deserializers) pass `null` into a non-nullable reference parameter, the runtime does not automatically block it unless your public boundary enforces `ArgumentNullException.ThrowIfNull(arg)`.
+
+To make custom `Try*` and validation methods integrate seamlessly with the compiler's flow analyzer, use `System.Diagnostics.CodeAnalysis` null-state attributes:
+- `[NotNullWhen(true)]`: Informs the compiler that if the method returns `true`, the `out` or input parameter is guaranteed non-null.
+- `[MaybeNullWhen(false)]`: Allows generic `TryGetValue<T>(out T value)` signatures to output `default` when returning `false`, even if `T` is a non-nullable reference type.
+- `[NotNullIfNotNull(nameof(input))]`: Expresses that the return value is non-null whenever the named input argument is non-null.
+
+```csharp
+using System.Diagnostics.CodeAnalysis;
+
+public sealed record DiscountVoucher(string Code, decimal PercentageOff);
+
+public interface IDiscountPolicy
+{
+    Money Apply(Money originalTotal);
+}
+
+// 1. NRT Static Flow Analysis with [NotNullWhen(true)]
+public static class VoucherParser
+{
+    public static bool TryParse(
+        string? rawInput,
+        [NotNullWhen(true)] out DiscountVoucher? voucher)
+    {
+        if (string.IsNullOrWhiteSpace(rawInput) || !rawInput.StartsWith("PROMO-", StringComparison.Ordinal))
+        {
+            voucher = null;
+            return false;
+        }
+
+        voucher = new DiscountVoucher(rawInput.Trim(), 0.10m);
+        return true;
+    }
+}
+
+// 2. The Null-Object Pattern: Eliminates repetitive `if (policy != null)` checks across business workflows
+public sealed class NoOpDiscountPolicy : IDiscountPolicy
+{
+    public static readonly NoOpDiscountPolicy Instance = new();
+    private NoOpDiscountPolicy() { }
+
+    public Money Apply(Money originalTotal) => originalTotal; // Neutral, safe default behavior
+}
+
+// 3. Explicit Value-Typed Option<T>: Forces exhaustive matching when a Null-Object does not make domain sense
+public readonly struct Option<T> where T : notnull
+{
+    private readonly T? _value;
+    public bool HasValue { get; }
+
+    private Option(T value)
+    {
+        ArgumentNullException.ThrowIfNull(value);
+        _value = value;
+        HasValue = true;
+    }
+
+    public static Option<T> Some(T value) => new(value);
+    public static Option<T> None => default;
+
+    public TResult Match<TResult>(Func<T, TResult> onSome, Func<TResult> onNone) =>
+        HasValue ? onSome(_value!) : onNone();
+}
+```
+
+---
+
+### 3.7 Comments and Architectural Documentation
+
+#### Self-Documenting Code vs Explanatory *Why* Comments
+Code can only ever describe **what** the system is doing and **how** it is doing it. Code cannot always express **why** a non-obvious decision was made, which alternatives were rejected, or what external bug is being worked around.
+
+| Comment Category | Engineering Verdict | Example |
+|---|---|---|
+| **Redundant *What* Comment (Noise)** | **Delete.** Restates the code and rots when logic changes. | `// Increment retry counter by 1`<br>`retryCount++;` |
+| **Apology for Bad Naming** | **Refactor.** Rename the method/variable using Ubiquitous Language. | `// Check if customer has 0 unpaid invoices and active KYC`<br>`if (c.Inv == 0 && c.Stat == 2)` $\to$ `if (customer.IsEligibleForCreditIncrease())` |
+| **Explanatory *Why* / Workaround Comment** | **Essential.** Preserves domain or hardware constraints invisible in code. | `// Legacy SAP gateway silently truncates payloads > 4000 bytes without returning HTTP 413.`<br>`// We chunk batches at 50 items to stay strictly below the 4KB frame limit (see ADR-019).` |
+| **Public API Contract (`///` XML Docs)** | **Mandatory at boundaries.** Documents preconditions, thread-safety, and exceptions for NuGet/SDK consumers. | `/// <exception cref="InvalidOperationException">Thrown when account is frozen.</exception>` |
+
+#### Preventing Comment Rot
+Comments are not compiled or executed by the test suite; consequently, they decay silently when surrounding code is refactored (**comment rot**). A misleading, outdated comment is far more dangerous than no comment at all because it actively deceives the reader.
+1. **Encode invariants in types and tests first:** Prefer `ReadOnlySpan<byte>`, `readonly record struct`, and unit test names over prose warnings.
+2. **Keep Architecture Decision Records (ADRs) in source control:** Document macro-level trade-offs in versioned markdown files (`docs/adr/0019-sap-batch-chunking.md`) and link the ADR identifier directly in the code comment.
+
+---
+
 ### Section 3 Review: Interview Questions & Practice Exercises
 
 #### Realistic Interview Questions & Strong Model Answers
@@ -1052,16 +1236,16 @@ In Robert C. Martin's package architecture metrics:
 - **Afferent Coupling ($C_a$):** The number of classes *outside* this module that depend on classes *inside* this module (incoming dependencies; measures responsibility).
 - **Efferent Coupling ($C_e$):** The number of classes *inside* this module that depend on classes *outside* this module (outgoing dependencies; measures instability).
 
-$$	ext{Instability } (I) = rac{C_e}{C_a + C_e}$$
+$$\text{Instability } (I) = \frac{C_e}{C_a + C_e}$$
 - $I = 0$: Maximally stable. Highly depended upon, depends on nothing else. Hard to change because many consumers rely on it.
 - $I = 1$: Maximally instable. Depends on many external modules, no one depends on it. Easy to change.
 
-$$	ext{Abstractness } (A) = rac{	ext{Number of Abstract Classes and Interfaces}}{	ext{Total Number of Types}}$$
+$$\text{Abstractness } (A) = \frac{\text{Number of Abstract Classes and Interfaces}}{\text{Total Number of Types}}$$
 
-$$	ext{Distance from the Main Sequence } (D) = |A + I - 1|$$
-- $D pprox 0$: The module balances stability and abstractness perfectly (The Main Sequence).
-- The **Zone of Pain** ($A pprox 0, I pprox 0$): Highly concrete, highly stable. Changing this module creates massive change propagation (e.g., a massive concrete utility library used everywhere).
-- The **Zone of Uselessness** ($A pprox 1, I pprox 1$): Highly abstract, but nobody depends on it. Pure overhead.
+$$\text{Distance from the Main Sequence } (D) = |A + I - 1|$$
+- $D\approx 0$: The module balances stability and abstractness perfectly (The Main Sequence).
+- The **Zone of Pain** ($A\approx 0, I\approx 0$): Highly concrete, highly stable. Changing this module creates massive change propagation (e.g., a massive concrete utility library used everywhere).
+- The **Zone of Uselessness** ($A\approx 1, I\approx 1$): Highly abstract, but nobody depends on it. Pure overhead.
 
 ---
 
@@ -1115,7 +1299,7 @@ public sealed class AuthenticatedSmtpSession
 
 ### 5.4 Change Propagation & Circular Dependencies
 
-A circular dependency occurs when Module A depends on Module B, which depends on Module C, which depends on Module A ($A 	o B 	o C 	o A$).
+A circular dependency occurs when Module A depends on Module B, which depends on Module C, which depends on Module A ($A \to B \to C \to A$).
 Circular dependencies:
 - Prevent independent compilation and deployment.
 - Make unit testing impossible in isolation.
@@ -1251,7 +1435,25 @@ public interface IOrderRepository
 
 ---
 
-### 7.3 Information Hiding: David Parnas's Criteria (1972)
+### 7.3 Over-Abstraction vs Under-Abstraction: The Indirection Tax
+
+#### Fundamentals & Internal Mechanics
+Every abstraction introduces a cognitive and runtime **Indirection Tax**. While **under-abstraction** tangles high-level domain policies with low-level I/O mechanics (making unit testing and vendor changes painful), **over-abstraction** buries simple business rules beneath layers of pass-through interfaces, generic base classes, and mapper ceremonies.
+
+#### When Premature Abstraction Hurts Readability & Runtime Performance
+1. **Cognitive Fragmentation:** Navigating `Controller -> IOrderFacade -> OrderFacade -> IOrderOrchestrator -> OrderOrchestrator -> IOrderDomainService` where 80% of classes are 5-line pass-through wrappers forces engineers to keep 7 files open to trace a single field assignment.
+2. **JIT Devirtualization Barriers:** In .NET, invoking a method on a concrete `sealed` class allows the Tier-1 JIT compiler (and Dynamic PGO in .NET 8/9) to devirtualize and inline the method body directly into the caller. Wrapping every internal helper and value calculator in an interface (`ITaxMultiplierHelper`) forces **Virtual Stub Dispatch (VSD)**. If a call site becomes megamorphic or crosses assembly boundaries without inlining, the CPU suffers indirect branch mispredictions and loses register-allocation optimizations across the call boundary.
+3. **Diagnostic & Refactoring Friction:** Stack traces expand by dozens of frames, DI container startup validation slows down, and adding a single parameter to a business workflow requires shotgun surgery across four pass-through interfaces.
+
+| Architectural Symptom | Under-Abstraction | Pragmatic Sweet Spot (Senior Bar) | Over-Abstraction (Indirection Tax) |
+|---|---|---|---|
+| **I/O & External Volatility** | `new SqlConnection()` & `HttpClient` hardcoded inside domain methods. | Interfaces (`IOrderRepository`, `IPaymentGateway`) at true **architectural seams** (I/O, clock, external vendors). | Interfaces for pure deterministic internal math (`IDecimalRoundingHelper`) and DTOs (`IOrderDto`). |
+| **Data Access Layer** | Raw SQL strings scattered in Razor views or Minimal API lambdas. | Encapsulated repository or vertical slice handler using `DbContext` directly as its unit of work. | Generic `IRepository<TEntity>` wrapping `DbSet<T>`, hiding EF Core's change tracker, `AsNoTracking()`, and bulk `ExecuteUpdateAsync()`. |
+| **Extension Points** | 400-line `switch` statement modified every week by 4 teams. | Polymorphic Strategy (`IEnumerable<IPricingRule>`) introduced at **proven variation points** (Rule of Three). | Speculative plugin engine with reflection scanning and XML DSL built for a requirement that never changes. |
+
+---
+
+### 7.4 Information Hiding: David Parnas's Criteria (1972)
 
 David Parnas established the true criterion for decomposing systems into modules:
 **A module should be designed to hide a secret.**
@@ -1291,7 +1493,40 @@ A Senior Software Engineer recognizes that **prudent, deliberate technical debt 
 
 ---
 
-### 8.2 Safe Refactoring Strategies for Legacy Code (Michael Feathers)
+### 8.2 Code Smell Catalog & Automated Static Analysis
+
+#### The Five Families of Structural Code Smells
+Following Martin Fowler and Kent Beck's refactoring taxonomy, structural code smells fall into five diagnostic families:
+
+| Smell Category | Specific Smells | Enterprise .NET Symptom & Remediation |
+|---|---|---|
+| **1. Bloaters** | Long Method, Large Class (God Object), Primitive Obsession, Long Parameter List, Data Clumps | Passing `(string street, string city, string zip, string country)` to 12 methods instead of a `PostalAddress` `readonly record struct`; using `decimal` and `string` instead of a strongly-typed `Money` value object. |
+| **2. Object-Orientation Abusers** | Switch Statements on Type Codes, Refused Bequest, Temporary Field, Alternative Classes with Different Interfaces | Subclasses inheriting from a base class solely to reuse 2 helper methods while throwing `NotSupportedException` on virtual overrides (Refused Bequest / LSP violation) $\to$ Replace inheritance with composition. |
+| **3. Change Preventers** | Divergent Change, Shotgun Surgery, Parallel Inheritance Hierarchies | **Divergent Change:** One class (`OrderService`) is modified for tax rules, SQL tweaks, and email templates (violates SRP). **Shotgun Surgery:** Adding one tax field requires editing 14 files across 6 projects (violates CCP). |
+| **4. Dispensables** | Dead Code, Speculative Generality, Redundant Comments, Lazy Class | Interfaces with a single implementation and zero test doubles created "for future flexibility" (Speculative Generality) $\to$ Collapse hierarchy until the Rule of Three applies. |
+| **5. Couplers** | Feature Envy, Inappropriate Intimacy, Message Chains, Middle Man | **Feature Envy:** A method in `InvoiceCalculator` accesses 9 properties of `CustomerTier` to compute a discount $\to$ Move the method onto `CustomerTier`. |
+
+#### Enforcing Architectural Hygiene via `.editorconfig` and Roslyn Analyzers
+Senior engineers do not rely on human willpower during code reviews to catch nullability bypasses, unused values, or async pitfalls; they fail the CI build deterministically using `.NET SDK AnalysisLevel` and `.editorconfig`:
+
+```ini
+# .editorconfig — Enterprise Senior Engineering Baseline
+root = true
+
+[*.cs]
+# Treat asynchronous and resource-lifecycle bugs as compile-time errors
+dotnet_diagnostic.CA2007.severity = none       # No ConfigureAwait(false) noise in ASP.NET Core app code
+dotnet_diagnostic.CA2000.severity = error      # Dispose objects before losing scope
+dotnet_diagnostic.CA1859.severity = warning    # Use concrete types when possible for improved JIT devirtualization
+dotnet_diagnostic.CA1822.severity = warning    # Mark members as static when they do not access instance data
+dotnet_diagnostic.CA1068.severity = error      # CancellationToken parameters must come last
+dotnet_diagnostic.CS8600.severity = error      # Converting null literal or possible null value to non-nullable type
+dotnet_diagnostic.CS8602.severity = error      # Dereference of a possibly null reference
+```
+
+---
+
+### 8.3 Safe Refactoring Strategies for Legacy Code (Michael Feathers)
 
 When modifying legacy systems without existing automated test coverage:
 1. **Find a Seam:** A seam is a place where you can alter program behavior without editing the source code in place (e.g., an interface, a virtual method, a DI registration).
@@ -1301,7 +1536,46 @@ When modifying legacy systems without existing automated test coverage:
 
 ---
 
-### 8.3 Backwards Compatibility & Versioning in C#
+### 8.4 Extensibility Without Over-Engineering
+
+#### Designing Extension Points Only at Proven Variation Points
+True architectural agility comes from keeping code simple and cohesive so that adding an extension point *when the second or third variation arrives* takes 15 minutes—not from littering the codebase with speculative plugin engines on day one.
+
+1. **Identify the Axis of Volatility:** Before introducing an abstraction, ask: *"What concrete force has caused this module to change in the last 6 months?"* If the answer is "nothing," keep it a `sealed` concrete class.
+2. **Closed Core, Open Seams:** When variation is proven (e.g., supporting multiple regional tax authorities or fraud rules), define a narrow role interface (`IFraudRule`) and compose instances via constructor-injected `IEnumerable<IFraudRule>` or a Decorator pipeline.
+
+```csharp
+public sealed record FraudEvaluationContext(OrderId OrderId, CustomerId CustomerId, Money Amount, string IpCountry);
+public readonly record struct FraudVerdict(bool IsApproved, string? RejectionReason = null);
+
+// Narrow extension seam introduced ONLY after multiple fraud rules became a concrete business requirement
+public interface IFraudDetectionRule
+{
+    int PriorityOrder { get; }
+    ValueTask<FraudVerdict> EvaluateAsync(FraudEvaluationContext context, CancellationToken ct);
+}
+
+public sealed class FraudEvaluationPipeline(IEnumerable<IFraudDetectionRule> rules)
+{
+    private readonly IFraudDetectionRule[] _orderedRules = [.. rules.OrderBy(r => r.PriorityOrder)];
+
+    public async ValueTask<FraudVerdict> EvaluateAsync(FraudEvaluationContext context, CancellationToken ct)
+    {
+        foreach (var rule in _orderedRules)
+        {
+            var verdict = await rule.EvaluateAsync(context, ct);
+            if (!verdict.IsApproved)
+                return verdict; // Short-circuit immediately on first rule rejection
+        }
+
+        return new FraudVerdict(IsApproved: true);
+    }
+}
+```
+
+---
+
+### 8.5 Backwards Compatibility & Versioning in C#
 
 In enterprise libraries and shared NuGet packages:
 - **Binary Compatibility:** Existing compiled consumer DLLs can run against the new assembly without recompilation.
@@ -1395,6 +1669,170 @@ public sealed class OrderConfiguration : IEntityTypeConfiguration<Order>
 
 ---
 
+### 9.3 Middleware Pipeline Architecture
+
+#### Chain of Responsibility in ASP.NET Core
+The ASP.NET Core HTTP pipeline is a canonical implementation of the **Chain of Responsibility** and **Russian Doll (Decorator)** patterns. Each middleware component wraps the next `RequestDelegate` in the pipeline, executing pre-processing logic on the inbound pass, awaiting `next(context)`, and executing post-processing logic on the outbound pass—or **short-circuiting** the pipeline by returning early without invoking `next`.
+
+#### Convention-Based Middleware vs Factory-Activated `IMiddleware`
+| Characteristic | Convention-Based Middleware | `IMiddleware` (Factory-Activated) |
+|---|---|---|
+| **Lifetime** | **Singleton** (instantiated once at host startup). | Determined by DI registration (`Scoped` or `Transient`). |
+| **Dependency Injection** | Constructor can only inject `Singleton` services; `Scoped` services must be injected into `InvokeAsync(HttpContext, MyScopedService)`. | Constructor can safely inject `Scoped` services (e.g., `AppDbContext`, `ITenantContext`) directly without captive dependency bugs. |
+| **Contract Enforcement** | Duck-typed (`Invoke` / `InvokeAsync` method resolved via reflection at startup). | Strongly-typed compile-time interface `IMiddleware`. |
+
+#### Ambient Context Propagation with `AsyncLocal<T>`
+When propagating cross-cutting correlation IDs or tenant identifiers across asynchronous `await` boundaries without polluting every domain method signature, `ThreadLocal<T>` fails because continuations after `await` resume on arbitrary thread-pool threads. `AsyncLocal<T>` stores state inside the CLR's `ExecutionContext`, which flows automatically (copy-on-write) across `Task.Run`, `await`, and child async flows.
+
+```csharp
+public sealed record TenantSnapshot(string TenantId, string CorrelationId);
+
+public static class AmbientTenantContext
+{
+    private static readonly AsyncLocal<TenantSnapshot?> CurrentSnapshot = new();
+
+    public static TenantSnapshot? Current => CurrentSnapshot.Value;
+
+    public static IDisposable BeginScope(TenantSnapshot snapshot)
+    {
+        var prior = CurrentSnapshot.Value;
+        CurrentSnapshot.Value = snapshot;
+        return new ScopeResetter(prior);
+    }
+
+    private sealed class ScopeResetter(TenantSnapshot? prior) : IDisposable
+    {
+        public void Dispose() => CurrentSnapshot.Value = prior;
+    }
+}
+
+public sealed class TenantResolutionMiddleware : IMiddleware
+{
+    public async Task InvokeAsync(HttpContext context, RequestDelegate next)
+    {
+        if (!context.Request.Headers.TryGetValue("X-Tenant-Id", out var tenantHeader) ||
+            string.IsNullOrWhiteSpace(tenantHeader))
+        {
+            // Short-circuit pipeline immediately: downstream handlers and DB queries never execute
+            context.Response.StatusCode = StatusCodes.Status400BadRequest;
+            await context.Response.WriteAsJsonAsync(new ProblemDetails
+            {
+                Title = "Missing Tenant Identifier",
+                Detail = "The X-Tenant-Id header is required for all API requests.",
+                Status = StatusCodes.Status400BadRequest
+            });
+            return;
+        }
+
+        var snapshot = new TenantSnapshot(tenantHeader.ToString(), context.TraceIdentifier);
+        using (AmbientTenantContext.BeginScope(snapshot))
+        {
+            await next(context);
+        }
+    }
+}
+```
+
+---
+
+### 9.4 Separation of Concerns in Web APIs
+
+#### Minimal APIs vs Controllers & Validation Pipelines
+Whether using Minimal APIs (`MapPost` with `IEndpointFilter`) or Controllers, an HTTP endpoint's **sole responsibility** is protocol translation:
+1. Bind and validate transport input (via an `IEndpointFilter` or MediatR validation behavior).
+2. Dispatch a command/query to the application/domain layer.
+3. Translate the `Result<TValue>` into an HTTP status code or **RFC 9457 `ProblemDetails`** payload.
+
+```csharp
+public sealed class ValidationEndpointFilter<TRequest>(IValidator<TRequest> validator) : IEndpointFilter
+    where TRequest : class
+{
+    public async ValueTask<object?> InvokeAsync(
+        EndpointFilterInvocationContext context,
+        EndpointFilterDelegate next)
+    {
+        var request = context.Arguments.OfType<TRequest>().FirstOrDefault();
+        if (request is null)
+            return TypedResults.BadRequest();
+
+        var validation = await validator.ValidateAsync(request, context.HttpContext.RequestAborted);
+        if (!validation.IsValid)
+        {
+            return TypedResults.ValidationProblem(validation.ToDictionary());
+        }
+
+        return await next(context);
+    }
+}
+
+public static class OrderProblemMapper
+{
+    public static IResult ToProblemDetails(Error error, HttpContext httpContext) =>
+        TypedResults.Problem(new ProblemDetails
+        {
+            Type = $"https://api.enterprise.internal/errors/{error.Code}",
+            Title = "Domain Rule Violation",
+            Detail = error.Message,
+            Status = error.Code switch
+            {
+                "Order.NotFound" => StatusCodes.Status404NotFound,
+                "Order.ConcurrentConflict" => StatusCodes.Status409Conflict,
+                _ => StatusCodes.Status422UnprocessableEntity
+            },
+            Instance = httpContext.Request.Path
+        });
+}
+```
+
+---
+
+### 9.5 Enterprise Integration Boundaries
+
+#### Hexagonal Architecture (Ports & Adapters) and the Anti-Corruption Layer (ACL)
+When integrating with a legacy ERP or external payment provider whose data model is cryptic, unstable, or anemic, allowing external SDK types (`Stripe.Charge`, `LegacySapInvoiceXml`) to enter your domain model couples your core business logic to third-party volatility.
+
+- **Port (Domain Interface):** Defined inside your Application/Domain project using pure Ubiquitous Language (`ICreditBureauPort`).
+- **Adapter + Anti-Corruption Layer (Infrastructure Implementation):** Lives in the Infrastructure project, invokes the external transport, and translates foreign codes, quirks, and error shapes into clean domain value objects.
+
+```csharp
+// PORT: Lives in Core Domain — zero awareness of legacy SOAP/XML or vendor quirks
+public enum CreditRiskRating { Prime, Standard, HighRisk, Frozen }
+public sealed record CreditAssessment(CustomerId CustomerId, CreditRiskRating Rating, Money ApprovedLimit);
+
+public interface ICreditBureauPort
+{
+    Task<Result<CreditAssessment>> EvaluateCustomerCreditAsync(CustomerId customerId, CancellationToken ct);
+}
+
+// EXTERNAL VENDOR DTO: Cryptic legacy Mainframe/SOAP response shape
+public sealed record LegacyEquifaxPayload(string CustRef, int RawScoreCode, string? FreezeFlag, long CentsLimit);
+
+// ADAPTER & ANTI-CORRUPTION LAYER (ACL): Lives in Infrastructure — quarantines external ugliness
+public sealed class EquifaxAntiCorruptionAdapter(ILegacySoapClient soapClient) : ICreditBureauPort
+{
+    public async Task<Result<CreditAssessment>> EvaluateCustomerCreditAsync(CustomerId customerId, CancellationToken ct)
+    {
+        LegacyEquifaxPayload raw = await soapClient.FetchScoreAsync(customerId.Value.ToString("N"), ct);
+
+        if (raw.RawScoreCode == -999)
+            return Result<CreditAssessment>.Failure(new Error("CreditBureau.Unavailable", "Upstream mainframe offline."));
+
+        CreditRiskRating rating = (raw.FreezeFlag, raw.RawScoreCode) switch
+        {
+            ("Y", _) => CreditRiskRating.Frozen,
+            (_, >= 740) => CreditRiskRating.Prime,
+            (_, >= 620) => CreditRiskRating.Standard,
+            _ => CreditRiskRating.HighRisk
+        };
+
+        var limit = new Money(raw.CentsLimit / 100m, "USD");
+        return Result<CreditAssessment>.Success(new CreditAssessment(customerId, rating, limit));
+    }
+}
+```
+
+---
+
 ### Section 9 Review: Interview Questions & Practice Exercises
 
 #### Realistic Interview Questions & Strong Model Answers
@@ -1475,7 +1913,30 @@ public class InvoiceService
 
 ---
 
-### 10.3 Capstone Scenario
+### 10.3 Defending Architectural Trade-Offs & Staged Legacy Migration (Strangler Fig)
+
+#### Structuring Senior Interview Responses: Context $\to$ Forces $\to$ Decision $\to$ Trade-offs
+In senior and staff interviews, there are no universally "correct" architectures—only trade-offs aligned with specific business constraints. When defending a design decision, structure your answer around four pillars:
+1. **Context & Scale:** Quantify throughput, team topology, regulatory constraints, and SLA targets (e.g., "200 RPS peak, strict PCI-DSS auditability, 6-engineer team").
+2. **Competing Design Forces:** State the tension explicitly (e.g., "Immediate transactional consistency vs cross-service availability during downstream ERP maintenance windows").
+3. **The Chosen Architecture & Why Alternatives Were Rejected:** Explain why a Modular Monolith with an transactional Outbox beat a premature 12-microservice mesh for a 6-person team.
+4. **Accepted Downsides & Mitigation:** Acknowledge what your design sacrifices and how you monitor or bound that risk.
+
+#### Staged Legacy Migration: The Strangler Fig Pattern & Branch by Abstraction
+Never propose a "Big Bang" 12-month freeze-and-rewrite of a revenue-generating production system. Instead, migrate incrementally in production using the **Strangler Fig Pattern**:
+
+1. **Introduce an Abstraction Seam (Proxy / Router / `IFulfillmentEngine`):** Place an interception point in front of the legacy subsystem.
+2. **Dark Launching & Shadow Traffic (Verification Phase):** Execute the new refactored domain logic in parallel with the legacy path (in a fire-and-forget shadow background task), comparing the outputs of `LegacyEngine` and `ModernEngine` and logging discrepancies to telemetry without affecting user responses.
+3. **Canary Rollout via Feature Flags:** Route 1% $\to$ 10% $\to$ 50% $\to$ 100% of live traffic (by `TenantId` or `OrderId` hash) to `ModernEngine`, with an instant kill-switch fallback to `LegacyEngine` if error rates spike.
+4. **Expand-and-Contract Database Schema Migration:**
+   - *Expand:* Add nullable new columns/tables alongside legacy columns; deploy dual-write code that populates both.
+   - *Backfill:* Migrate historical rows in idempotent background batches.
+   - *Switch Reads:* Point application reads to the new schema.
+   - *Contract:* Remove legacy writes and drop obsolete columns in a subsequent release.
+
+---
+
+### 10.4 Capstone Scenario
 
 You are asked in an interview:
 > *"We have an enterprise e-commerce platform processing 10,000 orders an hour. During flash sales, the inventory service frequently allows products to oversell. The legacy codebase uses a monolithic `OrderService` that updates stock balances directly in a SQL transaction with no optimistic locking. Walk us through how you would diagnose the failure, redesign the domain model, and refactor the architecture safely."*
@@ -1485,6 +1946,26 @@ You are asked in an interview:
 2. **Domain Boundary Redesign:** Encapsulate `InventoryItem` as an aggregate root with an invariant: `DeductStock(int quantity)` throws if quantity exceeds available stock.
 3. **Concurrency Control:** Implement optimistic concurrency control via a `RowVersion` / concurrency token in EF Core, or use an atomic SQL increment statement (`UPDATE Inventory SET Stock = Stock - @qty WHERE Id = @id AND Stock >= @qty`).
 4. **Architectural Decoupling:** Decouple order placement from immediate inventory fulfillment using an asynchronous reservation pattern backed by messaging (Outbox pattern).
+
+---
+
+### Section 10 Review: Interview Questions & Practice Exercises
+
+#### Realistic Interview Questions & Strong Model Answers
+
+**Q1: Why did instantiating `new HttpClient()` inside `InvoiceService.ProcessInvoice()` receive a P0 blocker severity in the code review?**
+> **Strong answer:** Although `HttpClient` implements `IDisposable`, disposing or re-instantiating it per request creates a new underlying `HttpMessageHandler` and TCP socket connection every time. When disposed, OS sockets do not close immediately; they remain in the `TIME_WAIT` state for up to 240 seconds to catch delayed packets. Under bursty enterprise traffic, this rapidly exhausts the ephemeral TCP port pool on the host machine, throwing `SocketException` across the entire process. Additionally, a single static `HttpClient` without handler rotation ignores DNS TTL changes. The production fix is injecting `IHttpClientFactory` (or a typed `HttpClient`), which pools and rotates `SocketsHttpHandler` instances safely while respecting DNS updates.
+
+**Q2: How do you convince product management to invest engineering sprints in refactoring an anemic, tightly coupled legacy module when "it currently works"?**
+> **Strong answer:** Avoid pitching refactoring in abstract technical terms like 'SOLID compliance' or 'code aesthetics.' Frame technical debt using Martin Fowler's interest-vs-principal model tied directly to business delivery metrics: lead time for changes, change failure rate (production incidents), and onboarding velocity. Show concrete evidence—for instance, that adding a new payment method took 3 weeks instead of 2 days due to shotgun surgery across 18 files and caused two regression outages. Then propose an incremental Strangler Fig or Sprout Class strategy folded into upcoming feature work on that module, guaranteeing zero feature freeze and measurable defect reduction.
+
+**Q3: During a Strangler Fig migration, how do you verify that your newly refactored domain service produces identical financial calculations to a 10-year-old legacy stored procedure before switching live traffic?**
+> **Strong answer:** We use **Branch by Abstraction** combined with a **Shadow / Dark-Read Comparison Harness**. The legacy stored procedure remains the authoritative source of truth that returns the response to the caller and commits state. Concurrently, we capture an immutable snapshot of the input request and run the new C# domain model in an isolated, read-only shadow execution path (guarded by a timeout and exception bulkhead so shadow failures never impact production). A comparison telemetry sink diffs the legacy output against the new domain output—checking line-item rounding, tax edge cases, and currency conversions—and emits structured mismatch events. Only after millions of production shadow executions achieve 100% parity do we flip the feature flag to cut over live writes.
+
+#### Practical Exercises
+1. **Exercise 10.1:** Take the flawed `InvoiceService` from Section 10.2 and write the complete, production-ready refactored solution: an encapsulated `Invoice` aggregate root, an `InvoiceId` strong ID, an `IUrgentNotificationPort` adapter using `HttpClient`, and a unit-tested application handler.
+2. **Exercise 10.2:** Design and implement a generic `ShadowParityVerifier<TInput, TOutput>` decorator in C# that executes a primary legacy delegate and a secondary candidate delegate concurrently, logs structural differences via `ILogger`, and guarantees that exceptions or slowdowns in the candidate path never delay or fail the primary response.
+3. **Exercise 10.3:** Write a 4-stage Expand-and-Contract migration plan (with C# entity states and SQL steps) to split a single `Customer.FullName` column into `GivenName` and `FamilyName` across a live zero-downtime ASP.NET Core deployment.
 
 ---
 

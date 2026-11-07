@@ -1,38 +1,54 @@
 # Module 11 — DevOps & Engineering Processes
 
-> **Senior Software Engineer Academy** · Advanced Professional Curriculum · Module 11 of 12
+**Senior Software Engineer Academy · Module 11 of 12**
 
----
+> **Learning objective:** Master the end-to-end engineering processes, delivery pipelines, cloud-native container orchestration, infrastructure as code, observability, supply-chain security, and incident management practices expected of a Senior or Staff Software Engineer. The goal is not merely to write YAML scripts, but to architect resilient, zero-downtime delivery pipelines, instrument distributed .NET systems with OpenTelemetry, enforce cryptographic supply-chain provenance, and lead blameless operational excellence.
+>
+> **Audience:** Experienced C#/.NET engineers preparing for Senior and Staff Software Engineer interviews. Familiarity with Git, Docker, CI/CD, and cloud platforms (Azure/AWS) is assumed, and every topic is examined from internal mechanics through enterprise failure modes.
+>
+> **Version note:** Code, container, and pipeline examples target .NET 8 LTS and .NET 9, Ubuntu Chiseled distroless containers, GitHub Actions / Azure DevOps YAML, Azure Bicep, Kubernetes (AKS), and OpenTelemetry (`System.Diagnostics.Activity` / `Meter`).
 
-## Progress Tracker
+## How to use this module
+
+Every section in Part II provides comprehensive senior-level instruction:
+1. **Fundamentals & Internal Mechanics:** Precise definitions, DAG/object layouts, protocol handshakes, and operational forces.
+2. **C#/.NET & Cloud-Native Implementation:** Production-grade C#, Dockerfile, YAML, Bicep, and KQL implementations.
+3. **Enterprise Application:** Realistic scenarios in zero-downtime releases, multi-replica orchestration, and high-throughput telemetry.
+4. **Trade-offs, Alternatives & Failure Modes:** Where pipelines, probes, and deployment topologies break under load or partial failure.
+5. **What a Senior Engineer Is Expected to Know:** The contrast between a mid-level and a senior/staff answer.
+6. **Interview Questions with Model Answers:** Real interview questions with structured, senior-level responses.
+7. **Practical Exercises:** Deep problems without inline solutions, designed to test operational and architectural judgment.
+
+## Progress tracker
 
 | Section | Topic | Status |
 |---|---|---|
-| 1 | DevOps Foundations: CALMS, The Three Ways, DORA Metrics & Team Topologies | Completed |
-| 2 | Git Internals & Branching Strategies: Object Model, Rebase vs Merge, Bisect & Trunk-Based Development | Completed |
-| 3 | Continuous Integration: Stages, Reproducible Builds, Central Package Management, SBOM & Test Parallelism | Completed |
-| 4 | CI/CD Platforms & Secure Automation: GitHub Actions & Azure DevOps YAML, OIDC Workload Identity | Completed |
-| 5 | Continuous Delivery & Pipeline Architecture: Build Once Deploy Many, Env Config & DB Migration Gates | Completed |
-| 6 | Deployment Strategies: Rolling, Blue-Green, Canary, Feature Flags (Azure App Configuration) & Rollbacks | Completed |
-| 7 | Containers & Orchestration: Multi-Stage Docker, Chiseled .NET, Kubernetes AKS Architecture & Probes | Completed |
-| 8 | Infrastructure as Code (IaC): Declarative Bicep vs Terraform, State Drift, Managed Identities & GitOps | Completed |
-| 9 | Observability Engineering: OpenTelemetry in .NET, Activity/Meter, Azure Monitor, KQL & SLO Burn Alerts | Completed |
-| 10 | Incident Management & Operations: On-Call, Severity Levels, Incident Commander & Blameless Postmortems | Completed |
-| 11 | DevSecOps & Supply Chain Security: SLSA Framework, Secret/Container Scanning & Branch Protection | Completed |
-| 12 | Agile Flow Metrics & Lean Delivery: Scrum Anti-Patterns, Kanban WIP Limits, Cycle Time & CFD | Completed |
-| 13 | Enterprise Change Management: Automated Audit Trails, SOC 2 / ISO 27001 Compliance & Modern CAB | Completed |
-| 14 | DevOps Capstone: End-to-End GitOps on Azure AKS with Bicep, Canary Rollout & Sev-1 Postmortem | Completed |
+| Section 1 | DevOps Foundations: CALMS, The Three Ways, DORA Metrics & Team Topologies | Complete |
+| Section 2 | Git Internals & Branching Strategies: Object Model, Rebase vs Merge, Bisect & Trunk-Based Development | Complete |
+| Section 3 | Continuous Integration: Stages, Reproducible Builds, Central Package Management, SBOM & Test Parallelism | Complete |
+| Section 4 | CI/CD Platforms & Secure Automation: GitHub Actions & Azure DevOps YAML, OIDC Workload Identity | Complete |
+| Section 5 | Continuous Delivery & Pipeline Architecture: Build Once Deploy Many, Env Config & DB Migration Gates | Complete |
+| Section 6 | Deployment Strategies: Rolling, Blue-Green, Canary, Feature Flags (Azure App Configuration) & Rollbacks | Complete |
+| Section 7 | Containers & Orchestration: Multi-Stage Docker, Chiseled .NET, Kubernetes AKS Architecture & Probes | Complete |
+| Section 8 | Infrastructure as Code (IaC): Declarative Bicep vs Terraform, State Drift, Managed Identities & GitOps | Complete |
+| Section 9 | Observability Engineering: OpenTelemetry in .NET, Activity/Meter, Azure Monitor, KQL & SLO Burn Alerts | Complete |
+| Section 10 | Incident Management & Operations: On-Call, Severity Levels, Incident Commander & Blameless Postmortems | Complete |
+| Section 11 | DevSecOps & Supply Chain Security: SLSA Framework, Secret/Container Scanning & Branch Protection | Complete |
+| Section 12 | Agile Flow Metrics & Lean Delivery: Scrum Anti-Patterns, Kanban WIP Limits, Cycle Time & CFD | Complete |
+| Section 13 | Enterprise Change Management: Automated Audit Trails, SOC 2 / ISO 27001 Compliance & Modern CAB | Complete |
+| Section 14 | DevOps Capstone: End-to-End GitOps on Azure AKS with Bicep, Canary Rollout & Sev-1 Postmortem | Complete |
 
----
+**Current position:** Full curriculum complete. Ready for self-study, exercises, and interview drills.
 
-## Module Boundaries
+## Module boundaries
 
+- **This module owns:** DevOps culture and DORA metrics, Git internals and trunk-based workflows, CI/CD pipeline engineering, OIDC workload federation, progressive delivery strategies, Docker and Kubernetes orchestration for .NET, Bicep/Terraform IaC and GitOps, OpenTelemetry observability, incident command and blameless postmortems, SLSA supply-chain security, Kanban flow metrics, and continuous compliance.
 - **Upstream Dependencies:**
-  - [Module 03 — C# & .NET Internals](file:///module_03_dotnet_internals.md): Low-level performance, memory profiling, and ASP.NET Core hosting model running in Linux container environments.
-  - [Module 05 — Databases & Data Engineering](file:///module_05_databases_data_engineering.md): Zero-downtime expand/contract schema migrations executed within continuous delivery pipelines.
-  - [Module 09 — Testing & Quality Engineering](file:///module_09_testing_quality_engineering.md): Automated test gates, unit, integration, contract, and mutation testing running in CI pipelines.
+  - [Module 03 — C# & .NET Internals](module_03_dotnet_internals.md): Low-level performance, memory profiling, cgroup-aware GC, and ASP.NET Core hosting model running in Linux container environments.
+  - [Module 05 — Databases & Data Engineering](module_05_databases_data_engineering.md): Zero-downtime expand/contract schema migrations executed within continuous delivery pipelines.
+  - [Module 09 — Testing & Quality Engineering](module_09_testing_quality_engineering.md): Automated test gates, unit, integration, contract, and mutation testing running in CI pipelines.
 - **Downstream Dependents:**
-  - [Module 12 — Senior Engineering Leadership](file:///module_12_senior_engineering_leadership.md): Incident communication, engineering culture, flow metrics, and capacity estimation.
+  - [Module 12 — Senior Engineering Leadership](module_12_senior_engineering_leadership.md): Incident communication, engineering culture, flow metrics, and capacity estimation.
 
 ---
 
@@ -52,6 +68,136 @@ A Senior Software Engineer does not treat CI/CD, deployment, and infrastructure 
 |  - Small PR Batches   - SBOM Generation (CycloneDX)- Azure App Config Flags   - Blameless Postmortems |
 +-------------------------------------------------------------------------------------------------------+
 ```
+
+## Section 1 — DevOps Foundations: CALMS, The Three Ways, DORA Metrics & Team Topologies
+**Outcome:** Evaluate and re-architect organizational delivery systems using empirical DORA metrics, Theory of Constraints, and Team Topologies.
+- 1.1 The CALMS Framework: Culture, Automation, Lean, Measurement, and Sharing as mutually reinforcing pillars.
+- 1.2 The Three Ways: Systems thinking and left-to-right flow, right-to-left feedback amplification, and psychological safety for continuous experimentation.
+- 1.3 DORA Four Key Metrics: Throughput (Deployment Frequency, Lead Time for Changes) vs Stability (Change Failure Rate, Failed Deployment Recovery Time / MTTR).
+- 1.4 Team Topologies: Stream-aligned, Enabling, Complicated-Subsystem, and Platform teams; interaction modes (Collaboration, X-as-a-Service, Facilitating) and cognitive load management.
+**Senior-level bar:** Diagnose why an organization's DORA metrics are lagging without sacrificing stability, and design self-service platform capabilities that reduce stream-aligned team cognitive load.
+
+---
+
+## Section 2 — Git Internals & Branching Strategies: Object Model, Rebase vs Merge, Bisect & Trunk-Based Development
+**Outcome:** Manipulate Git's directed acyclic graph (DAG) directly and enforce branching workflows that eliminate merge freezes.
+- 2.1 The Git Content-Addressable Object Model: Blobs, Trees, Commits, and Annotated Tags; SHA hashing mechanics and `.git/index` staging semantics.
+- 2.2 Graph Topology Operations: `git merge` (3-way merge commits) vs `git rebase` (commit replay and linear history) vs `git merge --squash` (atomic trunk commits); recovery via `git reflog`.
+- 2.3 Automated Regression Hunting: Binary search across commit history using `git bisect run` with `dotnet test`.
+- 2.4 Branching Topologies: Why GitFlow fails in continuous delivery; Trunk-Based Development, short-lived branches (<24h), and Branch by Abstraction.
+**Senior-level bar:** Explain the exact disk structure of `.git/objects`, recover corrupted or force-pushed branches via `reflog`, and migrate a 50-engineer team from GitFlow to Trunk-Based Development safely.
+
+---
+
+## Section 3 — Continuous Integration: Stages, Reproducible Builds, Central Package Management, SBOM & Test Parallelism
+**Outcome:** Architect fast, deterministic, hermetic .NET CI pipelines with locked dependency graphs and automated Software Bills of Materials.
+- 3.1 CI Pipeline Anatomy: Restore caching, deterministic compilation (`TreatWarningsAsErrors`), parallel unit/integration testing, static analysis, and artifact packaging.
+- 3.2 Central Package Management (CPM): `Directory.Packages.props`, transitive pinning, and `packages.lock.json` lockfiles in .NET 8/9.
+- 3.3 Reproducible Builds & Deterministic Binaries: Compiler flags (`<Deterministic>true</Deterministic>`, `<ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>`), source link, and symbol servers.
+- 3.4 Software Bill of Materials (SBOM) & Test Sharding: SPDX / CycloneDX generation and parallel test execution strategies to keep CI under 10 minutes.
+**Senior-level bar:** Design a multi-project .NET 9 CI build that produces byte-for-byte identical binaries, enforces transitive NuGet lockfile verification, and executes 5,000 tests in under 8 minutes.
+
+---
+
+## Section 4 — CI/CD Platforms & Secure Automation: GitHub Actions & Azure DevOps YAML, OIDC Workload Identity
+**Outcome:** Build declarative, secretless CI/CD pipelines using OpenID Connect (OIDC) federated workload identities.
+- 4.1 Declarative Pipeline Engineering: Reusable workflows, composite actions, matrix strategies, and environment protection rules in GitHub Actions and Azure DevOps.
+- 4.2 OIDC Workload Identity Federation: Eliminating static service principal secrets; JWT token exchange between GitHub/AzDO OIDC issuer and Microsoft Entra ID.
+- 4.3 Least-Privilege Pipeline Security: Scoping `permissions` blocks, pinning third-party actions by commit SHA, and securing private runner fleets.
+**Senior-level bar:** Explain the cryptographic OIDC token exchange handshake between GitHub Actions and Azure Entra ID (`issuer`, `subject`, `audience` claims) and eliminate all static cloud credentials from CI/CD.
+
+---
+
+## Section 5 — Continuous Delivery & Pipeline Architecture: Build Once Deploy Many, Env Config & DB Migration Gates
+**Outcome:** Decouple artifact creation from environment promotion and orchestrate zero-downtime database schema migrations in delivery pipelines.
+- 5.1 Build Once, Deploy Many: Promoting immutable container digests across Dev, Staging, and Production without recompilation.
+- 5.2 Runtime Configuration Injection: Environment variables, Kubernetes ConfigMaps/Secrets, Azure App Configuration, and Key Vault CSI drivers.
+- 5.3 Database Migration Pipeline Gates: Why `Database.Migrate()` on startup fails in multi-replica clusters; idempotent migration scripts (`--idempotent`) and expand/contract schema evolution.
+**Senior-level bar:** Architect a multi-stage deployment pipeline where schema migrations execute as isolated pre-deploy gates with strict backward compatibility ($N-1$ container support) so code rollbacks never require database restores.
+
+---
+
+## Section 6 — Deployment Strategies: Rolling, Blue-Green, Canary, Feature Flags (Azure App Configuration) & Rollbacks
+**Outcome:** Select and implement progressive delivery topologies that decouple physical deployment from functional feature release.
+- 6.1 Deployment Topology Trade-Offs: Recreate, Rolling Update (`maxSurge` / `maxUnavailable`), Blue-Green, Canary, and Shadow / Dark Launching.
+- 6.2 Feature Management in .NET: `Microsoft.FeatureManagement`, Azure App Configuration, percentage rollouts, targeting filters, and kill switches.
+- 6.3 Automated Rollback Mechanics: Telemetry-driven rollback triggers, stateful vs stateless rollback considerations, and feature flag lifecycle hygiene.
+**Senior-level bar:** Combine Canary traffic shifting at the ingress layer with user-targeted feature flags in .NET to roll out high-risk pricing logic with sub-second kill-switch capability.
+
+---
+
+## Section 7 — Containers & Orchestration: Multi-Stage Docker, Chiseled .NET, Kubernetes AKS Architecture & Probes
+**Outcome:** Package .NET applications into hardened, minimal, non-root containers and orchestrate their full lifecycle in Kubernetes.
+- 7.1 Multi-Stage Dockerfiles & Layer Caching: Optimizing NuGet restore layers, stripping SDK toolchains, and targeting Ubuntu Chiseled (`noble-chiseled`) rootless images.
+- 7.2 Kubernetes Pod Lifecycle & Health Probes: Startup, Liveness, and Readiness probes; why checking SQL/Redis in liveness probes causes cascading cluster blackouts.
+- 7.3 ASP.NET Core Health Checks & Graceful Shutdown: `AddHealthChecks`, tag-based filtering (`"live"` vs `"ready"`), `SIGTERM` handling, `preStop` hooks, and `HostOptions.ShutdownTimeout`.
+- 7.4 Resource Requests, Limits & Linux cgroups: CPU throttling (CFS quotas) vs memory OOM-Kills (`Exit Code 137`) and .NET Server GC heap sizing in containers.
+**Senior-level bar:** Implement differentiated `/health/live` and `/health/ready` endpoints in ASP.NET Core 9, configure zero-dropped-request `SIGTERM` draining in Kubernetes, and tune .NET GC memory limits against container cgroup v2 ceilings.
+
+---
+
+## Section 8 — Infrastructure as Code (IaC): Declarative Bicep vs Terraform, State Drift, Managed Identities & GitOps
+**Outcome:** Provision immutable cloud infrastructure declaratively and enforce continuous state reconciliation via GitOps controllers.
+- 8.1 Declarative IaC Mechanics: Azure Bicep (ARM transpilation, live Azure state) vs Terraform (HCL, multi-cloud providers, remote `.tfstate` locking).
+- 8.2 Passwordless Cloud Security: Provisioning User-Assigned Managed Identities and deterministic RBAC role assignments in Bicep.
+- 8.3 GitOps Architecture (Argo CD & Flux): Pull-based in-cluster reconciliation loops vs push-based CI deployment; automated drift detection and self-healing.
+**Senior-level bar:** Contrast Bicep and Terraform state models, write modular Bicep with least-privilege Managed Identities, and design a pull-based GitOps topology where CI never holds cluster-admin credentials.
+
+---
+
+## Section 9 — Observability Engineering: OpenTelemetry in .NET, Activity/Meter, Azure Monitor, KQL & SLO Burn Alerts
+**Outcome:** Instrument distributed .NET systems using vendor-neutral OpenTelemetry APIs and configure low-noise multi-window SLO burn-rate alerts.
+- 9.1 The Three Pillars & OpenTelemetry in .NET: `ActivitySource` / `Activity` (Traces), `Meter` / `Counter` / `Histogram` (Metrics), and structured `ILogger` correlation (`traceparent` W3C propagation).
+- 9.2 High-Cardinality Pitfalls & Telemetry Pipelines: Metric dimension explosion vs trace attributes; head-based vs tail-based sampling in the OpenTelemetry Collector.
+- 9.3 Kusto Query Language (KQL): Aggregating P95/P99 latencies, correlating exceptions across microservices, and anomaly detection in Azure Monitor.
+- 9.4 SLIs, SLOs, Error Budgets & Burn-Rate Alerting: Why static threshold alerts fail; Google SRE multi-window, multi-burn-rate alerting math.
+**Senior-level bar:** Instrument a custom .NET `ActivitySource` and `Meter`, write KQL queries to isolate tail-latency regressions, and calculate exact multi-window burn-rate alert thresholds for a 99.9% SLO.
+
+---
+
+## Section 10 — Incident Management & Operations: On-Call, Severity Levels, Incident Commander & Blameless Postmortems
+**Outcome:** Lead high-pressure production incident triage with structured command roles and author blameless postmortems that eliminate systemic failure classes.
+- 10.1 Severity Taxonomy & Escalation: Sev-1 through Sev-3 definitions, paging policies, war-room assembly, and executive communication cadences.
+- 10.2 Incident Command System (ICS): Incident Commander (IC), Communications Lead, and Operations Lead; why the IC must never debug code.
+- 10.3 Mitigate First, Debug Later: Traffic shifting, rollbacks, feature kill-switches, and preserving forensic state (memory dumps, thread stacks) before restarting pods.
+- 10.4 Blameless Postmortems & The Five Whys: Moving from human error ("who broke it") to systemic gaps ("why did the system allow this change to cause an outage").
+**Senior-level bar:** Step into the Incident Commander role during a multi-service Sev-1 outage, restore service in under 15 minutes via mitigation controls, and facilitate a blameless postmortem producing concrete architectural guardrails.
+
+---
+
+## Section 11 — DevSecOps & Supply Chain Security: SLSA Framework, Secret/Container Scanning & Branch Protection
+**Outcome:** Harden the software supply chain from developer workstation to production cluster against dependency hijacking, secret leaks, and tampered build artifacts.
+- 11.1 SLSA (Supply-chain Levels for Software Artifacts): Provenance attestation, hermetic builds, and progression from SLSA Level 1 to Level 3.
+- 11.2 Automated Security Gates: Pre-commit secret scanning (`Gitleaks`), SAST (`CodeQL`), SCA (`Dependabot`/`NuGet Audit`), and container vulnerability scanning (`Trivy`).
+- 11.3 Artifact Signing & Verification: Signing container digests with `Cosign` / `Notation` and enforcing admission controller policies (Kyverno / OPA Gatekeeper) in Kubernetes.
+**Senior-level bar:** Design a SLSA Level 3 pipeline that blocks vulnerable transitive NuGet packages, signs container images with ephemeral OIDC keys, and rejects unsigned images at the Kubernetes admission webhook.
+
+---
+
+## Section 12 — Agile Flow Metrics & Lean Delivery: Scrum Anti-Patterns, Kanban WIP Limits, Cycle Time & CFD
+**Outcome:** Replace subjective story-point theater with empirical Lean flow metrics to diagnose bottlenecks and accelerate predictable delivery.
+- 12.1 Little's Law & Empirical Flow Metrics: Work in Progress (WIP), Cycle Time, Throughput, and Work Item Age ($\text{Cycle Time} = \text{WIP} / \text{Throughput}$).
+- 12.2 Cumulative Flow Diagrams (CFD): Reading band widths, arrival vs departure rates, and identifying hidden queues in code review and QA.
+- 12.3 Scrum Anti-Patterns vs Kanban Flow: Sprint mini-waterfalls, Goodhart's Law on velocity, WIP limits, and right-sizing work items.
+**Senior-level bar:** Use a Cumulative Flow Diagram and Little's Law to prove to engineering leadership why starting more concurrent stories increases cycle time, and implement WIP limits that cut lead time in half.
+
+---
+
+## Section 13 — Enterprise Change Management: Automated Audit Trails, SOC 2 / ISO 27001 Compliance & Modern CAB
+**Outcome:** Replace manual Change Advisory Board (CAB) bottlenecks with continuous, cryptographically verifiable compliance pipelines.
+- 13.1 The Failure of Manual CABs: Empirical findings from *Accelerate* showing why external manual approvals increase batch size and failure rates.
+- 13.2 Continuous Compliance & Policy as Code: Automating SOC 2 Type II and ISO 27001 controls (Segregation of Duties, Change Authorization, Test Evidence) inside CI/CD.
+- 13.3 Immutable Audit Trails: Linking Jira/AzDO work items, PR approvals, SAST scans, and cryptographic image signatures into tamper-proof compliance artifacts.
+**Senior-level bar:** Re-architect a bank or healthcare company's 2-week manual CAB review process into an automated policy-as-code pipeline that satisfies external SOC 2 auditors while enabling daily deployments.
+
+---
+
+## Section 14 — DevOps Capstone: End-to-End GitOps on Azure AKS with Bicep, Canary Rollout & Sev-1 Postmortem
+**Outcome:** Synthesize IaC, container hardening, GitOps progressive delivery, and SRE incident analysis into a cohesive production architecture.
+- 14.1 Cloud Infrastructure & Hardened Runtime: Modular Azure Bicep provisioning paired with Chiseled .NET 9 containers.
+- 14.2 Progressive Delivery with Flagger & Prometheus: Declarative `Canary` custom resources with automated metric checks (HTTP 5xx rate and P99 latency) and instant rollback.
+- 14.3 Worked Sev-1 Postmortem Artifact: Complete root-cause analysis and remediation of a Linux cgroup v2 .NET Server GC `Exit Code 137` OOM-Kill production incident.
+**Senior-level bar:** Defend an end-to-end production delivery architecture under Staff-level interview questioning, writing the Flagger Canary specification and diagnosing container memory exhaustion at the CLR/Linux kernel boundary.
 
 ---
 

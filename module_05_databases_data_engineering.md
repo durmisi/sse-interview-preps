@@ -163,6 +163,82 @@ Guid id = Guid.CreateVersion7();
 ```
 *Result:* Always appends to the last page of the B+Tree, eliminating page splits while retaining the global uniqueness of a GUID.
 
+| Key Strategy | Storage Size | Clustered Index Fragmentation | Distributed Generation | Best Use Case |
+|---|---|---|---|---|
+| **`INT` / `BIGINT` `IDENTITY`** | 4 / 8 bytes | 0% (strictly sequential) | Poor (requires DB round-trip or `HiLo`) | Single-node relational tables, high-density join keys |
+| **Natural Key (e.g., `Email`, `ISBN`)** | Variable (20–255 bytes) | High (random alphabetical inserts) | Good | Lookup tables (ISO country codes); poor for clustered keys due to wide nonclustered index pointers |
+| **Random GUID (`Guid.NewGuid()` / UUIDv4)** | 16 bytes | Catastrophic ($>90\%$ page splits) | Excellent | Non-indexed external correlation tokens only |
+| **SQL `NEWSEQUENTIALID()`** | 16 bytes | Low (sequential per OS boot) | DB-generated only | Legacy SQL Server GUID primary keys |
+| **UUIDv7 (`Guid.CreateVersion7()`)** | 16 bytes | Near 0% (time-ordered prefix) | Excellent (client-side) | Modern .NET 9 microservices, DDD aggregates, sharded DBs |
+
+### 1.2 Normalization (1NF, 2NF, 3NF, BCNF) vs Pragmatic Denormalization
+
+Relational normalization eliminates data redundancy and prevents **Update, Insertion, and Deletion Anomalies** by decomposing relations based on functional dependencies ($X \to Y$).
+
+#### The Normal Forms in Practice
+1. **First Normal Form (1NF) — Atomic Values & No Repeating Groups:**
+   - *Violation:* Storing `PhoneNumbers = "555-0101, 555-0102"` or `Tag1, Tag2, Tag3` columns on a `Customers` table.
+   - *Fix:* Extract a child table `CustomerPhones(CustomerId, PhoneNumber)` or, for semi-structured metadata that isn't relationally joined, use indexed `JSONB` (PostgreSQL) / `JSON` (SQL Server 2025 / EF Core 8 complex/primitive collections).
+2. **Second Normal Form (2NF) — Full Functional Dependency on the Entire Candidate Key:**
+   - Applies to tables with **composite primary keys**. Every non-key attribute must depend on the *whole* composite key, not a subset of it.
+   - *Violation:* In `OrderLines(OrderId, ProductId, Quantity, ProductName, UnitListPrice)`, `ProductName` depends only on `ProductId`, not `(OrderId, ProductId)`.
+   - *Fix:* Move `ProductName` and `UnitListPrice` to `Products(ProductId, ...)`. (Note: `UnitPriceAtPurchase` *does* belong on `OrderLines` because historical price at the moment of the order depends on both `OrderId` and `ProductId`!)
+3. **Third Normal Form (3NF) — No Transitive Dependencies:**
+   - Every non-key attribute must depend *only* on the candidate key ($A \to B$, and not $A \to B \to C$).
+   - *Violation:* `Orders(OrderId, CustomerId, CustomerZipCode, CustomerCity)`. Here `OrderId -> CustomerId -> CustomerZipCode -> CustomerCity`. Updating a customer's address requires updating thousands of historical order rows.
+   - *Fix:* Normalize into `Orders`, `Customers`, and `PostalCodes`.
+4. **Boyce-Codd Normal Form (BCNF) — Every Determinant is a Candidate Key:**
+   - A stricter version of 3NF for tables with overlapping candidate keys. For every non-trivial functional dependency $X \to Y$, $X$ must be a superkey.
+
+> **Mnemonic:** Every non-key attribute must provide a fact about **the key** (1NF), **the whole key** (2NF), and **nothing but the key** (3NF/BCNF) — so help me Codd.
+
+#### Foreign Key Constraints & Cascade Behaviors
+Foreign keys enforce **referential integrity** at the storage engine level. Note that SQL Server and PostgreSQL **do not automatically create an index** on a foreign key column—you must explicitly create a nonclustered index on every foreign key column to avoid full table scans during parent `DELETE` checks and join queries!
+
+#### Pragmatic Denormalization for Read-Heavy Workloads
+Strict 3NF/BCNF optimizes for write consistency ($O(1)$ single-row updates), but high-throughput analytical or dashboard queries joining 8+ tables across 50M rows incur prohibitive CPU and I/O costs. Senior engineers deliberately denormalize when read-to-write ratios exceed $\approx 20:1$:
+
+```sql
+-- Denormalized Summary Column + Indexed View (Materialized View) in SQL Server
+-- Pattern 1: Precomputed Aggregate Column maintained via Transactional Trigger or Domain Event
+ALTER TABLE dbo.Invoices
+ADD LineCount INT NOT NULL DEFAULT 0,
+    ComputedSubtotal DECIMAL(18, 2) NOT NULL DEFAULT 0.00;
+GO
+
+-- Pattern 2: Schema-Bound Indexed View (SQL Server automatically maintains the B+Tree on disk!)
+CREATE VIEW dbo.vw_CustomerOrderMetrics
+WITH SCHEMABINDING
+AS
+SELECT
+    o.TenantId,
+    o.CustomerId,
+    COUNT_BIG(*) AS TotalOrderCount,
+    SUM(ISNULL(o.TotalAmount, 0.00)) AS LifetimeSpend
+FROM dbo.Orders AS o
+WHERE o.Status = 3 -- Completed
+GROUP BY o.TenantId, o.CustomerId;
+GO
+
+-- Materialize the view on disk as a unique clustered B+Tree:
+CREATE UNIQUE CLUSTERED INDEX IX_vw_CustomerOrderMetrics
+ON dbo.vw_CustomerOrderMetrics (TenantId, CustomerId);
+```
+
+### Section 1 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions
+1. **Q: Why does using `Guid.NewGuid()` (UUIDv4) as a clustered primary key degrade write and read performance, and how does .NET 9 solve this?**
+   - **Model Answer:** In SQL Server, the clustered index dictates the physical sort order of rows across 8KB data pages. UUIDv4 generates cryptographically random 128-bit values. Inserting a row forces SQL Server to locate the target page in the middle of the B+Tree; if that page is full, the engine executes a **page split**—allocating a new 8KB page, migrating half the rows, updating intermediate B+Tree pointers, and writing heavy log records to the WAL. This causes severe external fragmentation, wastes Buffer Pool RAM with half-empty pages, and turns sequential scans into random I/O. .NET 9 introduces `Guid.CreateVersion7()`, which places a 48-bit Unix millisecond timestamp in the most significant bits, ensuring monotonically increasing values that append cleanly to the tail of the B+Tree. (Note: In SQL Server `UNIQUEIDENTIFIER`, byte ordering is mixed-endian in the first 3 groups; for strict SQL Server binary sort order, either store UUIDv7 as `BINARY(16)` or order bytes to match SQL Server's `Data4` comparison rules).
+2. **Q: Suppose an `OrderLines` table stores `UnitPrice`. Doesn't storing `UnitPrice` on both `Products` and `OrderLines` violate 2NF/3NF?**
+   - **Model Answer:** No—this is a classic interview trap. `Products.CurrentPrice` represents the *current catalog price* and depends solely on `ProductId`. `OrderLines.UnitPriceAtPurchase` represents the *contractual historical price* at the exact time the order was placed, which functionally depends on the composite key `(OrderId, ProductId)`. If you normalized it away and joined to `Products.CurrentPrice`, changing a product's price today would retroactively corrupt historical financial invoices!
+
+#### Practice Exercise
+- **Schema Audit Challenge:** Given a table `ProjectAssignments(EmployeeId, ProjectId, EmployeeName, DepartmentId, DepartmentManagerName, HoursLogged)`:
+  1. Identify the composite primary key.
+  2. Identify all 2NF violations (partial dependencies) and 3NF violations (transitive dependencies).
+  3. Write the normalized 3NF DDL in SQL with properly indexed foreign keys.
+
 ---
 
 ## Section 2 — SQL Mastery, Window Functions & Sargability
@@ -184,12 +260,34 @@ FROM Orders
 WHERE OrderDate >= '2024-01-01' AND OrderDate < '2025-01-01';
 ```
 
+#### The Silent Killer: Implicit Datatype Conversions (`CONVERT_IMPLICIT`)
+In SQL Server, data type precedence rules require converting the lower-precedence type to the higher-precedence type (`NVARCHAR` has higher precedence than `VARCHAR`). If a table column `AccountNumber` is `VARCHAR(50)` (ASCII), and EF Core sends an `NVARCHAR(50)` parameter (C# `string` defaults to Unicode `NVARCHAR`), SQL Server cannot convert the parameter down to `VARCHAR` without risking data loss. Instead, it wraps the *indexed table column* in `CONVERT_IMPLICIT(NVARCHAR(50), [AccountNumber])` for every single row—destroying the index seek and forcing a 100% Index Scan!
+
+```csharp
+// EF Core Configuration: Prevent CONVERT_IMPLICIT on VARCHAR columns!
+modelBuilder.Entity<Customer>()
+    .Property(c => c.AccountNumber)
+    .HasMaxLength(50)
+    .IsUnicode(false); // Generates VARCHAR(50) parameter instead of NVARCHAR(50)!
+```
+
+| Anti-Pattern (Non-Sargable — Forces Scan) | Sargable Rewrite (Enables Index Seek) |
+|---|---|
+| `WHERE YEAR(CreatedAt) = 2025` | `WHERE CreatedAt >= '2025-01-01' AND CreatedAt < '2026-01-01'` |
+| `WHERE ISNULL(Status, 'Pending') = 'Pending'` | `WHERE Status = 'Pending' OR Status IS NULL` |
+| `WHERE TotalAmount * 1.10 > 1000` | `WHERE TotalAmount > 1000 / 1.10` |
+| `WHERE LEFT(SkuCode, 4) = 'ELEC'` | `WHERE SkuCode LIKE 'ELEC%'` |
+| `WHERE LOWER(Email) = 'user@company.com'` | Use a case-insensitive collation or persisted computed column `EmailLower AS LOWER(Email) PERSISTED` |
+
 ---
 
 ### 2.2 Advanced Window Functions in Production
 
+Window functions compute aggregates, rankings, and analytical offsets across a sliding window of rows related to the current row **without collapsing the rows** like `GROUP BY`.
+
 ```sql
--- Compute the 30-day running total of sales and rank customers by monthly spend:
+-- Compute the 30-day running total of sales, rank customers by monthly spend,
+-- and calculate month-over-month order delta using LAG():
 SELECT 
     CustomerId,
     OrderDate,
@@ -198,7 +296,11 @@ SELECT
         PARTITION BY CustomerId 
         ORDER BY OrderDate 
         ROWS BETWEEN 29 PRECEDING AND CURRENT ROW
-    ) AS Running30DayTotal,
+    ) AS Rolling30OrderSum,
+    TotalAmount - LAG(TotalAmount, 1, 0.00) OVER (
+        PARTITION BY CustomerId 
+        ORDER BY OrderDate
+    ) AS DeltaFromPreviousOrder,
     DENSE_RANK() OVER (
         PARTITION BY YEAR(OrderDate), MONTH(OrderDate) 
         ORDER BY TotalAmount DESC
@@ -206,11 +308,93 @@ SELECT
 FROM Orders;
 ```
 
+#### Critical Distinction: `ROWS` vs `RANGE` Framing
+When `ORDER BY` is specified inside `OVER(...)` without an explicit frame, SQL defaults to **`RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`**:
+- **`RANGE`**: Groups duplicate `ORDER BY` ties together and always spills the window frame worktable to `tempdb` on disk!
+- **`ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW`**: Operates strictly on physical row offsets in memory, running up to **5x–10x faster** than the default `RANGE` frame. Always specify `ROWS` explicitly unless tie-grouping semantics are strictly required.
+
+---
+
+### 2.3 Physical Join Algorithms: Nested Loops, Hash Match & Merge Join
+
+When you write `INNER JOIN` or `LEFT JOIN`, you declare *logical* intent. The query optimizer selects one of three *physical* join operators based on input cardinality, statistics, and index sort order:
+
+| Physical Operator | Algorithmic Complexity | Memory Grant Required | Optimal Scenario |
+|---|---|---|---|
+| **Nested Loops Join** | $O(N \times \log M)$ (with inner index) | None ($O(1)$ streaming) | Outer input is **small** ($<1,000$ rows) and inner input has an index on the join key |
+| **Merge Join** | $O(N + M)$ | None (unless explicit `Sort` added) | Both inputs are **already sorted** on the join column (e.g., joining two tables on their Clustered PKs) |
+| **Hash Match Join** | $O(N + M)$ | **High** (builds hash table in RAM; spills to `tempdb` if memory grant is underestimated) | Large, **unsorted** inputs where no suitable index exists or a high percentage of rows match |
+
+1. **Nested Loops:** For each row in the outer (top) input, the engine probes the inner (bottom) input's index. If statistics are stale and the optimizer thinks the outer input has 10 rows when it actually has 2,000,000 rows, Nested Loops will execute 2,000,000 index seeks—causing severe latency!
+2. **Merge Join:** Advances two pointers down two pre-sorted streams in lockstep. Extremely fast and requires zero memory grant if both tables have clustered or covering indexes ordered by the join predicate.
+3. **Hash Match:** Reads the smaller input (**Build input**) and hashes its join keys into an in-memory hash table (allocated from the query's workspace memory grant). Then scans the larger input (**Probe input**) and probes the hash buckets. If cardinality estimation underestimates the build input size, the hash table **spills to `tempdb` on disk** (visible as a yellow warning triangle on the Hash Match operator in the execution plan).
+
+---
+
+### 2.4 Recursive CTEs for Hierarchical Data
+
+To query organizational hierarchies, bill-of-materials (BOM) trees, or nested category taxonomies, a **Recursive Common Table Expression (CTE)** combines an **Anchor Member** and a **Recursive Member** via `UNION ALL`:
+
+```sql
+-- Traverse an entire organizational hierarchy downward from a VP and guard against cycles:
+WITH OrgHierarchyCTE AS (
+    -- 1. Anchor Member: Root node(s)
+    SELECT 
+        e.EmployeeId,
+        e.FullName,
+        e.ManagerId,
+        0 AS HierarchyLevel,
+        CAST(CONCAT('/', e.EmployeeId, '/') AS VARCHAR(500)) AS MaterializedPath
+    FROM dbo.Employees AS e
+    WHERE e.EmployeeId = @RootVpEmployeeId
+
+    UNION ALL
+
+    -- 2. Recursive Member: Joins Employees to the CTE result from the previous iteration
+    SELECT 
+        sub.EmployeeId,
+        sub.FullName,
+        sub.ManagerId,
+        cte.HierarchyLevel + 1 AS HierarchyLevel,
+        CAST(CONCAT(cte.MaterializedPath, sub.EmployeeId, '/') AS VARCHAR(500)) AS MaterializedPath
+    FROM dbo.Employees AS sub
+    INNER JOIN OrgHierarchyCTE AS cte ON sub.ManagerId = cte.EmployeeId
+    -- Prevent infinite loops if corrupt data contains a cycle:
+    WHERE cte.MaterializedPath NOT LIKE CONCAT('%/', sub.EmployeeId, '/%')
+)
+SELECT EmployeeId, FullName, ManagerId, HierarchyLevel, MaterializedPath
+FROM OrgHierarchyCTE
+OPTION (MAXRECURSION 100); -- Default limit is 100; 0 means unlimited (dangerous without cycle check!)
+```
+
+### Section 2 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions
+1. **Q: What is the difference between `ROW_NUMBER()`, `RANK()`, and `DENSE_RANK()`, and how would you write a query to return the top 3 highest-value orders per customer?**
+   - **Model Answer:** For values `[100, 90, 90, 80]`: `ROW_NUMBER()` assigns unique sequential integers `[1, 2, 3, 4]` arbitrarily breaking ties; `RANK()` assigns `[1, 2, 2, 4]` (skipping rank 3 after a tie); `DENSE_RANK()` assigns `[1, 2, 2, 3]` (no gaps). To fetch the top 3 orders per customer, wrap `ROW_NUMBER() OVER (PARTITION BY CustomerId ORDER BY TotalAmount DESC) AS rn` inside a CTE or subquery and filter `WHERE rn <= 3` (or use `CROSS APPLY (SELECT TOP (3) ...)` if a supporting index on `(CustomerId, TotalAmount DESC)` exists).
+2. **Q: Why did a query with an index on `AccountCode VARCHAR(20)` suddenly start doing a Full Index Scan when called from an EF Core LINQ query?**
+   - **Model Answer:** C# strings are UTF-16 Unicode, so EF Core binds string parameters as `NVARCHAR` by default. Because `NVARCHAR` has higher SQL type precedence than `VARCHAR`, the database engine implicitly converts every row's `VARCHAR(20)` column to `NVARCHAR` (`CONVERT_IMPLICIT`), making the predicate non-sargable. Adding `.IsUnicode(false)` in the EF Core entity configuration fixes parameter typing and restores the Index Seek.
+
+#### Practice Exercise
+- **Query Optimization Lab:** Rewrite the following non-sargable reporting query so it can use a single composite covering index, and specify the exact `CREATE INDEX` DDL required:
+  ```sql
+  SELECT CustomerId, SUM(TotalAmount)
+  FROM dbo.Orders
+  WHERE DATEDIFF(DAY, OrderDate, '2025-03-01') <= 30
+    AND LOWER(CurrencyCode) = 'usd'
+  GROUP BY CustomerId;
+  ```
+
 ---
 
 ## Section 3 — Storage & Indexing Internals (B+Trees, Clustered, Nonclustered)
 
-### 3.1 B+Tree Physical Structure
+### 3.1 Physical Page Storage & B+Tree Structure
+
+In SQL Server (and similarly in PostgreSQL with 8KB heap/index pages), the fundamental unit of disk and memory I/O is the **8KB Page (8,192 bytes)**:
+- **Page Header (96 bytes):** Stores page metadata (`PageId`, `NextPageId`, `PrevPageId`, free space bytes, and `MinLSN` for WAL recovery).
+- **Data Rows (~8,060 bytes max):** Fixed-length columns followed by variable-length column offsets. Large `NVARCHAR(MAX)` / `VARBINARY(MAX)` payloads overflow to **LOB (Large Object) allocation units** if they exceed the row limit.
+- **Row Offset Array (Slot Array at the bottom of the page):** Growing upward from the end of the page, storing 2-byte offsets pointing to the exact byte position of each row on the page. Eight contiguous 8KB pages form a **64KB Extent**.
 
 ```text
 [ Root Node Page ]
@@ -225,19 +409,72 @@ FROM Orders;
 (Contains actual data rows in Clustered Index, linked via Prev/Next pointers)
 ```
 
-- **Clustered Index:** The leaf pages contain the **actual table data rows**. A table can have exactly one clustered index.
-- **Nonclustered Index:** The leaf pages contain index keys plus a pointer to the data row:
-  - If table has a clustered index, the pointer is the **Clustered Key**.
-  - If table is a heap (no clustered index), the pointer is a **Row Identifier (RID)** (File:Page:Slot).
+- **Clustered Index:** The leaf pages contain the **actual table data rows**. A table can have exactly one clustered index. Because the B+Tree has a high fan-out (hundreds of keys per 8KB intermediate page), a B+Tree of depth 3–4 can index over 100 million rows, requiring only 3–4 logical page reads for any point lookup!
+- **Nonclustered Index:** The leaf pages contain index keys plus a pointer (row locator) to the data row:
+  - If the table has a clustered index, the pointer is the **Clustered Key** (which is why clustered keys must be narrow, static, and unique—otherwise SQL Server silently appends a 4-byte **uniquifier** to every duplicate clustered key, bloating *every* nonclustered index on the table!).
+  - If the table is a **Heap** (no clustered index), the pointer is an 8-byte **Row Identifier (RID)** (`FileId:PageId:SlotNumber`). Updating a variable-length column in a Heap that no longer fits on its original page leaves behind a **Forwarding Pointer**, causing painful extra random I/O reads (**Forwarded Records**).
 
 #### Key Lookup / Bookmark Lookup Cost:
-If a query selects columns not present in a nonclustered index, the engine must execute a **Key Lookup** for every matching row, jumping back to the clustered index. If the query matches more than $pprox 1-3\%$ of the table, the query optimizer abandons the index entirely and executes a Full Table Scan!
+If a query selects columns not present in a nonclustered index, the engine must execute a **Key Lookup** for every matching row, jumping back to the clustered index. If the query matches more than $\approx 1-3\%$ of the table (the **Tipping Point**), the query optimizer abandons the nonclustered index entirely and executes a Full Clustered Index Scan!
 *Solution:* Create a **Covering Index** using the `INCLUDE` clause:
 ```sql
 CREATE NONCLUSTERED INDEX IX_Orders_CustomerId_Status 
 ON Orders (CustomerId, Status) 
-INCLUDE (TotalAmount, OrderDate); -- Avoids Key Lookups completely!
+INCLUDE (TotalAmount, OrderDate); -- Stored only at Leaf level; avoids Key Lookups completely!
 ```
+
+---
+
+### 3.2 Composite Index Design (Equality First, Range Second), Filtered Indexes & Columnstore Indexes
+
+#### The Left-to-Right Leading Prefix Rule & Equality Before Inequality
+A composite B+Tree index `ON Orders (ColA, ColB, ColC)` sorts rows first by `ColA`, then within ties of `ColA` by `ColB`, and within ties of `(ColA, ColB)` by `ColC` (identical to a telephone book sorted by `LastName, FirstName, MiddleName`):
+1. **Leading Column Requirement:** A query filtering *only* `WHERE ColB = 10` **cannot seek** this index because `ColB` values are scattered across all values of `ColA`.
+2. **Equality First, Range Second Rule:** As soon as the optimizer encounters a **range predicate** (`>`, `<`, `BETWEEN`, `LIKE 'abc%'`), the B+Tree sort order is broken for all subsequent key columns!
+   - Suppose a query runs `WHERE Status = 'Pending' AND CreatedAt >= '2025-01-01' AND CustomerId = 42`.
+   - If the index is `(CreatedAt, Status, CustomerId)`, the engine seeks on the `CreatedAt` range and must *scan* all matching leaf entries to filter `Status` and `CustomerId`.
+   - If the index is **`(Status, CustomerId, CreatedAt)`** (Equality columns first, Range column last), the engine seeks directly to the exact slice of rows matching `Status = 'Pending' AND CustomerId = 42` and scans only the contiguous `CreatedAt >= '2025-01-01'` tail!
+
+#### Filtered Indexes for Skewed Data
+When a column has heavily skewed cardinality (e.g., an `Orders` table where 99.5% of rows have `Status = 'Completed'` and 0.5% have `Status = 'Processing'`, or `IsDeleted = 0`), a full index wastes 99.5% of disk and RAM:
+```sql
+-- Filtered Index: Consumes <1% of the storage of a full index and accelerates worker queue queries!
+CREATE NONCLUSTERED INDEX IX_Orders_ProcessingQueue
+ON dbo.Orders (NextRetryAt, Priority DESC)
+INCLUDE (CustomerId, TotalAmount)
+WHERE Status = 1 AND IsDeleted = 0; -- Note: Queries must include this exact literal predicate (or use OPTION(RECOMPILE) if parameterized)
+```
+
+#### Columnstore Indexes for Real-Time Operational Analytics (HTAP)
+Traditional **Rowstore** B+Trees store all columns of a row contiguously on an 8KB page—ideal for OLTP point lookups, but terrible for analytical queries like `SELECT Region, SUM(Revenue) FROM Sales GROUP BY Region` across 500M rows (which must read all 40 columns of every row from disk).
+- **Columnstore Indexes** pivot storage vertically: rows are grouped into **Rowgroups** of ~1,048,576 rows, and each column is compressed independently into a **Column Segment** using Run-Length Encoding (RLE) and dictionary bit-packing:
+  1. **10x Data Compression:** Repeated values within a single column compress dramatically, fitting 10x more data in the Buffer Pool.
+  2. **Column Elimination:** Only the `Region` and `Revenue` column segments are read from disk; the other 38 columns are never touched.
+  3. **Rowgroup Elimination (Segment Skipping):** Each segment header stores `Min` and `Max` metadata, allowing the engine to skip entire 1M-row chunks instantly.
+  4. **Batch Mode Execution:** Instead of processing row-by-row, CPU SIMD vector instructions process batches of ~900 values in a single CPU cycle.
+
+```sql
+-- Hybrid Transactional/Analytical Processing (HTAP):
+-- Add a Nonclustered Columnstore Index on top of an OLTP table for real-time analytics!
+CREATE NONCLUSTERED COLUMNSTORE INDEX NCCI_Orders_Analytics
+ON dbo.Orders (OrderDate, TenantId, CustomerId, Status, TotalAmount, TaxAmount);
+```
+
+### Section 3 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions
+1. **Q: Why should columns in the `INCLUDE` clause of a nonclustered index not just be added as key columns of the index?**
+   - **Model Answer:** Index **key columns** are stored at *every level* of the B+Tree (root, intermediate pages, and leaf pages) and require the engine to maintain sorted order whenever those columns are updated. **`INCLUDE` columns** are stored *only* at the leaf level and do not participate in B+Tree sorting. This keeps intermediate tree pages compact (maximizing fan-out and minimizing tree depth), reduces index size, avoids re-sorting overhead when included columns are modified, and allows non-sortable types (`NVARCHAR(MAX)`) to be covered.
+2. **Q: You have a query `WHERE TenantId = @tid AND CreatedAt >= @start AND Status = @status`. In what order should you define the composite index columns?**
+   - **Model Answer:** Define equality predicates before range predicates: `(TenantId, Status, CreatedAt)` (or `(Status, TenantId, CreatedAt)`, putting the more selective column first if other queries filter by `TenantId` alone). Putting `CreatedAt` last ensures the B+Tree narrows down to the exact `(TenantId, Status)` equality prefix before performing a contiguous leaf-level range scan on `CreatedAt`.
+
+#### Practice Exercise
+- **Index Consolidation Exercise:** A table `dbo.AuditEvents` (200M rows) currently has 4 separate indexes causing slow `INSERT` latency:
+  - `IX_1 (TenantId)`
+  - `IX_2 (TenantId, EventType)`
+  - `IX_3 (TenantId, CreatedAt)`
+  - `IX_4 (TenantId, EventType, CreatedAt) INCLUDE (UserId, PayloadSummary)`
+  Determine which indexes are redundant or can be consolidated into 2 optimal indexes without degrading any existing seek paths.
 
 ---
 
@@ -250,9 +487,66 @@ When a stored procedure or parameterized query executes for the first time, SQL 
 - If subsequent queries pass a massive tenant (e.g., `TenantId = 1` matching 5,000,000 rows), SQL Server reuses the cached plan, executing **5,000,000 random Key Lookups**, bringing the entire database server to 100% CPU lockup!
 
 #### Mitigation Strategies:
-1. `OPTION (RECOMPILE)`: Forces compilation on every execution (ideal for complex reporting queries run infrequently).
-2. `OPTIMIZE FOR (@TenantId = 1)`: Forces the optimizer to compile a robust plan for common large inputs.
-3. Query Store Plan Forcing: Force a stable execution plan directly via Query Store.
+1. **Create a Covering Index:** If the index covers the query via `INCLUDE`, there is no Key Lookup cliff—both 5 rows and 5,000,000 rows use the same index cleanly!
+2. `OPTION (RECOMPILE)`: Forces compilation on every execution (ideal for skewed queries run < 50 times/sec). In EF Core 8/9, you can inject query hints via a `DbCommandInterceptor` or `FromSql`.
+3. `OPTIMIZE FOR (@TenantId = 1)` or `OPTIMIZE FOR UNKNOWN`: Forces the optimizer to compile for a known heavy tenant or use average density across the table rather than the sniffed parameter.
+4. **Query Store Plan Forcing:** Force a stable execution plan directly via Query Store in production without deploying code changes.
+
+---
+
+### 4.2 Statistics Histograms, Cardinality Estimation & Query Store
+
+The cost-based Query Optimizer relies on **Statistics Objects** to estimate how many rows each operator will output (**Cardinality Estimation**). Each statistics object contains:
+1. **Header:** Last updated timestamp, total rows (`Rows`), and rows sampled (`Rows Sampled`).
+2. **Density Vector:** Measures uniqueness ($1 / \text{distinct values}$) for column prefixes—used for `GROUP BY`, `OPTIMIZE FOR UNKNOWN`, and local variables.
+3. **Histogram (Up to 201 Steps):** Divides the leading column's distribution into up to 200 buckets, storing for each step:
+   - `RANGE_HI_KEY`: Upper-bound value of the bucket.
+   - `EQ_ROWS`: Estimated number of rows exactly equal to `RANGE_HI_KEY`.
+   - `RANGE_ROWS`: Estimated number of rows strictly between the previous step and `RANGE_HI_KEY`.
+   - `DISTINCT_RANGE_ROWS`: Number of distinct values inside the range.
+
+#### The Ascending Key Problem & Estimated vs Actual Row Discrepancy
+When diagnosing a slow query in an **Actual Execution Plan**, the #1 diagnostic signal a Senior Engineer looks for is a massive gap between **Estimated Number of Rows** and **Actual Number of Rows** (e.g., Estimated = 1, Actual = 850,000):
+- When the optimizer underestimates rows by 1,000x, it allocates a tiny **Memory Grant** (causing Sort and Hash Match operators to spill to `tempdb` on disk) and mistakenly chooses **Nested Loops + Key Lookups** instead of a **Hash Match + Index Scan**.
+- Common root causes of cardinality misestimation:
+  - **Stale Statistics:** Bulk inserts occurred without triggering auto-update thresholds ($\sqrt{1000 \times N}$ rows in modern compatibility levels).
+  - **Multi-Column Correlation:** Filtering `WHERE Make = 'Ferrari' AND Price < 30000` when default independence assumptions multiply probabilities instead of recognizing correlation (solved via multi-column statistics).
+  - **Table Variables (`@TempTable`):** Prior to SQL Server 2019 deferred compilation, table variables always had a hardcoded cardinality estimate of **1 row** (whereas `#TempTables` maintain real statistics and histograms!).
+
+```sql
+-- Diagnostic Query: Inspect the Statistics Histogram and check for Stale Statistics
+SELECT 
+    s.name AS StatisticsName,
+    OBJECT_NAME(s.object_id) AS TableName,
+    sp.last_updated,
+    sp.rows AS TotalRows,
+    sp.rows_sampled,
+    sp.modification_counter ASUnindexedModificationsSinceUpdate
+FROM sys.stats AS s
+CROSS APPLY sys.dm_db_stats_properties(s.object_id, s.stats_id) AS sp
+WHERE s.object_id = OBJECT_ID('dbo.Orders');
+
+-- View the 200-step histogram for an index:
+DBCC SHOW_STATISTICS ('dbo.Orders', 'IX_Orders_CustomerId_Status') WITH HISTOGRAM;
+```
+
+#### Query Store & Intelligent Query Processing (IQP)
+**Query Store** acts as a "flight data recorder" built into SQL Server and Azure SQL, persisting query texts, historical execution plans, and runtime latency/CPU metrics across restarts:
+- If a statistics update or parameter-sniffing event causes a plan regression at 3:00 AM, an engineer (or **Automatic Plan Correction**) can identify the regressed plan ID and execute `EXEC sp_query_store_force_plan @query_id = 42, @plan_id = 108;` to lock in the previous healthy plan in milliseconds.
+- In SQL Server 2022 (`COMPATIBILITY_LEVEL = 160`), **Parameter Sensitive Plan (PSP) Optimization** automatically caches up to 3 separate active plans (small, medium, and large cardinality buckets) for a single parameterized query based on histogram skewness!
+
+### Section 4 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions
+1. **Q: During a production outage, a stored procedure is timing out when called from your C# API, but when you copy the exact SQL into SSMS and run it with the same parameters, it finishes in 15ms. Why?**
+   - **Model Answer:** Two classic culprits:
+     1. **Parameter Sniffing + `SET` Options Cache Key:** ADO.NET/EF Core connects with specific session settings (especially `SET ARITHABORT OFF`), whereas SSMS defaults to `SET ARITHABORT ON`. Because `SET` options are part of the Plan Cache key, SSMS cannot reuse the poisoned plan cached for the API's `ARITHABORT OFF` entry—so SSMS compiles a *brand new plan* sniffed specifically for the parameter you just pasted!
+     2. **Local Variable vs Parameter:** If the engineer declared local variables (`DECLARE @p1 INT = 42`) in SSMS instead of executing the proc, the optimizer couldn't sniff `@p1` at compile time and used the average density vector instead of the poisoned histogram step.
+2. **Q: What does a yellow warning triangle on a `Sort` or `Hash Match` operator in an Actual Execution Plan indicate, and how do you fix it?**
+   - **Model Answer:** It indicates a **`tempdb` Spill** caused by an insufficient **Workspace Memory Grant**. Because the optimizer underestimated the number of rows flowing into the operator (Estimated Rows $\ll$ Actual Rows), the allocated RAM buffer overflowed and SQL Server had to write and read intermediate sort runs or hash buckets to `tempdb` on disk. You fix it by updating stale statistics (`UPDATE STATISTICS WITH FULLSCAN`), rewriting non-sargable predicates or table-valued functions so the cardinality estimator sees accurate row counts, or in SQL Server 2019/2022 letting **Memory Grant Feedback** adjust the cached plan's memory grant on subsequent executions.
+
+#### Practice Exercise
+- **Execution Plan Triage:** Write a T-SQL diagnostic query against Query Store (`sys.query_store_query`, `sys.query_store_plan`, `sys.query_store_runtime_stats`) that finds all queries in the last 24 hours that have **more than 1 distinct execution plan** where the maximum average logical reads across plans differs by more than $10\times$ (a signature of parameter sniffing regression).
 
 ---
 

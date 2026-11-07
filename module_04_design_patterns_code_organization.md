@@ -142,6 +142,74 @@ Mid-level engineers who have just learned design patterns often suffer from the 
 
 ---
 
+### 1.2 Pattern Over-Engineering, YAGNI & GoF Taxonomy
+
+#### The Classic Gang of Four (GoF) Taxonomy
+In *Design Patterns: Elements of Reusable Object-Oriented Software* (1994), the 23 foundational patterns are classified across two orthogonal axes: **Purpose** (what a pattern does) and **Scope** (whether the pattern applies primarily to compile-time class inheritance or runtime object composition).
+
+| Purpose | Class Scope (Compile-Time Inheritance) | Object Scope (Runtime Composition & Delegation) |
+|---|---|---|
+| **Creational** *(Decoupling object instantiation)* | Factory Method | Abstract Factory, Builder, Prototype, Singleton (+ modern Object Pool) |
+| **Structural** *(Composing larger topologies)* | Adapter *(Class)* | Adapter *(Object)*, Bridge, Composite, Decorator, Facade, Flyweight, Proxy |
+| **Behavioral** *(Algorithmic & responsibility flow)* | Interpreter, Template Method | Chain of Responsibility, Command, Iterator, Mediator, Memento, Observer, State, Strategy, Visitor |
+
+> **Why Modern C# Eliminates Many GoF Boilerplate Structures:**
+> Several 1994 patterns existed to work around missing language features in C++ and Smalltalk:
+> - **Iterator** is built directly into C# via `IEnumerable<T>`, `IAsyncEnumerable<T>`, and the compiler's `yield return` state-machine generator.
+> - **Strategy** and **Command** with a single method can often be represented directly as strongly-typed delegates (`Func<TInput, CancellationToken, Task<TOutput>>`) unless the strategy requires multiple collaborating dependencies or metadata properties.
+> - **Visitor** is largely superseded in modern C# by exhaustive switch expressions and recursive positional/property pattern matching (`switch { ... }`).
+
+#### The Cost of Indirection & Speculative Generality (YAGNI)
+Every design pattern resolves rigidity by introducing a **seam of indirection** (an interface, an abstract base class, a wrapper, or a message dispatcher). That indirection is never free:
+
+$$\text{Net Architectural Value} = (\text{Probability of Change} \times \text{Cost of Future Change without Pattern}) - \text{Ongoing Indirection Tax}$$
+
+The **Ongoing Indirection Tax** compounds across three dimensions:
+1. **Cognitive & Navigation Overhead:** When a single use case jumps through `Controller` $\to$ `IMediator` $\to$ `ValidationBehavior` $\to$ `CommandHandler` $\to$ `IDomainService` $\to$ `IFactory` $\to$ `IRepository`, an engineer debugging a production incident must hold seven abstractions in working memory.
+2. **Static Analysis Blindness:** Heavy reliance on dynamic dispatch, reflection, or generic mediator pipelines breaks IDE "Find Implementation" and call-hierarchy graphing.
+3. **Runtime Allocation & Dispatch Overhead:** Interface dispatch (`callvirt` via vtable/interface dispatch stub) inhibits JIT inlining unless guarded by Dynamic PGO (Profile-Guided Optimization) in .NET 8+, and wrapper/pipeline allocations increase Gen 0 GC pressure on hot paths.
+
+#### Rule of Three vs Speculative Generality
+Apply **YAGNI (You Aren't Gonna Need It)** and the **Rule of Three**:
+- **1st occurrence:** Write direct, concrete, readable code (`sealed class`).
+- **2nd occurrence:** Note the similarity; tolerate minor duplication or extract a simple helper method if the domain concept is identical.
+- **3rd occurrence:** Now that you have three concrete data points showing *how* the axis of variation actually behaves in production, refactor toward the appropriate pattern (e.g., Strategy or Factory).
+
+---
+
+### Section 1 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions & Model Answers
+
+**Q1: A developer on your team submits a PR where every single service has a corresponding `IFooService` interface, an `AbstractFooFactory`, and a `FooFacade`, even though each interface has only one implementation and no external I/O. How do you address this in a code review?**
+> **Model Answer:**
+> I evaluate abstractions based on the **design forces** they resolve. Creating 1:1 interfaces and factories for internal, deterministic logic with a single implementation is **Speculative Generality**—it violates YAGNI and inflates the navigation and maintenance tax without providing architectural value.
+> In C#, interfaces are warranted at **architectural seams**:
+> 1. **External I/O boundaries** (databases, HTTP clients, message brokers, clocks) where deterministic unit testing requires test doubles.
+> 2. **True polymorphic axes of variation** (e.g., multiple payment providers or discount strategies selected at runtime).
+> 3. **Module or layer boundary inversion** (Dependency Inversion Principle across assemblies, or Decorator chains like caching/retry).
+> For pure internal domain calculation classes with one implementation, I recommend marking the class `sealed`, injecting it directly (or testing it directly as a state-based collaborator), and deferring factory or interface extraction until a second implementation or cross-cutting decorator is actually required.
+
+**Q2: How has the evolution of C# (from C# 1.0 to C# 12/13) changed the way you implement classic GoF patterns?**
+> **Model Answer:**
+> Many GoF patterns were originally ceremony-heavy workarounds for missing first-class functions, algebraic data types, and language-level iterators in 1990s C++. In modern C# 12/13:
+> - **Iterator Pattern:** Replaced by `IEnumerable<T>` / `IAsyncEnumerable<T>` and compiler-generated `yield return` state machines.
+> - **Prototype Pattern:** Largely replaced on immutable models by `record class` and `readonly record struct` with compiler-synthesized `with` expressions.
+> - **Visitor & State Patterns:** Often simplified using exhaustive switch expressions, list patterns, and property pattern matching over closed type hierarchies.
+> - **Template Method:** Frequently replaced by higher-order functions accepting `Func<T, Task>` or `IPipelineBehavior` composition rather than brittle base-class inheritance.
+
+**Q3: Explain the trade-off between the Open/Closed Principle (OCP) and the YAGNI principle when deciding whether to introduce a Strategy or Factory pattern.**
+> **Model Answer:**
+> OCP states that a module should be open for extension but closed for modification, which encourages introducing abstractions (`IStrategy`) upfront so new behaviors can be added as new classes. YAGNI warns against building abstractions for hypothetical requirements that may never materialize.
+> A senior engineer resolves this tension by identifying **known axes of volatility**. If the business domain inherently requires frequent additions along a well-defined seam (e.g., onboarding a new tax jurisdiction every quarter, or supporting multiple webhook event types), applying Strategy upfront pays off immediately. Conversely, if a team abstracts the database provider behind a custom DAL "in case we switch from PostgreSQL to MongoDB next year," the probability of change is near zero ($\approx 0$), making the abstraction a net-negative maintenance burden.
+
+#### Practice Exercises
+
+1. **Indirection Audit Drill:** Take an existing microservice endpoint in your codebase and trace a single HTTP request from the entry point down to the database command. Count the number of interfaces, DTO mappings, and wrapper classes crossed. Identify at least two abstractions that have only a single implementation and zero test mocks, and write a refactoring proposal to collapse them.
+2. **GoF-to-Modern-C# Refactoring:** Write a classic 4-class GoF `Visitor` hierarchy (`IVisitor`, `ElementA`, `ElementB`, `ConcreteVisitor`) for calculating shipping fees on `StandardParcel`, `HazmatParcel`, and `FreightPallet`, then refactor it into a single 15-line C# 12 `record` hierarchy with an exhaustive `switch` expression. Compare line count, allocation overhead, and what happens when a 4th parcel type vs a 2nd operation is added (the Expression Problem).
+
+---
+
 ## Section 2 — Creational Patterns
 
 ### 2.1 Factory Method & Abstract Factory
@@ -256,6 +324,141 @@ public sealed class InvoiceBuilder
 
 ---
 
+### 2.4 Prototype Pattern (C# `with` Expressions vs Shallow/Deep Copy) & Object Pool (`ObjectPool<T>`)
+
+#### Prototype Pattern & Why `ICloneable` Is Broken in .NET
+The **Prototype Pattern** creates new objects by cloning an existing pre-configured template instance rather than instantiating and populating a class from scratch.
+In .NET 1.0, `System.ICloneable` exposed a single `object Clone()` method, which is universally considered a framework design mistake by the .NET BCL team because:
+1. It is untyped (`object`), forcing reference casting or boxing.
+2. Its contract fails to specify whether `Clone()` performs a **shallow copy** (`Object.MemberwiseClone()`, which copies value fields bit-by-bit and copies reference pointers) or a **deep copy** (recursively cloning the entire referenced object graph).
+
+#### Shallow vs Deep Copy Trap with C# `record` and `with` Expressions
+C# 9+ `record` types synthesize a protected copy constructor and a `<Clone>$` method invoked by `with` expressions. Crucially, **`with` performs a shallow copy**. If a record contains a mutable reference collection (`List<T>`, `Dictionary<TKey, TValue>`, or an array `T[]`), both the original record and the cloned record point to the **exact same heap collection**!
+
+```csharp
+public sealed record TenantPricingTemplate(
+    string PlanName,
+    decimal BaseMonthlyFee,
+    IReadOnlyList<string> EnabledFeatures)
+{
+    // Explicit Deep Clone method to protect mutable/collection reference graphs
+    public TenantPricingTemplate DeepClone(string newPlanName) =>
+        this with
+        {
+            PlanName = newPlanName,
+            EnabledFeatures = [.. EnabledFeatures] // C# 12 collection expression allocates a fresh backing list
+        };
+}
+```
+
+#### High-Throughput Object Pooling with `Microsoft.Extensions.ObjectPool`
+When objects are expensive to allocate, initialize, or garbage-collect (e.g., cryptographic `IncrementalHash` instances, `StringBuilder`, reusable `RecyclableMemoryStream` buffers, or XML/JSON serializers with pre-warmed caches), allocating them per HTTP request causes Gen 2 / Large Object Heap (LOH) fragmentation when buffers exceed $85{,}000\text{ bytes}$.
+The **Object Pool Pattern** pre-allocates or recycles instances in a thread-safe pool (`ObjectPool<T>`).
+
+```csharp
+using System.Security.Cryptography;
+using System.Text;
+using Microsoft.Extensions.ObjectPool;
+
+// 1. Expensive reusable state object holding a pre-allocated buffer & native crypto handle
+public sealed class WebhookSignatureComputationContext : IDisposable
+{
+    public byte[]ScratchBuffer { get; } = new byte[64 * 1024]; // 64 KB reusable buffer
+    public StringBuilder CanonicalPayloadBuilder { get; } = new(capacity: 4096);
+
+    public void Reset()
+    {
+        CanonicalPayloadBuilder.Clear();
+        Array.Clear(ScratchBuffer, 0, ScratchBuffer.Length);
+    }
+
+    public void Dispose() => Reset();
+}
+
+// 2. Custom PooledObjectPolicy<T> enforcing state hygiene on Return()
+public sealed class SignatureContextPooledPolicy : PooledObjectPolicy<WebhookSignatureComputationContext>
+{
+    public override WebhookSignatureComputationContext Create() => new();
+
+    public override bool Return(WebhookSignatureComputationContext obj)
+    {
+        // Guard against oversized buffers bloating pool memory permanently
+        if (obj.CanonicalPayloadBuilder.Capacity > 64 * 1024)
+        {
+            return false; // Drop instance; let GC collect it instead of returning to pool
+        }
+
+        obj.Reset(); // CRITICAL: Scrub sensitive tenant data before returning to pool!
+        return true;
+    }
+}
+
+// 3. Production Consumer with try/finally Return guarantee
+public sealed class WebhookVerifier(ObjectPool<WebhookSignatureComputationContext> pool)
+{
+    public bool VerifyPayload(string timestamp, string body, ReadOnlySpan<byte> secretKey, ReadOnlySpan<byte> expectedMac)
+    {
+        WebhookSignatureComputationContext ctx = pool.Get();
+        try
+        {
+            ctx.CanonicalPayloadBuilder.Append(timestamp).Append('.').Append(body);
+            int bytesWritten = Encoding.UTF8.GetBytes(
+                ctx.CanonicalPayloadBuilder.ToString(),
+                ctx.ScratchBuffer);
+
+            Span<byte> computedHash = stackalloc byte[HMACSHA256.HashSizeInBytes];
+            HMACSHA256.HashData(secretKey, ctx.ScratchBuffer.AsSpan(0, bytesWritten), computedHash);
+
+            return CryptographicOperations.FixedTimeEquals(computedHash, expectedMac);
+        }
+        finally
+        {
+            pool.Return(ctx);
+        }
+    }
+}
+
+// Registration in Program.cs:
+// builder.Services.AddSingleton<ObjectPoolProvider, DefaultObjectPoolProvider>();
+// builder.Services.AddSingleton(sp =>
+//     sp.GetRequiredService<ObjectPoolProvider>().Create(new SignatureContextPooledPolicy()));
+```
+
+> **Senior Security & Reliability Warning on Object Pools:**
+> Failing to scrub state inside `IPooledObjectPolicy<T>.Return(T obj)` causes **cross-tenant data bleed** (Tenant B reading leftover buffer bytes from Tenant A's request). Furthermore, never pool objects whose creation cost is cheaper than the interlocked CAS (`CompareExchange`) synchronization overhead of the pool itself.
+
+---
+
+### Section 2 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions & Model Answers
+
+**Q1: In a .NET service with Dependency Injection, when do you actually need a Factory (`IFactory<T>` or `Func<T>`) instead of simply injecting `T` directly into the constructor?**
+> **Model Answer:**
+> Direct constructor injection works when the dependency's concrete type and lifetime are known at container resolution time. A Factory is required in four concrete scenarios:
+> 1. **Runtime Parameter Selection:** Selecting an implementation based on runtime data that only arrives inside a request payload (e.g., resolving a payment processor based on `request.Currency` or `request.CountryCode`).
+> 2. **Deferred or Conditional Instantiation:** When an object is expensive to construct and is only needed on a rare branch of execution.
+> 3. **Lifetime Mismatch (Singleton Consuming Scoped/Transient Work):** A `Singleton` service cannot directly inject a `Scoped` dependency without creating a **Captive Dependency** bug; instead, it injects `IServiceScopeFactory` or a custom factory to create short-lived instances per operation.
+> 4. **Multiple Independent Instances per Operation:** When a single method call must instantiate $N$ separate stateful protocol sessions or builders.
+
+**Q2: How can a fluent `Builder` enforce mandatory fields at compile time rather than throwing `InvalidOperationException` inside `Build()` at runtime?**
+> **Model Answer:**
+> Using the **Step Builder Pattern** (also known as a Progressive Fluent Interface). Instead of every fluent method returning the concrete `InvoiceBuilder`, each step returns a narrow interface representing the *next valid state* in a compile-time finite state machine:
+> `InvoiceBuilder.Create()` returns `IRequireCustomer` $\to$ `.ForCustomer(id)` returns `IRequireCurrency` $\to$ `.InCurrency(usd)` returns `IRequireLineItems` $\to$ `.AddItem(...)` returns `IBuildableInvoice` (which exposes both `.AddItem(...)` and `.Build()`).
+> This makes calling `.Build()` before setting `Customer` and `Currency` a **compile-time syntax error** rather than a runtime exception. In C# 11+, for simpler data transfer objects without complex multi-step invariant calculations, `required init` properties provide compile-time enforcement without needing a Step Builder.
+
+**Q3: What happens if you forget to call `pool.Return(obj)` on `Microsoft.Extensions.ObjectPool<T>`, and how does it differ from failing to dispose a database connection in a connection pool?**
+> **Model Answer:**
+> `DefaultObjectPool<T>` does **not** block callers or throw pool-exhaustion exceptions when all pooled items are checked out. Instead, if the lock-free fast slot and bounded `ConcurrentQueue<T>` are empty, `pool.Get()` simply calls `policy.Create()` to allocate a brand-new instance on the managed heap.
+> Therefore, forgetting to call `pool.Return(obj)` does not deadlock the application (unlike leaking `SqlConnection` instances, which exhausts the max pool size of 100 and throws timeout exceptions); instead, it silently degrades into **unpooled per-request heap allocations**, defeating the purpose of the pool and triggering heavy Gen 0 / LOH garbage collection.
+
+#### Practice Exercises
+
+1. **Step Builder Implementation:** Refactor `InvoiceBuilder` from Section 2.2 into a compile-time **Step Builder** using interfaces (`ICustomerStep`, `ICurrencyStep`, `ILineItemStep`, `IBuildStep`) so that `InvoiceBuilder.Start().Build()` fails to compile until at least one customer, currency, and line item have been supplied.
+2. **Object Pool Benchmark & Leak Audit:** Implement a `PooledStringBuilderPolicy` with `DefaultObjectPoolProvider` that caps retained capacity at $16\text{ KB}$. Write an xUnit test verifying that a `StringBuilder` that grew to $128\text{ KB}$ during a large report export is rejected by `Return()` (`returns false`) while a $4\text{ KB}$ instance is cleared and reused on the subsequent `Get()` call.
+
+---
+
 ## Section 3 — Structural Patterns
 
 ### 3.1 Decorator Pattern & Scrutor Assembly Decoration
@@ -310,7 +513,9 @@ builder.Services.Decorate<ICustomerRepository, CachedCustomerRepository>();
 
 ---
 
-### 3.2 Facade Pattern vs Leaky Subsystems
+### 3.2 Adapter, Facade, Composite & Proxy Patterns in .NET
+
+#### Facade Pattern vs Leaky Subsystems
 
 A **Facade** provides a simple, high-level interface to a complex, multi-class subsystem.
 In an enterprise ordering pipeline, placing an order requires:
@@ -320,6 +525,154 @@ In an enterprise ordering pipeline, placing an order requires:
 4. Publishing an Azure Service Bus event.
 
 Without a Facade, client controllers must inject 4 distinct services and orchestrate the sequence. A `CheckoutFacade` provides a single clean `ExecuteOrderAsync()` method, shielding callers from subsystem volatility.
+
+#### Adapter Pattern: Wrapping a Legacy SOAP/SDK Client (Anti-Corruption Layer)
+An **Adapter** converts the interface of a class (the *Adaptee*) into another interface that clients expect (the *Target*). In Domain-Driven Design, Adapters serve as an **Anti-Corruption Layer (ACL)** so ugly third-party or legacy SOAP data structures (`int` status codes, XML strings, nullable arrays) never leak into your domain model.
+
+```csharp
+// 1. Clean Domain Port (Target Interface owned by our Application Layer)
+public interface ITaxCalculationPort
+{
+    Task<Money> CalculateSalesTaxAsync(Address destination, Money subtotal, CancellationToken ct);
+}
+
+// 2. Legacy 3rd-Party SOAP/SDK Client (Adaptee — cannot be modified)
+public sealed class LegacyVertexSoapClient
+{
+    public Task<VertexSoapResponse> InvokeTaxEnvelopeAsync(string zip5, double netAmountDouble, string isoCurr)
+        => Task.FromResult(new VertexSoapResponse { StatusCode = 0, CalculatedTaxAmount = netAmountDouble * 0.0825 });
+}
+
+public sealed class VertexSoapResponse
+{
+    public int StatusCode { get; set; }
+    public double CalculatedTaxAmount { get; set; }
+}
+
+// 3. Object Adapter (Translates clean Domain types <-> Legacy SOAP primitives)
+public sealed class VertexTaxAdapter(LegacyVertexSoapClient soapClient) : ITaxCalculationPort
+{
+    public async Task<Money> CalculateSalesTaxAsync(Address destination, Money subtotal, CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+
+        VertexSoapResponse raw = await soapClient.InvokeTaxEnvelopeAsync(
+            destination.PostalCode[..5],
+            (double)subtotal.Amount,
+            subtotal.Currency);
+
+        if (raw.StatusCode != 0)
+        {
+            throw new TaxProviderUnavailableException($"Legacy Vertex SOAP failed with code {raw.StatusCode}.");
+        }
+
+        decimal roundedTax = Math.Round((decimal)raw.CalculatedTaxAmount, 2, MidpointRounding.ToEven);
+        return new Money(roundedTax, subtotal.Currency);
+    }
+}
+```
+
+#### Composite Pattern: Hierarchical Pricing & Permission Trees
+The **Composite Pattern** composes objects into tree structures to represent part-whole hierarchies, allowing clients to treat individual leaf objects (`SkuLineItem`) and nested compositions (`PromotionalBundle`) uniformly through a shared component interface.
+
+```csharp
+public interface IPricedComponent
+{
+    string Name { get; }
+    decimal CalculatePrice();
+}
+
+// Leaf Node
+public sealed record SkuItem(string Name, decimal UnitPrice) : IPricedComponent
+{
+    public decimal CalculatePrice() => UnitPrice;
+}
+
+// Composite Node (contains Leaf nodes and/or nested Composite bundles)
+public sealed class PromotionalBundle(
+    string name,
+    decimal bundleDiscountPercentage,
+    IReadOnlyList<IPricedComponent> children) : IPricedComponent
+{
+    public string Name => name;
+
+    public decimal CalculatePrice()
+    {
+        decimal grossSum = children.Sum(child => child.CalculatePrice());
+        return Math.Round(grossSum * (1m - bundleDiscountPercentage), 2, MidpointRounding.ToEven);
+    }
+}
+
+// Usage: Uniform evaluation of arbitrary nesting depth
+// var holidayPack = new PromotionalBundle("Ultimate Dev Station", 0.10m, [
+//     new SkuItem("4K Monitor", 600m),
+//     new PromotionalBundle("Peripheral Starter Kit", 0.05m, [
+//         new SkuItem("Mechanical Keyboard", 150m),
+//         new SkuItem("Ergonomic Mouse", 100m)
+//     ])
+// ]);
+// decimal total = holidayPack.CalculatePrice(); // Evaluates tree recursively
+```
+
+#### Proxy Pattern: Virtual, Protection & Resilience Proxies
+A **Proxy** provides a surrogate or placeholder for another object to control access to it.
+While **Decorator** and **Proxy** share an identical UML class structure (both implement `IService` and wrap an inner `IService`), their **architectural intents** differ:
+- **Decorator** focuses on *augmenting behavior* (stacking cross-cutting concerns onto a caller-supplied or DI-chained object).
+- **Proxy** focuses on *controlling access and lifecycle* of the target subject:
+  - **Virtual Proxy:** Delays expensive instantiation until the first method invocation (e.g., EF Core `Castle.Proxies` lazy-loading navigation properties or wrapping a heavy dependency inside `Lazy<T>`).
+  - **Protection Proxy:** Enforces tenant isolation or RBAC authorization checks before delegating to the real subject.
+  - **Remote / Resilience Proxy:** Manages network serialization and circuit-breaking (e.g., typed `HttpClient` with `Microsoft.Extensions.Http.Resilience` / Polly v8 pipelines, or generated gRPC client stubs).
+
+```csharp
+public sealed class TenantProtectionCustomerProxy(
+    ICustomerRepository realSubject,
+    ITenantContextAccessor tenantContext) : ICustomerRepository
+{
+    public async Task<Customer?> GetByIdAsync(CustomerId id, CancellationToken ct)
+    {
+        Customer? customer = await realSubject.GetByIdAsync(id, ct);
+        if (customer is not null && customer.TenantId != tenantContext.CurrentTenantId)
+        {
+            throw new UnauthorizedAccessException(
+                $"Cross-tenant access denied: Tenant {tenantContext.CurrentTenantId} cannot read Customer {id.Value}.");
+        }
+
+        return customer;
+    }
+}
+```
+
+---
+
+### Section 3 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions & Model Answers
+
+**Q1: Decorator, Proxy, and Adapter all wrap an underlying object. How do you distinguish them in an architectural design review?**
+> **Model Answer:**
+> They are distinguished by **interface compatibility** and **intent**:
+> 1. **Adapter** changes the interface (`ITarget` wraps `Adaptee`). Its intent is *compatibility and translation* across mismatched boundaries (e.g., wrapping a third-party SDK behind a domain port).
+> 2. **Decorator** keeps the exact same interface (`IService` wraps `IService`). Its intent is *open/closed behavior composition*—layering concerns like caching, telemetry, and validation dynamically.
+> 3. **Proxy** also keeps the same interface (`IService` wraps `IService`), but its intent is *access control, lifecycle management, or location transparency* (e.g., lazy initialization, RBAC enforcement, or remote RPC marshaling). Often, a Proxy manages or restricts whether the underlying target is even instantiated or invoked.
+
+**Q2: When stacking multiple Decorators in ASP.NET Core DI (e.g., `SqlCustomerRepository` wrapped by `CachedCustomerRepository` wrapped by `LoggingCustomerRepository`), why does registration order matter, and what happens if you get it backward?**
+> **Model Answer:**
+> In Scrutor (`services.Decorate<TService, TDecorator>()`), each call wraps the *previously registered* service descriptor like layers of an onion. The **last** decorator registered becomes the **outermost** wrapper invoked first by consumers:
+> - Registering `SqlRepo` $\to$ `Decorate<CachedRepo>` $\to$ `Decorate<LoggingRepo>` means callers hit `LoggingRepo` $\to$ `CachedRepo` $\to$ `SqlRepo`. Every call (including cache hits) is logged and timed.
+> - If you reverse `CachedRepo` and `LoggingRepo` (`SqlRepo` $\to$ `LoggingRepo` $\to$ `CachedRepo`), then cache hits return immediately from `CachedRepo` and **completely bypass `LoggingRepo`**, leaving you blind to cache-hit traffic and latency metrics!
+> Similarly, a `RetryDecorator` must wrap the inner `SqlRepo` *inside* the `CachedRepo` so retries only execute on database misses rather than retrying memory cache reads.
+
+**Q3: What is the danger of using `IMemoryCache` inside a Decorator that wraps an EF Core repository returning tracked entities?**
+> **Model Answer:**
+> `IMemoryCache` stores direct in-process object references on the local heap (it does not serialize by default). If `SqlCustomerRepository` returns an EF Core-tracked entity and `CachedCustomerRepository` caches that reference across HTTP requests:
+> 1. **Thread-Safety & Change Tracker Corruption:** Concurrent HTTP requests retrieve the exact same entity reference and may mutate its properties simultaneously across threads.
+> 2. **Captive `DbContext` Memory Leak:** If lazy-loading proxies or navigation fix-ups retain a reference back to the originating `DbContext`, caching the entity pins the disposed `DbContext` graph in memory.
+> **Fix:** Either project to immutable `record` DTOs/read models with `.AsNoTracking()` before caching, or clone/serialize the snapshot before storing it in `IMemoryCache`.
+
+#### Practice Exercises
+
+1. **Multi-Decorator Ordering Pipeline:** Register an `IExchangeRateProvider` with three decorators using Scrutor: `ResilienceRetryExchangeRateDecorator`, `MemoryCacheExchangeRateDecorator`, and `OpenTelemetryMetricsExchangeRateDecorator`. Write an integration test with a fake inner provider that fails on call 1, succeeds on call 2, and serves from cache on call 3. Assert that total outer metrics count = 2 requests, inner provider invocation count = 2 (1 failure + 1 retry), and database/network hits on the 2nd external request = 0.
+2. **Composite Authorization Tree:** Model an enterprise permission system using the **Composite Pattern** where `IPermissionGrant` is implemented by `AtomicPermission(string Scope)` and `RolePermissionGroup(string RoleName, IReadOnlyList<IPermissionGrant> Grants)`. Implement `bool HasPermission(string requiredScope)` and a cycle-detection guard in `RolePermissionGroup` so circular role assignments (`Admin` contains `Ops` contains `Admin`) throw on construction rather than causing a `StackOverflowException`.
 
 ---
 
