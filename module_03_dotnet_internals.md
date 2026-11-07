@@ -1246,6 +1246,48 @@ app.MapPost("/orders", (HttpContext context, IBackgroundQueue queue) =>
 
 ---
 
+### 8.4 Request Lifecycle, Endpoint Routing & Minimal APIs vs Controllers Internals
+
+Understanding what happens between Kestrel parsing an HTTP frame and your C# handler executing separates senior engineers from framework consumers:
+
+1. **Kestrel Frame Parsing & `HttpContext` Pooling:**
+   - Kestrel's `HttpParser<TRequestHandler>` scans the `ReadOnlySequence<byte>` from `PipeReader` using SIMD-accelerated `Span<byte>` operations (`SearchValues<byte>`) to locate `\r\n` boundaries and populate a pooled `DefaultHttpContext` instance.
+2. **Endpoint Routing (`DfaMatcher`):**
+   - `UseRouting()` executes a compiled **Deterministic Finite Automaton (DFA)** jump table (`DfaMatcher`) over the URL path segments. Route matching is $O(\text{path length})$ regardless of whether your application registers 10 or 10,000 endpoints.
+3. **Minimal APIs vs `ControllerBase` Execution Overhead:**
+   - **Controllers:** Invoke `ControllerActionInvoker`, action filters, model binders, and reflection/expression-compiled activator delegates.
+   - **Minimal APIs (.NET 8/9):** Use the **RequestDelegate Generator (RDG)** Roslyn source generator at compile time to emit a strongly-typed `RequestDelegate` directly wiring query/route/JSON body deserialization (`JsonTypeInfo<T>`) to your handler without runtime reflection or filter pipeline allocations.
+
+```csharp
+// Compile-time AOT-safe Minimal API with zero reflection and TypedResults
+app.MapGet("/api/v1/orders/{id:guid}", async Task<Results<Ok<OrderDto>, NotFound>> (
+    Guid id,
+    IOrderRepository repo,
+    CancellationToken ct) =>
+{
+    return await repo.GetByIdAsync(id, ct) is { } order
+        ? TypedResults.Ok(order)
+        : TypedResults.NotFound();
+});
+```
+
+---
+
+### Section 8 Review: Interview Questions & Practice Exercises
+
+#### Realistic Interview Questions & Strong Model Answers
+
+**Q1: Why is `IHttpContextAccessor` discouraged in modern high-throughput .NET 8/9 services, and how does it work under the hood?**
+> **Strong answer:** `IHttpContextAccessor` stores the current `HttpContext` inside an `AsyncLocal<HttpContextHolder>`. Every time an async method yields across an `await` boundary, the CLR copies the `ExecutionContext` carrying that `AsyncLocal` state, adding allocation and copy overhead on hot paths. Furthermore, it hides dependencies and tempts developers to access `HttpContext` from background threads where the pooled context has already been reset. Instead, pass only the required domain primitives (`Guid tenantId`, `CancellationToken ct`) explicitly down the call stack.
+
+**Q2: What happens if a middleware writes to `context.Response.Body` *before* calling `await _next(context)`, or modifies headers *after* `await _next(context)` has already flushed bytes to the socket?**
+> **Strong answer:** Once the first chunk of body bytes is flushed to Kestrel's response pipe, `context.Response.HasStarted` becomes `true` and HTTP response headers have already been transmitted over the wire. Any attempt by an outer middleware's `finally` block (or exception handler) to change `context.Response.StatusCode` or append headers after `HasStarted == true` throws an `InvalidOperationException`. Always check `if (!context.Response.HasStarted)` before mutating headers in post-processing middleware.
+
+#### Practical Exercises
+1. **Exercise 8.1:** Write a custom ASP.NET Core middleware implementing `IMiddleware` that measures exact endpoint execution time using `Stopwatch.GetTimestamp()` (zero allocation) and writes an `X-Server-Duration-Ms` header using `context.Response.OnStarting(...)` so the header is safely injected right before Kestrel flushes the response headers.
+
+---
+
 ## Section 9 — Performance Engineering, Profiling & Diagnostics Toolkit
 
 ### 9.1 The Production Diagnostics Toolkit
@@ -1319,6 +1361,51 @@ public class ParsingBenchmark
 
 ---
 
+### 9.3 In-Process GC Telemetry (`GC.GetGCMemoryInfo`) & Zero-Allocation Logging
+
+Beyond external CLI tools, production services expose internal CLR memory pressure via `GC.GetGCMemoryInfo()` and eliminate logging string allocations using compile-time `[LoggerMessage]` source generation:
+
+```csharp
+public static partial class HighPerfAuditLogger
+{
+    // Roslyn Source Generator emits zero-boxing, level-guarded structured logging code
+    [LoggerMessage(
+        EventId = 4001,
+        Level = LogLevel.Warning,
+        Message = "High GC Heap Load detected: Fragmented={FragmentedBytes}B, Load={MemoryLoadPct}%")]
+    public static partial void LogGcPressure(
+        ILogger logger, long fragmentedBytes, double memoryLoadPct);
+
+    public static void CheckMemoryHealth(ILogger logger)
+    {
+        GCMemoryInfo info = GC.GetGCMemoryInfo();
+        double loadPct = (double)info.MemoryLoadBytes / info.HighMemoryLoadThresholdBytes * 100.0;
+
+        if (loadPct >= 85.0)
+        {
+            LogGcPressure(logger, info.FragmentedBytes, Math.Round(loadPct, 1));
+        }
+    }
+}
+```
+
+---
+
+### Section 9 Review: Interview Questions & Practice Exercises
+
+#### Realistic Interview Questions & Strong Model Answers
+
+**Q1: Why is benchmarking C# code with `Stopwatch` inside a `Main()` method unreliable compared to `BenchmarkDotNet`?**
+> **Strong answer:** A manual `Stopwatch` loop fails to account for Tier 0 vs Tier 1 JIT compilation warmup, Dynamic PGO profile stabilization, dead-code elimination (where the JIT optimizes away a loop whose result is unused), GC pauses occurring mid-measurement, and OS thread scheduling jitter. `BenchmarkDotNet` spawns isolated child processes, executes warmup pilots until standard error converges, prevents dead-code elimination by consuming return values, and hooks ETW/EventPipe to report exact Gen 0/1/2 allocations per operation.
+
+**Q2: In `dotnet-dump analyze`, you see 4.5 GB of `System.Byte[]` instances in `dumpheap -stat`. How do you determine whether they are alive or waiting for the next GC?**
+> **Strong answer:** `dumpheap -stat` walks the entire managed heap linearly, including *dead* (unreachable) objects that simply haven't been swept yet! To filter or verify reachability, run `dumpheap -stat -live` (which only counts live objects), or sample several object addresses via `dumpheap -mt <ByteArrayMT>` and run `gcroot <address>`. If `gcroot` reports `Found 0 unique roots`, the array is dead garbage waiting for the next collection.
+
+#### Practical Exercises
+1. **Exercise 9.1:** Write a `BenchmarkDotNet` suite comparing `string.Format`, string interpolation `$"Order {id}"`, and `[LoggerMessage]` when `LogLevel.Information` is disabled in configuration. Verify that `[LoggerMessage]` allocates `0 B` and executes in $< 1\text{ ns}$.
+
+---
+
 ## Section 10 — Runtime Configuration, Containers & Incident Capstone
 
 ### 10.1 .NET in Linux Containers & Kubernetes
@@ -1344,6 +1431,33 @@ public class ParsingBenchmark
 - **Diagnosis:** Running `dotnet-dump analyze` and inspecting native virtual memory mappings reveals unmanaged heap bloat.
 - **Root Cause:** P/Invoke interop with a native image processing C library was allocating native buffers via `malloc()` and failing to call `free()` on certain exception branches. The managed GC had zero visibility into this native leak!
 - **Fix:** Wrap native pointers in `SafeHandle` to guarantee deterministic cleanup via `IDisposable`.
+
+---
+
+### 10.3 Essential Runtime Configuration Knobs (.NET 8 & .NET 9)
+
+| Environment Variable / MSBuild Property | Default (.NET 8/9) | Production Use Case & Impact |
+|---|---|---|
+| `DOTNET_gcServer` / `<ServerGarbageCollection>` | `true` (ASP.NET Core) | Set to `false` (Workstation GC) for sidecars or micro-containers with $< 512\text{ MB}$ RAM. |
+| `DOTNET_GCDynamicAdaptationMode` | `1` (DATAS enabled in .NET 9) | **DATAS (Dynamic Adaptation To Application Sizes)** automatically scales the number of Server GC heaps up and down with live traffic and compacts aggressively during idle windows. |
+| `DOTNET_GCHeapHardLimitPercent` | `75` (in containers) | Caps the managed GC heap to a strict percentage of the container's cgroup memory limit (e.g., `60` when native libraries or Kestrel buffers need extra headroom). |
+| `DOTNET_TieredPGO` | `1` (Enabled in .NET 8+) | Enables Dynamic Profile-Guided Optimization so Tier 1 JIT devirtualizes and inlines hot interface calls. |
+| `DOTNET_SYSTEM_GLOBALIZATION_INVARIANT` | `false` | Enables Invariant Globalization mode, stripping `libicu` dependencies for ultra-small Chiseled/Alpine containers when locale-specific sorting is not required. |
+
+---
+
+### Section 10 Review: Interview Questions & Practice Exercises
+
+#### Realistic Interview Questions & Strong Model Answers
+
+**Q1: What is DATAS (`DOTNET_GCDynamicAdaptationMode=1`), introduced in .NET 8 and enabled by default in .NET 9, and what container problem does it solve?**
+> **Strong answer:** Classic Server GC creates one heap per logical CPU core and optimizes exclusively for maximum throughput, refusing to release virtual memory segments until memory load hits $\approx 75\%$ of the container limit. In a 16-vCPU Kubernetes node where a pod bursts at startup and then sits idle, classic Server GC keeps hundreds of megabytes of committed RAM locked across 16 heaps. **DATAS (Dynamic Adaptation To Application Sizes)** dynamically adjusts the number of GC heaps and triggers full compacting GCs based on actual live data size ("Long-Lived Data Size"), cutting container working-set memory by $30\text{--}60\%$ in bursty cloud workloads.
+
+**Q2: A Kubernetes pod running your .NET 8 service terminates abruptly with `Exit Code 137` and zero unhandled exception logs in Application Insights. Why were no logs flushed, and what are the three most common culprits?**
+> **Strong answer:** `Exit Code 137` ($128 + 9$) means the Linux kernel's cgroup OOM killer sent `SIGKILL` (signal 9) directly to the `dotnet` process. Unlike `SIGTERM` (signal 15), `SIGKILL` cannot be caught, intercepted, or delayed by the CLR—the kernel tears down the process page tables immediately, so `finally` blocks and telemetry flush buffers never execute. The three prime culprits are: (1) Server GC multi-heap overhead on high-core host nodes with tight pod memory limits; (2) Unbounded LOH allocations or static caches; and (3) Unmanaged/native memory growth (`byte[]` pinning, `RegexOptions.Compiled` assembly leaks, or P/Invoke buffers) outside the GC's `75%` heap hard limit.
+
+#### Practical Exercises
+1. **Exercise 10.1:** Run a .NET 8/9 Web API inside Docker with `--memory=256m --cpus=4`. Compare peak working set (`docker stats`) under load across three configurations: (a) classic Server GC (`DOTNET_gcServer=1`, `DOTNET_GCDynamicAdaptationMode=0`), (b) DATAS enabled (`DOTNET_GCDynamicAdaptationMode=1`), and (c) Workstation GC (`DOTNET_gcServer=0`).
 
 ---
 

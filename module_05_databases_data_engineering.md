@@ -560,6 +560,33 @@ When a transaction mutates data (`UPDATE Orders SET Status = 'Paid'`):
 3. **The Inviolable WAL Rule:** The dirty data page in memory is **never** written to the database disk file (`.mdf`) until the corresponding log records have been written to the transaction log disk!
 4. When `COMMIT TRANSACTION` executes, the database flushes the transaction log buffer to disk synchronously. Once the log write completes, the transaction is durable. The actual data page can remain in RAM and be written to disk asynchronously later during a **Checkpoint**.
 
+### 5.2 Crash Recovery Mechanics: The ARIES Algorithm (Analysis, Redo, Undo)
+
+Because relational engines use a **STEAL / NO-FORCE** buffer pool policy (**STEAL** = the engine may flush uncommitted dirty pages to `.mdf` if RAM is full; **NO-FORCE** = committed pages do not need to be flushed to `.mdf` at commit time), power loss leaves `.mdf` data files with both missing committed changes and partial uncommitted changes. Upon restart, SQL Server and PostgreSQL execute the 3-phase **ARIES (Algorithms for Recovery and Isolation Exploiting Semantics)** protocol:
+
+```text
+LSN Timeline:   ... [Last Checkpoint] --------> [Crash Point!]
+                          |                           |
+1. ANALYSIS:              +=========================>|  Scan forward: identify Active Transactions & Dirty Pages
+2. REDO:        +===================================>|  From Min(RecLSN): replay ALL logged actions (even uncommitted!)
+3. UNDO:        |<===================================+  Walk backward: roll back active (uncommitted) txns via CLRs
+```
+
+1. **Phase 1 — Analysis:** Scans the WAL forward from the most recent **Checkpoint** record to reconstruct two tables at the moment of the crash: the **Active Transaction Table (ATT)** (transactions without a `COMMIT` or `ABORT` record) and the **Dirty Page Table (DPT)** (pages modified in RAM but not yet flushed to `.mdf`).
+2. **Phase 2 — Redo (Repeating History):** Scans forward from the smallest `RecLSN` in the Dirty Page Table and replays **every** logged change (both committed and uncommitted) whose LSN is greater than the page's on-disk `PageLSN`. This brings the database back to the exact physical state it held in RAM right before the crash (**Durability**).
+3. **Phase 3 — Undo:** Scans backward through the WAL, reversing every operation belonging to uncommitted transactions in the ATT in reverse chronological order, and writing **Compensation Log Records (CLRs)** so that if the server crashes *again* during recovery, Undo is idempotent (**Atomicity**).
+
+### Section 5 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions
+1. **Q: If a transaction modifies 100,000 rows and commits, why does `COMMIT TRANSACTION` return in 2 milliseconds even though writing 100,000 scattered 8KB pages to disk would take several seconds?**
+   - **Model Answer:** Because of **NO-FORCE** buffer management paired with **Write-Ahead Logging (WAL)**. At commit time, SQL Server only has to flush the sequential transaction log buffer up to the transaction's commit LSN to the `.ldf` file. Sequential append I/O on NVMe takes microseconds. The 100,000 dirty 8KB data pages stay in the RAM Buffer Pool and are written to the `.mdf` file asynchronously in batches by the background **Checkpoint** or **Lazy Writer** process.
+2. **Q: Why does ARIES replay *uncommitted* transactions during the Redo phase only to roll them back immediately afterward in the Undo phase?**
+   - **Model Answer:** Because physiological log records log physical page offsets combined with logical slot operations. Replaying all logged operations in strict LSN order ("Repeating History") guarantees that every 8KB page is restored to a structurally consistent state before logical inverse operations (Undo) are applied, and allows Undo to write forward-progress Compensation Log Records (CLRs).
+
+#### Practice Exercise
+- **Long-Running Transaction Trap:** Explain what happens to the SQL Server `.ldf` Transaction Log file when a single `BEGIN TRAN` remains open for 4 hours without committing while 500 other transactions per second commit normally. Why can't the Transaction Log truncate past the oldest active transaction's `MinLSN` even after a log backup?
+
 ---
 
 ## Section 6 — Concurrency Control, Isolation Levels & MVCC
@@ -580,6 +607,72 @@ When a transaction mutates data (`UPDATE Orders SET Status = 'Paid'`):
 ALTER DATABASE CurrentDb SET READ_COMMITTED_SNAPSHOT ON;
 ```
 Enabling RCSI eliminates reader-writer deadlocks. Queries reading data do not acquire shared locks and do not block writers. Writers do not block readers. Readers simply read the latest committed row version from the `tempdb` version store.
+
+### 6.2 Lock Modes (`S`, `X`, `U`, `IS`, `IX`), Lock Escalation & Concurrency in EF Core
+
+1. **Core Lock Modes & Why Update Locks (`U`) Prevent Conversion Deadlocks:**
+   - **Shared (`S`):** Acquired for reads under pessimistic locking; multiple transactions can hold `S` locks simultaneously.
+   - **Exclusive (`X`):** Acquired for `INSERT`, `UPDATE`, `DELETE`; incompatible with all other locks.
+   - **Update (`U`):** Acquired when reading a row with intent to update it (`WITH (UPDLOCK)`). `U` is compatible with `S` (readers aren't blocked during the scan) but **incompatible with another `U` lock**! Without `U` locks, two concurrent transactions in `Repeatable Read` that both read a row (`S` lock) and then attempt to upgrade to `X` lock will deadlock waiting for each other's `S` lock to release.
+   - **Intent Locks (`IS`, `IX`) & Lock Escalation:** Placed at the Table/Page level to signal that lower-level row locks are held. When a single statement acquires more than **5,000 row/key locks** on a single table, SQL Server triggers **Lock Escalation**, converting the 5,000 fine-grained row locks into a single **Table Exclusive (`X`) Lock** to save lock-manager RAM—which instantly freezes all other concurrent queries on that table!
+2. **Optimistic Concurrency in EF Core (`IsRowVersion`) vs Pessimistic Locking:**
+
+```csharp
+public sealed class Wallet
+{
+    public Guid Id { get; init; }
+    public decimal Balance { get; private set; }
+
+    // Maps to SQL Server ROWVERSION (8-byte auto-incrementing binary counter per mutation)
+    // or PostgreSQL xmin system column
+    [Timestamp]
+    public byte[] RowVersion { get; private set; } = [];
+
+    public void Debit(decimal amount)
+    {
+        if (Balance < amount) throw new InvalidOperationException("Insufficient funds.");
+        Balance -= amount;
+    }
+}
+
+// Handling Optimistic Concurrency Conflicts in EF Core:
+public async Task DebitWalletOptimisticAsync(Guid walletId, decimal amount, CancellationToken ct)
+{
+    for (int attempt = 1; attempt <= 3; attempt++)
+    {
+        var wallet = await dbContext.Wallets.FirstAsync(w => w.Id == walletId, ct);
+        wallet.Debit(amount);
+
+        try
+        {
+            // EF Core emits: UPDATE Wallets SET Balance = @p0 WHERE Id = @p1 AND RowVersion = @p2
+            // If 0 rows are affected, EF Core throws DbUpdateConcurrencyException!
+            await dbContext.SaveChangesAsync(ct);
+            return;
+        }
+        catch (DbUpdateConcurrencyException ex) when (attempt < 3)
+        {
+            // Reload fresh values from the database before retrying the domain operation
+            foreach (var entry in ex.Entries)
+            {
+                await entry.ReloadAsync(ct);
+            }
+        }
+    }
+    throw new InvalidOperationException("Concurrent modification conflict persisted after retries.");
+}
+```
+
+### Section 6 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions
+1. **Q: Why is adding `WITH (NOLOCK)` to SQL Server queries dangerous even for "read-only reporting queries"?**
+   - **Model Answer:** Beyond reading uncommitted dirty data that may roll back, `NOLOCK` switches the storage engine from an ordered B+Tree key scan to an **Allocation Order (IAM) Scan** or risks encountering concurrent **Page Splits**. If a page splits while a `NOLOCK` scan is reading it, the query can **skip committed rows entirely** (if rows move to a page behind the scan pointer) or **read the same committed row twice** (if rows move to a newly allocated page ahead of the scan pointer), returning corrupted financial totals. Enabling `READ_COMMITTED_SNAPSHOT ON` (RCSI) achieves zero reader-writer blocking without dirty reads or double-counting.
+2. **Q: What is the "Write Skew" anomaly, and why does `Snapshot Isolation` fail to prevent it while `Serializable` prevents it?**
+   - **Model Answer:** Write Skew occurs when two concurrent transactions read an overlapping dataset that satisfies a multi-row invariant, and each transaction modifies *disjoint* rows such that the combined result violates the invariant. Classic example: a hospital requires $\ge 1$ doctor on call. Doctor A and Doctor B both start under `Snapshot Isolation`, see `Count(OnCall) == 2`, and Doctor A updates Row A (`OnCall = false`) while Doctor B updates Row B (`OnCall = false`). Because they modified *different* rows, Snapshot Isolation's first-committer-wins conflict detector sees no row overlap and commits both, leaving `0` doctors on call! Under `Serializable` (or by materializing a lock on a parent shift row with `UPDLOCK`), the range/predicate is locked.
+
+#### Practice Exercise
+- **Batch Delete Without Lock Escalation:** Write a T-SQL batched purge loop (`DELETE TOP (4000) FROM AuditLogs WHERE CreatedAt < @Cutoff`) that deletes 10 million expired rows in chunks of 4,000 per transaction so SQL Server never crosses the 5,000-lock escalation threshold or fills the transaction log.
 
 ---
 
@@ -619,6 +712,60 @@ await context.Orders
         .SetProperty(o => o.UpdatedAt, DateTimeOffset.UtcNow), ct);
 ```
 
+### 7.2 `DbContext` Pooling, Compiled Queries & Execution Strategy Retries
+
+1. **`AddDbContextPool<TContext>`:** Resets and reuses `DbContext` instances across HTTP requests instead of instantiating internal service graphs and change-tracker dictionaries on every request. (Warning: pooled `DbContext` constructors cannot inject request-scoped services directly; use an interceptor or scoped state factory.)
+2. **Compiled Queries (`EF.CompileAsyncQuery`):** Eliminates the CPU and allocation cost of walking and hashing the C# `Expression` tree on ultra-hot query paths:
+3. **Resilient Execution Strategies & Explicit Transactions:** When `EnableRetryOnFailure()` is configured on SQL Server/PostgreSQL, EF Core buffers uncommitted operations to retry transient network blips. Consequently, calling `BeginTransactionAsync()` directly throws an `InvalidOperationException` unless wrapped inside `CreateExecutionStrategy().ExecuteAsync(...)`:
+
+```csharp
+public sealed class HighThroughputOrderRepository(AppDbContext dbContext)
+{
+    // Pre-compiled LINQ expression tree -> cached SQL generation delegate
+    private static readonly Func<AppDbContext, Guid, CancellationToken, Task<OrderSummaryDto?>>
+        GetOrderByIdCompiled = EF.CompileAsyncQuery(
+            (AppDbContext db, Guid id, CancellationToken ct) =>
+                db.Orders
+                  .AsNoTracking()
+                  .Where(o => o.Id == id)
+                  .Select(o => new OrderSummaryDto(o.Id, o.Customer.Name, o.TotalAmount))
+                  .FirstOrDefault());
+
+    public Task<OrderSummaryDto?> GetByIdFastAsync(Guid id, CancellationToken ct) =>
+        GetOrderByIdCompiled(dbContext, id, ct);
+
+    // Properly wrapping a multi-step ACID transaction with EnableRetryOnFailure()
+    public async Task TransferFundsResilientAsync(Guid fromId, Guid toId, decimal amount, CancellationToken ct)
+    {
+        var strategy = dbContext.Database.CreateExecutionStrategy();
+
+        await strategy.ExecuteAsync(async token =>
+        {
+            await using var transaction = await dbContext.Database.BeginTransactionAsync(token);
+
+            await dbContext.Wallets.Where(w => w.Id == fromId)
+                .ExecuteUpdateAsync(s => s.SetProperty(w => w.Balance, w => w.Balance - amount), token);
+
+            await dbContext.Wallets.Where(w => w.Id == toId)
+                .ExecuteUpdateAsync(s => s.SetProperty(w => w.Balance, w => w.Balance + amount), token);
+
+            await transaction.CommitAsync(token);
+        }, ct);
+    }
+}
+```
+
+### Section 7 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions
+1. **Q: What is a key behavioral caveat when using `ExecuteUpdateAsync` or `ExecuteDeleteAsync` alongside tracked entities in the same `DbContext` instance?**
+   - **Model Answer:** `ExecuteUpdateAsync` and `ExecuteDeleteAsync` execute immediate set-based SQL directly against the database **bypassing the EF Core Change Tracker completely**. Any entities already loaded and tracked in memory by that `DbContext` instance are *not* updated or detached automatically, creating stale in-memory state, and any `SaveChangesInterceptor` (such as audit logging or domain event dispatch) will *not* fire for `ExecuteUpdateAsync`.
+2. **Q: When can `AsSplitQuery()` produce inconsistent data across its child collections, and how do you prevent it?**
+   - **Model Answer:** Because `AsSplitQuery()` executes separate sequential `SELECT` statements (`SELECT Orders`, then `SELECT OrderLines`, then `SELECT AuditHistory`), under default `Read Committed` isolation a concurrent transaction could modify or delete an `Order` *between* Query 1 and Query 2! If strict cross-collection consistency is required, wrap the `AsSplitQuery()` call inside a `Snapshot` or `RepeatableRead` transaction.
+
+#### Practice Exercise
+- **Detect Client-Side Evaluation & N+1:** Write an EF Core `DbCommandInterceptor` that counts the number of SQL `SELECT` commands executed during a single HTTP request and logs a `LogLevel.Warning` whenever a single request executes more than 5 queries (automatic N+1 detector).
+
 ---
 
 ## Section 8 — Schema Evolution & Zero-Downtime Migrations
@@ -631,6 +778,26 @@ Never rename or drop a column in a single migration in a live system. Use the 4-
 3. **Backfill:** Run an asynchronous background batch job updating all historical rows: `UPDATE Users SET FullName = FirstName + ' ' + LastName WHERE FullName IS NULL`.
 4. **Contract:** Deploy application version $N+2$ reading solely from `FullName`. Drop legacy columns in a subsequent non-breaking database migration.
 
+### 8.2 CI/CD Migration Pipelines & Online DDL Operations
+
+1. **Never Call `dbContext.Database.MigrateAsync()` in `Program.cs`:**
+   - When Kubernetes scales out 10 pods simultaneously during a rollout, all 10 pods race to acquire schema modification locks (`Sch-M`), causing startup timeouts, crash loops, or broken rollbacks if pod startup fails after altering the schema.
+   - Instead, generate an **idempotent SQL script** (`dotnet ef migrations script --idempotent -o migrate.sql`) that checks `IF NOT EXISTS (SELECT * FROM [__EFMigrationsHistory] WHERE [MigrationId] = N'...')` and run it as a dedicated pre-deployment CI/CD pipeline gate.
+2. **Schema Lock (`Sch-M`) Hazards & Online Index Creation:**
+   - Standard `CREATE INDEX` or `ALTER TABLE ALTER COLUMN` acquires a Schema Modification (`Sch-M`) or Shared table lock, blocking all production writes for minutes on a 100M-row table.
+   - Always specify **`WITH (ONLINE = ON, RESUMABLE = ON, WAIT_AT_LOW_PRIORITY (MAX_DURATION = 1 MINUTES, ABORT_AFTER_WAIT = SELF))`** in SQL Server (or `CREATE INDEX CONCURRENTLY` in PostgreSQL) so index builds do not block live OLTP transactions or cause blocking chains behind a long-running query!
+
+### Section 8 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions
+1. **Q: Why can `ALTER TABLE Orders ADD IsArchived BIT NOT NULL DEFAULT 0` complete in 2 milliseconds on a 500-million-row table in SQL Server, whereas adding a non-deterministic default or changing a column from `INT` to `BIGINT` can lock the table for an hour?**
+   - **Model Answer:** Modern SQL Server (2012+ Enterprise / 2016+ all editions) implements **Metadata-Only Column Addition** for `NOT NULL` columns with a constant default. Instead of rewriting all 500 million 8KB data pages on disk, SQL Server simply records the default value in `sys.system_internals_partition_columns` metadata; when an old page lacking the physical bytes is read later, the storage engine injects the default value in memory. By contrast, widening `INT` (4 bytes) to `BIGINT` (8 bytes) changes the fixed-length byte offset of every row on every page, forcing a full physical table rewrite and page splits unless performed via an Expand/Contract shadow column.
+2. **Q: Why is `WAIT_AT_LOW_PRIORITY (MAX_DURATION = 1 MINUTES, ABORT_AFTER_WAIT = SELF)` critical even when running `CREATE INDEX ... WITH (ONLINE = ON)`?**
+   - **Model Answer:** Even an `ONLINE = ON` index build requires a brief Schema Modification (`Sch-M`) lock at the very final millisecond to swap metadata. If a 5-minute reporting query is currently holding an Intent-Shared (`IS`) lock on the table, the `Sch-M` lock request queues behind the reporting query, and **every subsequent live OLTP `SELECT`/`INSERT` queues behind the waiting `Sch-M` lock** (the "blocking train" effect)! `WAIT_AT_LOW_PRIORITY` with `ABORT_AFTER_WAIT = SELF` ensures the DDL waits in a low-priority queue without blocking normal traffic and safely aborts itself if it cannot acquire the lock within 1 minute.
+
+#### Practice Exercise
+- **Zero-Downtime PK Migration:** Design the step-by-step Expand/Contract migration plan to convert a live 200-million-row `Transactions` table's primary key from a 32-bit `INT` (currently at $2.05 \times 10^9$, approaching `int.MaxValue` overflow) to a 64-bit `BIGINT` with zero downtime.
+
 ---
 
 ## Section 9 — NoSQL Architectures, Document Stores & Cosmos DB
@@ -642,6 +809,35 @@ In Cosmos DB, data is distributed across physical partitions based on the hash o
 - A physical partition provides a fixed maximum throughput (e.g., 10,000 RU/s).
 - **Hot Partition Anti-Pattern:** Using a low-cardinality partition key like `Country` or `Status`. All traffic routes to the single partition holding "USA", exhausting RUs and triggering HTTP 429 (Too Many Requests), while other partitions sit idle!
 - **Optimal Partition Key:** High cardinality, evenly distributed access patterns (e.g., `TenantId` in B2B SaaS, or `UserId` in consumer applications).
+
+### 9.2 Cosmos DB Consistency Levels, Hierachical Partition Keys & Document Modeling
+
+1. **Overcoming the 20 GB Logical Partition Limit with Hierarchical Partition Keys:**
+   - In multi-tenant B2B SaaS, partitioning solely by `/tenantId` fails if a single enterprise tenant grows beyond **20 GB** of data or **10,000 RU/s** (the physical partition ceiling).
+   - **Hierarchical Partition Keys (Subpartitioning):** Configure up to 3 levels—e.g., `["/tenantId", "/yearMonth", "/userId"]`. Cosmos DB can split a giant tenant across multiple physical partitions while still allowing queries scoped to `/tenantId` and `/yearMonth` to route to a targeted subset of partitions rather than fanning out across the entire cluster!
+2. **The 5 Consistency Levels in Azure Cosmos DB:**
+   - **Strong:** Linearizable reads guaranteed to see the latest committed write globally (RPO = 0; limited to single-region or higher write latency across regions; $2\times$ RU read cost vs Session).
+   - **Bounded Staleness:** Reads lag behind writes by at most $K$ versions or $T$ seconds/milliseconds; preserves global write order.
+   - **Session (Default):** Guarantees *Read-Your-Writes*, *Monotonic Reads*, and *Monotonic Writes* within a client session token (`x-ms-session-token`) at half the RU cost of Strong/Bounded Staleness!
+   - **Consistent Prefix:** Never sees out-of-order writes (if writes are $A, B, C$, reader sees $A$, $A,B$, or $A,B,C$, never $A,C$).
+   - **Eventual:** Lowest latency, no ordering guarantee across replicas.
+3. **Document Modeling: When to Embed vs When to Reference:**
+
+| Criterion | Embed inside Parent Document (`Order` contains `Items[]`) | Reference as Separate Document (Store in same container with shared Partition Key) |
+|---|---|---|
+| **Relationship Cardinality** | **1:1** or **Bounded 1:Few** (e.g., 1–50 order lines, shipping addresses). | **Unbounded 1:Many** (e.g., product reviews, IoT telemetry events, audit logs) or **Many:Many**. |
+| **Mutation Frequency** | Parent and child fields change together at the same rate. | Child items are appended/updated continuously (avoid rewriting a 500 KB document to update 1 counter, which consumes massive RUs and hits the **2 MB** item size limit). |
+
+### Section 9 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions
+1. **Q: Why does a Cosmos DB Point Read (`container.ReadItemAsync<Order>(id, new PartitionKey(pk))`) cost exactly 1 RU for a 1 KB document, whereas `SELECT * FROM c WHERE c.id = @id` with the same partition key costs ~2.8 RUs?**
+   - **Model Answer:** A `ReadItemAsync` Point Read bypasses the query parser and index engine entirely, routing directly to the storage backend via the `(PartitionKey, Id)` composite address. A SQL `SELECT` query must invoke the query engine, consult the inverted index, and construct a result iterator feed.
+2. **Q: A Cosmos DB container provisioned with 40,000 RU/s is returning `HTTP 429 TooManyRequests` even though Azure Monitor shows total cluster RU consumption is only 8,000 RU/s. How is that possible?**
+   - **Model Answer:** Provisioned RU/s are divided **evenly across all physical partitions**. If the container has 10 physical partitions, each physical partition gets at most $40,000 / 10 = 4,000\text{ RU/s}$. Because of a skewed/hot partition key, a single partition is receiving $8,000\text{ RU/s}$ of traffic and throttling with `429` once it crosses its $4,000\text{ RU/s}$ slice, while the other 9 partitions sit at $0\text{ RU/s}$.
+
+#### Practice Exercise
+- **Change Feed Materialized View:** Design a Cosmos DB Change Feed Processor (`GetChangeFeedProcessorBuilder`) that listens to an `Orders` container partitioned by `/customerId` and maintains a synchronized denormalized copy in an `OrdersByMerchant` container partitioned by `/merchantId` so merchant dashboards never execute cross-partition fan-out queries.
 
 ---
 

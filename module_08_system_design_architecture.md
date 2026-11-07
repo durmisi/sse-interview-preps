@@ -843,6 +843,494 @@ In enterprise architecture, systems must be partitioned around business capabili
 
 ---
 
+### 6.2 Global Load Balancing (L4 vs L7, Anycast DNS) & CDN Edge Caching
+
+Before a request ever reaches a Bounded Context or microservice, it traverses the global edge and load-balancing hierarchy.
+
+```mermaid
+flowchart LR
+    Client["Client Browser / Mobile App"] -->|"1. Anycast BGP (<15ms)"| AFD["Azure Front Door / Edge POP\n(TLS Termination, WAF, Edge Cache)"]
+    AFD -->|"2. Cache Miss -> Origin Shield"| Shield["Origin Shield POP\n(Consolidates Edge Misses)"]
+    Shield -->|"3. Backbone Private Link"| AppGW["Regional L7 Load Balancer\n(Application Gateway / YARP)"]
+    AppGW -->|"4. Path / Header Routing"| Pods["AKS / Container App Replicas"]
+    NLB["Regional L4 Load Balancer\n(Azure Load Balancer - TCP/UDP)"] -.->|"Non-HTTP / Ultra-Low Latency TCP"| Pods
+```
+
+#### 1. Layer 4 (Transport) vs Layer 7 (Application) Load Balancing
+- **Layer 4 Load Balancer (TCP/UDP — e.g., Azure Standard Load Balancer, AWS NLB):**
+  - Inspects only network/transport 5-tuple (`Source IP`, `Dest IP`, `Source Port`, `Dest Port`, `Protocol`).
+  - Uses **Direct Server Return (DSR)** or ultra-fast packet forwarding without terminating TLS or parsing HTTP payloads.
+  - **Best for:** Millions of concurrent TCP/UDP packets/sec, raw gRPC/TCP streams, database connection load balancing, or gaming servers.
+- **Layer 7 Load Balancer (HTTP/HTTPS — e.g., Azure Front Door, Application Gateway, Envoy, YARP):**
+  - Terminates client TLS connections, decrypts HTTP/2 or HTTP/3 (QUIC) frames, and inspects URLs, HTTP headers, JWT claims, and cookies.
+  - Performs path-based routing (`/api/orders` $\to$ Order Service), WAF inspection (SQLi/XSS filtering), rate limiting, and canary traffic splitting.
+- **Anycast Routing at the Edge:**
+  - Global L7 edges (Azure Front Door, Cloudflare) advertise the **same IP address** from $190+$ global Points of Presence (POPs) via BGP Anycast. A user in Tokyo completes the TCP + TLS handshake at the local Tokyo POP ($<10\text{ ms}$ RTT) rather than making multiple round-trips across the Pacific Ocean to a US East origin ($160\text{ ms}$ RTT per handshake step).
+
+#### 2. Advanced CDN Edge Caching Semantics & Origin Shield
+- **HTTP Cache Directives:**
+  - `Cache-Control: public, max-age=60, s-maxage=3600, stale-while-revalidate=120, stale-if-error=86400`
+  - `max-age=60`: Client browsers cache the response for 60 seconds.
+  - `s-maxage=3600`: Shared proxy caches (CDN Edge) cache the response for 1 hour (overriding `max-age`).
+  - `stale-while-revalidate=120`: When the 1-hour TTL expires, the CDN immediately serves the slightly stale cached response to the user in $2\text{ ms}$ while refreshing the cache from the origin asynchronously in the background!
+  - `stale-if-error=86400`: If the origin backend returns `5xx` or times out during an outage, the CDN continues serving cached data for up to 24 hours.
+- **Cache Key Normalization:** By default, CDNs include the full URL query string in the cache key. If marketing adds `?utm_source=twitter&fbclid=12345`, every user gets a unique URL and bypasses the CDN cache ($0\%$ hit ratio!). Always normalize cache keys at the edge by stripping tracking parameters (`utm_*`, `fbclid`), lowercasing paths, and sorting allowed query parameters alphabetically.
+- **Origin Shield:** Without an Origin Shield, if a popular key expires simultaneously across 200 global Edge POPs, all 200 POPs send a cache-miss request to your origin database at once. An **Origin Shield** is a designated middle-tier POP that consolidates misses from all 200 edge POPs into a **single request** to your origin.
+
+---
+
+### Section 6 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions & Model Answers
+
+**Q1: Explain why terminating TLS at an Anycast CDN Edge (like Azure Front Door) reduces latency even for dynamic, uncacheable `POST /api/checkout` requests.**
+> **Model Answer:** Even when a `POST` request cannot be cached, establishing a new HTTPS connection over TCP + TLS 1.3 requires **2 network round trips** (1 RTT for the TCP 3-way handshake, 1 RTT for the TLS 1.3 key exchange) before the first byte of the HTTP payload is transmitted. If a user in Sydney connects directly to an origin server in Virginia ($200\text{ ms}$ RTT), connection setup alone wastes $400\text{ ms}$. With Anycast Edge termination, the client completes the TCP and TLS handshakes with the local Sydney Edge POP ($8\text{ ms} \times 2 = 16\text{ ms}$). The Sydney POP then forwards the request to Virginia over a **pre-warmed, persistent, multiplexed HTTP/2 connection** running over Microsoft's private fiber backbone, shaving nearly $400\text{ ms}$ off cold-connection latency.
+
+**Q2: A viral marketing campaign launches with unique `fbclid` and `utm_campaign` query parameters per user, and your origin API immediately melts down despite having a CDN in front. Why did this happen and how do you fix it in 60 seconds?**
+> **Model Answer:** The CDN is using the raw request URI (including query string) as its cache key. Because `fbclid` is unique per click, the CDN treats every single request as a distinct cache key, dropping the CDN cache hit ratio from $99\%$ to $0\%$ and forwarding $100\%$ of viral traffic straight to the origin.
+> **Immediate Fix:** Configure a **Cache Key Normalization Rule** on the CDN route to **ignore query strings** (or whitelist only functional query parameters like `page` and `category`), and enable **Origin Shield + Request Coalescing (Collapsed Forwarding)** so concurrent misses for the normalized key collapse into a single origin fetch.
+
+#### Practice Exercises
+
+1. **Exercise 6.1 — Designing `Cache-Control` Headers for a Product Catalog API:**
+   Write the exact HTTP response headers (`Cache-Control`, `ETag`, `Vary`) for a product details endpoint (`GET /api/products/{id}`) where browsers should cache for 30 seconds, the CDN should cache for 10 minutes, expired CDN entries should re-validate asynchronously for up to 5 minutes, and responses vary by `Accept-Encoding` and `X-Currency`.
+2. **Exercise 6.2 — Azure Load Balancing Topology:**
+   Draw an architecture diagram combining Azure Front Door, Azure Application Gateway (WAF v2), and an internal Azure Standard Load Balancer for an AKS cluster hosting both public REST APIs and an internal high-throughput TCP syslog ingestion service.
+
+---
+
+## Section 7 — Multi-Layer Caching & Hot-Key Mitigation at Scale
+
+### 7.1 Multi-Tier Caching Topology (Browser -> CDN -> L1 In-Memory -> L2 Redis -> DB)
+
+At extreme scale ($100,000+\text{ RPS}$), relying on a single caching layer is insufficient. Every layer in the multi-tier hierarchy filters out an order of magnitude of traffic and protects the layer beneath it:
+
+```text
+[ Client Browser ]      (L0 Cache: Memory/Disk, 0ms network RTT)
+        |
+        v (Miss)
+[ CDN Edge POP ]        (Edge Cache: s-maxage + Origin Shield, 2-10ms RTT)
+        |
+        v (Miss)
+[ API Pod: L1 Memory ]  (IMemoryCache inside .NET process, ~100ns access, 0 network I/O)
+        |
+        v (Miss)
+[ Distributed L2 Redis ](Azure Managed Redis Cluster, 0.3-1ms intra-AZ RTT)
+        |
+        v (Miss + Single-Flight Lock)
+[ Primary Database ]    (PostgreSQL / Cosmos DB Buffer Pool + NVMe SSD, 2-15ms)
+```
+
+#### Preventing Synchronized Expiration (TTL Jitter) & Cache Stampedes
+- **Synchronized Expiration Trap:** If a background job pre-warms $50,000$ catalog items into Redis at midnight with a fixed `TTL = 3600s`, all $50,000$ keys expire at the exact same millisecond at 01:00:00 AM, causing a catastrophic **Cache Avalanche** that overwhelms the database.
+- **Mitigation 1 — Randomized TTL Jitter:** Always add a random jitter ($\pm 10\%\text{ to }20\%$) to every cache TTL:
+  $$\text{TTL}_{\text{actual}} = \text{TTL}_{\text{base}} + \text{Random}(-\Delta, +\Delta)$$
+- **Mitigation 2 — Single-Flight Locking (Request Coalescing):** When a cache miss occurs on a cold key, use .NET 9 `HybridCache` or a keyed `SemaphoreSlim` so only **1 request per pod** queries Redis/DB while 500 concurrent requests on that pod await the same `Task<T>`.
+
+---
+
+### 7.2 Solving the "Celebrity / Flash-Sale Hot Key" Problem
+
+#### Why a Single Redis Shard Melts at 500,000 RPS on One Key
+A common interview misconception is: *"Redis is fast, so if a celebrity tweets or an iPhone flash sale goes live at 500,000 RPS, we'll just put that key in our 20-shard Redis cluster."*
+- **The Physics Problem:** Redis Cluster partitions keys across shards using CRC16 hashing (`CRC16(key) mod 16384`). A single key (e.g., `product:iphone16:stock` or `celebrity:messi:profile`) hashes to **one specific slot on one single Redis shard**.
+- Because Redis's core command execution loop is **single-threaded**, one Redis shard tops out around **$80,000\text{–}120,000\text{ ops/sec}$**. Funneling $500,000\text{ RPS}$ onto a single key saturates that single shard's CPU at $100\%$, causing timeouts across all other keys co-located on that shard while the other 19 shards sit idle!
+
+#### Two Production Solutions for Read Hot Keys
+
+1. **Key Salting / Key Replication Across Shards (`key#1` .. `key#N`):**
+   - For known or dynamically detected read hot keys, append a random shard suffix `1..N` (e.g., `N = 20`): `celebrity:messi:profile#1` through `celebrity:messi:profile#20`.
+   - Readers pick a random suffix `Random.Shared.Next(1, 21)`, spreading the $500,000\text{ RPS}$ evenly across all 20 Redis shards ($25,000\text{ RPS}$ per shard).
+2. **Short-Lived L1 In-Process Cache + Redis Pub/Sub Invalidation (`.NET HybridCache` Pattern):**
+   - Cache hot keys in local pod memory (`IMemoryCache`) for a very short duration (**$2\text{–}5\text{ seconds}$**) alongside a Redis Pub/Sub invalidation channel.
+   - If 50 API pods each cache the hot key in local RAM for $2\text{ seconds}$, each pod only calls Redis **once every 2 seconds** (total load on Redis drops from $500,000\text{ RPS}$ to **$25\text{ RPS}$**!).
+
+```csharp
+using System.Collections.Concurrent;
+using Microsoft.Extensions.Caching.Distributed;
+using Microsoft.Extensions.Caching.Memory;
+
+namespace EnterpriseScale.Caching;
+
+public sealed class HotKeyResilientCache
+{
+    private readonly IMemoryCache _l1Cache;
+    private readonly IDistributedCache _l2Redis;
+    private readonly ConcurrentDictionary<string, SemaphoreSlim> _keyLocks = new();
+    private const int HotKeySaltBuckets = 16;
+
+    public HotKeyResilientCache(IMemoryCache l1Cache, IDistributedCache l2Redis)
+    {
+        _l1Cache = l1Cache;
+        _l2Redis = l2Redis;
+    }
+
+    public async Task<string?> GetOrFetchHotKeyAsync(
+        string baseKey,
+        Func<CancellationToken, Task<string>> dbFallback,
+        TimeSpan l1Ttl,
+        TimeSpan l2BaseTtl,
+        CancellationToken ct)
+    {
+        // 1. L1 Local Memory Check (~100ns, absorbs 99.99% of hot-key spikes)
+        if (_l1Cache.TryGetValue(baseKey, out string? cachedValue))
+            return cachedValue;
+
+        // 2. Single-flight lock per key on this pod to prevent stampeding L2/DB
+        var gate = _keyLocks.GetOrAdd(baseKey, _ => new SemaphoreSlim(1, 1));
+        await gate.WaitAsync(ct);
+        try
+        {
+            if (_l1Cache.TryGetValue(baseKey, out cachedValue))
+                return cachedValue;
+
+            // 3. Salted L2 Redis Lookup: spread reads across 16 hash slots/shards
+            int bucket = Random.Shared.Next(1, HotKeySaltBuckets + 1);
+            string saltedRedisKey = $"{baseKey}:shard:{bucket}";
+
+            cachedValue = await _l2Redis.GetStringAsync(saltedRedisKey, ct);
+            if (cachedValue is null)
+            {
+                // 4. Fallback to DB and write with +/- 15% TTL Jitter to prevent synchronized expiry
+                cachedValue = await dbFallback(ct);
+                double jitterFactor = 0.85 + (Random.Shared.NextDouble() * 0.30);
+                var jitteredL2Ttl = TimeSpan.FromMilliseconds(l2BaseTtl.TotalMilliseconds * jitterFactor);
+
+                await _l2Redis.SetStringAsync(
+                    saltedRedisKey,
+                    cachedValue,
+                    new DistributedCacheEntryOptions { AbsoluteExpirationRelativeToNow = jitteredL2Ttl },
+                    ct);
+            }
+
+            // Populate L1 cache with brief TTL (e.g., 2-5 seconds)
+            _l1Cache.Set(baseKey, cachedValue, l1Ttl);
+            return cachedValue;
+        }
+        finally
+        {
+            gate.Release();
+        }
+    }
+}
+```
+
+---
+
+### Section 7 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions & Model Answers
+
+**Q1: Explain the difference between a Cache Stampede (Thundering Herd), a Cache Avalanche, and Cache Penetration, and how you defend against each.**
+> **Model Answer:**
+> 1. **Cache Stampede (Thundering Herd):** A single extremely popular key expires, and thousands of concurrent requests simultaneously miss the cache and hammer the database to recompute the same key. *Defense:* Single-flight request coalescing (`.NET 9 HybridCache` / keyed lock) or `stale-while-revalidate` logical early refresh before the physical TTL expires.
+> 2. **Cache Avalanche:** Thousands of distinct keys expire at the exact same second (or an entire Redis cluster node fails), shifting massive aggregate read volume to the database. *Defense:* Add $\pm 15\%$ randomized **TTL jitter** to every cache write, and deploy multi-AZ Redis replicas.
+> 3. **Cache Penetration:** Malicious or buggy clients repeatedly query non-existent IDs (e.g., `GET /users/-999` or random GUIDs). Because the ID is neither in Redis nor in the database, every request misses Redis and hits the database disk. *Defense:* Cache negative results (`null` sentinel value) with a short TTL ($30\text{–}60\text{ s}$), or place a **Bloom Filter** in front of the cache to reject keys guaranteed not to exist in $O(1)$ memory.
+
+**Q2: Why does Cache-Aside occasionally suffer from stale data when a write happens concurrently with a read miss, and why do we prefer Cache Invalidation (Delete) over Cache Update on writes?**
+> **Model Answer:** If two concurrent writers update the database (`Write A` then `Write B`) and also update the cache, network jitter can cause `Write B` to hit Redis *before* `Write A`, leaving Redis permanently poisoned with `Write A`'s older value until TTL expiry. Deleting (`DEL`) the cache key after committing the DB write is idempotent and avoids write-write ordering races. Even with `DEL`, a rare race exists where a slow Reader misses the cache, a Writer commits to DB and deletes the cache, and then the slow Reader writes its stale snapshot into Redis—mitigated via short TTLs, Redis Lua compare-and-set version numbers, or CDC-driven cache updates (Debezium/Outbox).
+
+#### Practice Exercises
+
+1. **Exercise 7.1 — Bloom Filter Sizing for Cache Penetration Defense:**
+   Your catalog has $50\text{ Million}$ valid `ProductId` GUIDs, and attackers are spraying random GUIDs at $20,000\text{ RPS}$. Calculate the memory required for a Redis Bloom Filter (`BF.RESERVE`) with a $0.1\%$ false-positive rate ($\approx 14.4\text{ bits per item}$), and show the read flow.
+2. **Exercise 7.2 — L1 Cache Invalidation via Redis Pub/Sub:**
+   Extend `HotKeyResilientCache` so that when a product price is updated, the writer publishes an invalidation message to a Redis Pub/Sub channel (`cache:invalidate`) that immediately evicts the key from all 50 pods' local `IMemoryCache`.
+
+---
+
+## Section 8 — Asynchronous Processing, Backpressure & Load Shedding
+
+### 8.1 Queue-Based Load Leveling & Little's Law ($L = \lambda W$)
+
+When downstream dependencies (databases, payment processors, PDF generators) have a fixed throughput ceiling, synchronous coupling during traffic spikes causes cascading failures.
+
+#### 1. Little's Law in Distributed Systems
+Little's Law is the fundamental theorem of queueing theory:
+$$L = \lambda \times W$$
+Where:
+- $L$: Average number of concurrent requests (or items queued/in-flight) inside the system.
+- $\lambda$ (Lambda): Average arrival/throughput rate ($\text{requests/second}$).
+- $W$: Average time a request spends in the system (Wait time + Service time, in seconds).
+
+**Worked Example:**
+- Suppose your API handles $\lambda = 2,000\text{ req/s}$ and each request normally takes $W = 0.05\text{ s}$ ($50\text{ ms}$).
+  $$L = 2,000 \times 0.05 = \mathbf{100\text{ concurrent requests in flight}}$$
+- Now, a downstream database query slows down from $50\text{ ms}$ to $W = 2.5\text{ seconds}$ due to lock contention:
+  $$L = 2,000 \times 2.5 = \mathbf{5,000\text{ concurrent requests in flight}}$$
+- Within seconds, those $5,000$ in-flight requests exhaust your connection pools, memory buffers, and sockets!
+
+#### 2. Queue-Based Load Leveling & KEDA Autoscaling
+By placing a durable broker (**Azure Service Bus / Kafka**) between the ingestion API and the worker tier:
+- The API validates the payload, writes to the queue in $3\text{ ms}$, and returns `202 Accepted` with a status polling URL (`Location: /api/jobs/{id}`).
+- Worker pods consume at their sustainable rate while **KEDA (Kubernetes Event-Driven Autoscaler)** monitors queue depth:
+  $$\text{Desired Replicas} = \left\lceil \frac{\text{Current Queue Length}}{\text{Target Messages Per Pod}} \right\rceil$$
+
+---
+
+### 8.2 Backpressure, Bounded Channels & Priority Load Shedding in C#
+
+#### Never Use `Channel.CreateUnbounded<T>()` in Production
+An unbounded in-memory queue (`Channel.CreateUnbounded<T>()` or `ConcurrentQueue<T>`) is an **Out-Of-Memory (`OutOfMemoryException`) time bomb**. If producers enqueue at $10,000\text{ items/sec}$ while the consumer slows to $1,000\text{ items/sec}$, the process accumulates $9,000\text{ objects/sec}$ in Gen 2 heap until the container is OOM-killed by Kubernetes—losing all in-memory work!
+
+#### Applying Backpressure & Priority-Based Load Shedding
+1. **Bounded Channels (`Channel.CreateBounded<T>`):** Force producers to await capacity (`BoundedChannelFullMode.Wait`) or fail fast so upstream callers slow down.
+2. **Priority Load Shedding Middleware:** When in-flight concurrency or CPU crosses a critical threshold ($>85\%$), **proactively shed low-priority traffic** (e.g., anonymous scraping, recommendations, analytics) with `HTTP 503 Service Unavailable` and a `Retry-After` header so **high-priority traffic** (checkout, payments, health checks) continues with $100\%$ success!
+
+```csharp
+using System.Threading.Channels;
+using Microsoft.AspNetCore.Http;
+
+namespace EnterpriseScale.Resilience;
+
+public enum RequestPriority { Low = 0, Normal = 1, Critical = 2 }
+
+// 1. Adaptive Priority Load Shedder Middleware
+// Preserves capacity for Critical traffic (Checkout/Health) when the pod approaches saturation.
+public sealed class PriorityLoadSheddingMiddleware
+{
+    private readonly RequestDelegate _next;
+    private int _currentInFlight;
+    private const int MaxConcurrency = 500;
+    private const int ShedLowPriorityThreshold = 350;    // 70% capacity
+    private const int ShedNormalPriorityThreshold = 450; // 90% capacity
+
+    public PriorityLoadSheddingMiddleware(RequestDelegate next) => _next = next;
+
+    public async Task InvokeAsync(HttpContext context)
+    {
+        int inFlight = Interlocked.Increment(ref _currentInFlight);
+        try
+        {
+            var priority = ClassifyPriority(context.Request.Path);
+
+            bool shouldShed =
+                (priority == RequestPriority.Low && inFlight > ShedLowPriorityThreshold) ||
+                (priority == RequestPriority.Normal && inFlight > ShedNormalPriorityThreshold) ||
+                (inFlight > MaxConcurrency);
+
+            if (shouldShed)
+            {
+                context.Response.StatusCode = StatusCodes.Status503ServiceUnavailable;
+                context.Response.Headers["Retry-After"] = "5";
+                await context.Response.WriteAsJsonAsync(new
+                {
+                    Error = "ServerBusy",
+                    Message = $"Load shedding active (InFlight={inFlight}). Please retry after 5 seconds."
+                });
+                return;
+            }
+
+            await _next(context);
+        }
+        finally
+        {
+            Interlocked.Decrement(ref _currentInFlight);
+        }
+    }
+
+    private static RequestPriority ClassifyPriority(PathString path)
+    {
+        if (path.StartsWithSegments("/health") || path.StartsWithSegments("/api/v1/checkout"))
+            return RequestPriority.Critical;
+        if (path.StartsWithSegments("/api/v1/recommendations") || path.StartsWithSegments("/api/v1/analytics"))
+            return RequestPriority.Low;
+        return RequestPriority.Normal;
+    }
+}
+
+// 2. Bounded Channel Worker with Explicit Backpressure & Timeout
+public sealed class BoundedTelemetryIngestionBuffer<T>
+{
+    private readonly Channel<T> _channel;
+
+    public BoundedTelemetryIngestionBuffer(int capacity = 5_000)
+    {
+        _channel = Channel.CreateBounded<T>(new BoundedChannelOptions(capacity)
+        {
+            FullMode = BoundedChannelFullMode.Wait,
+            SingleReader = false,
+            SingleWriter = false
+        });
+    }
+
+    public async ValueTask<bool> TryEnqueueWithBackpressureAsync(T item, TimeSpan maxWait, CancellationToken ct)
+    {
+        using var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
+        timeoutCts.CancelAfter(maxWait);
+        try
+        {
+            await _channel.Writer.WriteAsync(item, timeoutCts.Token);
+            return true;
+        }
+        catch (OperationCanceledException) when (!ct.IsCancellationRequested)
+        {
+            // Bounded channel remained full past maxWait -> signal caller to shed load (HTTP 429/503)
+            return false;
+        }
+    }
+
+    public ChannelReader<T> Reader => _channel.Reader;
+}
+```
+
+---
+
+### Section 8 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions & Model Answers
+
+**Q1: If your Kubernetes health check endpoint (`/healthz`) runs on the same HTTP request pipeline and thread pool as your overloaded API, what happens during a traffic spike, and how do you prevent cascading pod restarts?**
+> **Model Answer:** If the pod is experiencing heavy load or thread-pool queuing and `/healthz` gets queued behind slow user requests (or rejected by a naive global rate limiter), Kubernetes's `livenessProbe` will time out and **kill and restart the healthy pod**. Killing 1 of 10 pods routes $100\%$ of the traffic to the remaining 9 pods, pushing them over the edge and causing a **domino-effect cascading outage** across the entire cluster!
+> **Solution:**
+> 1. Classify `/healthz` and `/readyz` as `RequestPriority.Critical` so load-shedding and rate-limiting middleware never reject them.
+> 2. Never check external dependencies (like SQL or third-party APIs) inside a **Liveness Probe** (`livenessProbe` should only verify the local process isn't deadlocked; external dependency checks belong only in `readinessProbe` or startup probes).
+
+**Q2: Explain how you use Little's Law ($L = \lambda W$) to size the `MaxPoolSize` of a database connection pool or the bounded queue capacity of a microservice.**
+> **Model Answer:** If a database can execute at most $\lambda = 4,000\text{ queries/sec}$ before disk I/O saturates, and each query takes $W = 10\text{ ms}$ ($0.01\text{ s}$), Little's Law tells us the optimal number of concurrent active database operations across all API pods is $L = 4,000 \times 0.01 = 40\text{ connections}$. Setting `MaxPoolSize = 500` across 20 pods ($10,000$ connections) does *not* make the database faster—it causes heavy context-switching and lock contention inside the DB. Instead, we keep the connection pool tight and use bounded concurrency limiters in the API to fail fast if $W$ spikes.
+
+#### Practice Exercises
+
+1. **Exercise 8.1 — Little's Law Capacity & Queue Backlog Calculation:**
+   An order processing worker pool has 10 pods. Each pod processes 50 messages/sec ($\lambda_{\text{total}} = 500\text{ msg/s}$). During a 10-minute flash sale, orders arrive at $2,000\text{ msg/s}$. Calculate the peak queue backlog at minute 10, how long it will take the 10 pods to drain the backlog after traffic returns to $200\text{ msg/s}$, and how many KEDA pods are required to drain the backlog in under 2 minutes.
+2. **Exercise 8.2 — ASP.NET Core `ConcurrencyLimiter` Configuration:**
+   Configure .NET 8/9's built-in `AddRateLimiter` with two separate concurrency policies: a strict queue limit for `/api/reports/export` (max 10 concurrent, queue limit 5) and a high-throughput token bucket for `/api/orders`.
+
+---
+
+## Section 9 — Data Partitioning, Sharding, Search & Polyglot Persistence
+
+### 9.1 Horizontal Sharding Strategies, Routing & Rebalancing
+
+When write throughput or dataset size exceeds the physical limits of a single vertical database node (e.g., $>10\text{ TB}$ of hot transactional data or $>50,000\text{ ACID writes/sec}$), we partition data horizontally (**Sharding**) across independent nodes.
+
+#### Comparison of Sharding Strategies
+
+| Strategy | Mechanism | Pros | Cons / Failure Modes |
+|---|---|---|---|
+| **Range-Based Sharding** | Partition by contiguous key ranges (e.g., `OrderDate` month or `ZipCode 00000-19999`). | Efficient range queries (`BETWEEN`); easy to archive old time partitions. | **Severe Hot-Spotting:** In time-range sharding, $100\%$ of current writes hit the latest month's shard while historical shards sit idle! |
+| **Hash-Based (Consistent Hashing)** | `ShardId = Hash(PartitionKey) mod VNodes` (e.g., `CustomerId` or `TenantId`). | Uniform distribution of writes and reads across all physical shards. | Range queries across partition keys require expensive **Scatter-Gather** queries across all shards. |
+| **Directory / Lookup-Based Sharding** | A dedicated lookup service/table maps each `EntityId` or `TenantId` to its physical `ShardConnectionString`. | Maximum flexibility: can migrate a single noisy-neighbor enterprise tenant to its own dedicated shard at runtime. | Lookup table is on the critical path (must be heavily cached in L1/L2 memory); directory corruption is catastrophic. |
+
+#### The Scatter-Gather Anti-Pattern
+In a sharded database (such as Azure Cosmos DB or Citus PostgreSQL), choosing the right **Partition Key (Shard Key)** is the single most critical schema decision:
+- If `Orders` is sharded by `CustomerId`, querying `SELECT * FROM Orders WHERE CustomerId = @id` is a **$O(1)$ Single-Partition Point Query** ($2\text{ ms}$).
+- However, if an admin dashboard runs `SELECT * FROM Orders WHERE Status = 'Pending' ORDER BY CreatedAt DESC LIMIT 50` *without* a `CustomerId`, the coordinator must perform a **Scatter-Gather fan-out query** to **all $N$ physical shards**, wait for the slowest shard (tail latency amplification!), and merge-sort the results in memory.
+- **Solution:** Maintain a secondary materialized view / lookup table partitioned by the alternative access pattern, or offload cross-partition filtering and sorting to a dedicated **Search Index**.
+
+---
+
+### 9.2 Search Engines (Elasticsearch / Azure AI Search) & Blob Valet-Key Pattern
+
+#### 1. Inverted Index Synchronization via Transactional Outbox / CDC
+Relational and NoSQL document stores are optimized for point lookups and B-Tree range scans—not full-text fuzzy search, faceted aggregations, or typo-tolerant relevance scoring (`BM25`).
+- **Never Dual-Write Synchronously:** Writing to SQL Server and then calling `elasticClient.IndexAsync()` in the same HTTP request risks permanent data drift if the second call fails or arrives out of order.
+- **Event-Driven Synchronization Pipeline:**
+
+```mermaid
+flowchart LR
+    API["Catalog Command API"] -->|"1. ACID Transaction\n(Product + Outbox Row)"| SQL[("PostgreSQL / SQL Server")]
+    SQL -->|"2. Debezium CDC / Outbox Poller"| Kafka["Kafka / Azure Event Hubs\n(Partitioned by ProductId)"]
+    Kafka -->|"3. Batch Bulk Indexer\n(Idempotent Version Check)"| Search[("Azure AI Search / Elasticsearch\n(Inverted + Vector Index)")]
+```
+
+#### 2. The Valet-Key Pattern for Large Blob Uploads/Downloads
+A classic system design mistake is streaming $50\text{ MB}$ video/PDF uploads or downloads *through* your stateless ASP.NET Core web servers (`Client -> API Server -> Azure Blob Storage`). This ties up API memory buffers, network NIC bandwidth, and Kestrel connections for twice the transfer duration!
+
+**The Valet-Key Pattern:**
+1. The Client requests upload permission from the API (`POST /api/media/upload-intent`).
+2. The API validates user authorization and quota, then generates a **cryptographically signed, time-limited, least-privilege Azure Blob SAS (Shared Access Signature) URI** (or AWS S3 Pre-Signed URL) valid for only **10 minutes** with **Create/Write (`cw`)** permission on that specific blob path.
+3. The Client uploads the $50\text{ MB}$ binary stream **directly to Azure Blob Storage**, completely bypassing the API tier!
+4. Once uploaded, **Azure Event Grid** triggers a `BlobCreated` event to an asynchronous worker for virus scanning and thumbnail generation.
+
+```csharp
+using Azure.Storage;
+using Azure.Storage.Blobs;
+using Azure.Storage.Sas;
+
+namespace EnterpriseScale.Storage;
+
+public sealed record ValetUploadTokenResponse(
+    string BlobName,
+    Uri UploadSasUri,
+    DateTimeOffset ExpiresAtUtc,
+    long MaxAllowedBytes);
+
+public sealed class BlobValetKeyService
+{
+    private readonly BlobServiceClient _blobServiceClient;
+    private const string ContainerName = "customer-uploads";
+
+    public BlobValetKeyService(BlobServiceClient blobServiceClient)
+    {
+        _blobServiceClient = blobServiceClient;
+    }
+
+    public async Task<ValetUploadTokenResponse> IssueDirectUploadSasAsync(
+        Guid tenantId,
+        Guid userId,
+        string originalExtension,
+        CancellationToken ct)
+    {
+        // Strict path isolation by tenant and date
+        string safeExt = Path.GetExtension(originalExtension).ToLowerInvariant();
+        string blobName = $"{tenantId:N}/{DateTime.UtcNow:yyyy/MM/dd}/{Guid.NewGuid():N}{safeExt}";
+
+        var containerClient = _blobServiceClient.GetBlobContainerClient(ContainerName);
+        var blobClient = containerClient.GetBlobClient(blobName);
+
+        // Obtain a User Delegation Key backed by Microsoft Entra ID (Zero storage account keys in config!)
+        var now = DateTimeOffset.UtcNow;
+        var expiresAt = now.AddMinutes(10);
+        var userDelegationKey = await _blobServiceClient.GetUserDelegationKeyAsync(
+            now.AddMinutes(-2), // Clock-skew tolerance
+            expiresAt,
+            ct);
+
+        // Least-privilege SAS: Write + Create ONLY on this exact single blob
+        var sasBuilder = new BlobSasBuilder
+        {
+            BlobContainerName = ContainerName,
+            BlobName = blobName,
+            Resource = "b", // Single blob
+            StartsOn = now.AddMinutes(-2),
+            ExpiresOn = expiresAt,
+            Protocol = SasProtocol.Https
+        };
+        sasBuilder.SetPermissions(BlobSasPermissions.Create | BlobSasPermissions.Write);
+
+        var sasQueryParams = sasBuilder.ToSasQueryParameters(userDelegationKey, _blobServiceClient.AccountName);
+        var uploadUri = new UriBuilder(blobClient.Uri) { Query = sasQueryParams.ToString() }.Uri;
+
+        return new ValetUploadTokenResponse(blobName, uploadUri, expiresAt, MaxAllowedBytes: 50 * 1024 * 1024);
+    }
+}
+```
+
+---
+
+### Section 9 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions & Model Answers
+
+**Q1: How do you design a Partition Key in Azure Cosmos DB or a sharded PostgreSQL cluster when a single large B2B tenant has 10 million records while 5,000 smaller tenants have only 1,000 records each?**
+> **Model Answer:** In Azure Cosmos DB, a single logical partition has a strict **20 GB storage limit** and a **10,000 RU/s throughput ceiling**. If we partition purely by `TenantId`, the massive enterprise tenant will blow past the 20 GB limit and suffer `429 TooManyRequests` hot-partition throttling while other physical partitions sit empty.
+> **Solutions:**
+> 1. **Hierarchical Partition Keys (Sub-partitioning):** Use a multi-level partition key such as `[/TenantId, /YearMonth, /OrderId]`. Queries scoped to a `TenantId` and `YearMonth` hit only a small subset of partitions, while storage scales infinitely across months.
+> 2. **Bridge / Hybrid Sharding for Enterprise Whales:** Use directory-based routing to place the top $1\%$ enterprise "whale" tenants into their own dedicated Cosmos DB containers (partitioned by `CustomerId` or `OrderId`), while keeping the $99\%$ small tenants in a shared container partitioned by `TenantId`.
+
+**Q2: Why is using a Shared Access Signature (SAS) signed with a static Storage Account Key dangerous, and why does the `BlobValetKeyService` above use a `UserDelegationKey` instead?**
+> **Model Answer:** A SAS token signed with the master Storage Account Key remains valid until its expiration unless you rotate the entire storage account's master key (which risks breaking all services using that key). Furthermore, storing master keys in app configuration violates Zero-Trust principles. A **User Delegation SAS** is signed using temporary OAuth 2.0 credentials obtained via the API's **Managed Identity (Microsoft Entra ID)**. There are zero secrets stored in configuration, access can be revoked immediately via Entra RBAC, and all token issuance is audited in Azure Activity Logs.
+
+#### Practice Exercises
+
+1. **Exercise 9.1 — Preventing Out-of-Order Search Index Updates:**
+   A product price is updated twice within $50\text{ ms}$ (`v1: \$100` $\to$ `v2: \$80`). Due to consumer retries, the `v1` event arrives at Elasticsearch *after* `v2`. Show how to use Elasticsearch's `external_version` (`version_type=external`) with the database row's `RowVersion` / LSN to guarantee idempotent, monotonic updates.
+2. **Exercise 9.2 — Polyglot Persistence Selection for an E-Commerce Platform:**
+   For an Amazon-scale e-commerce site, justify the exact database engine you would choose for each of the following 5 workloads: (1) Shopping Cart, (2) Product Catalog & Faceted Search, (3) Order Financial Ledger, (4) Product Images/Videos, (5) "Customers Who Bought X Also Bought Y" recommendations.
+
+---
+
 ## Section 10 — Multi-Tenant SaaS Architecture & Isolation Models
 
 ### 10.1 Tenancy Isolation Comparison Matrix
@@ -850,8 +1338,362 @@ In enterprise architecture, systems must be partitioned around business capabili
 | Model | Architecture | Pros | Cons | Ideal Use Case |
 |---|---|---|---|---|
 | **Silo Model** | Dedicated compute and dedicated database per tenant | Maximum data isolation; compliance certified (HIPAA/PCI); zero noisy neighbors | Highest infrastructure cost; complex deployment management across 1,000+ tenants | Enterprise tier customers; highly regulated banking/healthcare |
-| **Pool Model** | Shared compute and shared database with `TenantId` column | Lowest operational cost; maximum resource utilization; simple single-step deployments | Noisy neighbor risk; complex row-level security; high blast radius if DB fails | Free/Basic tiers; high-volume B2C SaaS |
+| **Pool Model** | Shared compute and dedicated database with `TenantId` column | Lowest operational cost; maximum resource utilization; simple single-step deployments | Noisy neighbor risk; complex row-level security; high blast radius if DB fails | Free/Basic tiers; high-volume B2C SaaS |
 | **Bridge (Hybrid)** | Shared compute with dedicated databases per tenant | Good data isolation; custom backup/restore per tenant; moderate cost | Database connection pooling overhead; schema migration coordination | Mid-market B2B enterprise SaaS |
+
+---
+
+### 10.2 Multi-Region Active-Active vs Active-Passive Topologies & Failover Math
+
+To survive an entire cloud region outage (e.g., `East US 2` losing power or fiber connectivity) and meet strict **RPO (Recovery Point Objective — max data loss)** and **RTO (Recovery Time Objective — max downtime)** targets, systems must span multiple geographical regions.
+
+```mermaid
+flowchart TD
+    AFD["Global Anycast Edge (Azure Front Door)\nHealth Probes + Latency Routing"]
+    AFD -->|"Active (US Users - 15ms)"| RegA["Region A: US East\nAKS + Cosmos DB Multi-Write / SQL Primary"]
+    AFD -->|"Active or Standby (EU Users - 12ms)"| RegB["Region B: West Europe\nAKS + Cosmos DB Multi-Write / SQL Geo-Replica"]
+    RegA <-->|"Async Replication (<100ms)\nRPO: ~5s, RTO: <30s"| RegB
+```
+
+#### 1. Multi-Region Topologies & RPO/RTO Matrix
+
+| Topology | Mechanism | RTO (Downtime) | RPO (Data Loss) | Cost & Complexity |
+|---|---|---|---|---|
+| **Backup & Restore (Cold DR)** | Nightly geo-redundant backups (`GRS`) restored into a new region on disaster. | $4\text{–}24\text{ hours}$ | $1\text{–}24\text{ hours}$ | $1.1\times$ base cost; lowest complexity. |
+| **Pilot Light (Warm Standby)** | Database replicates continuously to Region B; compute is scaled to 0/minimal until failover. | $10\text{–}30\text{ minutes}$ | $5\text{–}60\text{ seconds}$ | $1.3\times$ base cost; moderate complexity. |
+| **Hot Standby (Active-Passive)** | Full compute & DB replica running in Region B; only Region A takes write traffic. | $30\text{ seconds}\text{–}2\text{ mins}$ | $< 5\text{ seconds}$ | $2.0\times$ base cost; requires automated failover testing. |
+| **Multi-Region Active-Active** | Both regions accept reads and writes simultaneously near the user. | $\approx \mathbf{0\text{ seconds}}$ | $\approx 0\text{ (or conflict resolution)}$ | $2.2\times+$ base cost; requires CRDTs / LWW conflict resolution or Geo-Homed user sharding. |
+
+#### 2. Composite Multi-Region Availability Math
+Suppose a single Azure region stack (AKS + Database + Load Balancer) achieves **$99.99\%$ availability** ($52.6\text{ minutes}$ downtime/year).
+When deployed in **Active-Active parallel redundancy** across two independent regions with automated edge failover:
+$$A_{\text{multi-region}} = 1 - (1 - A_{\text{region}})^2 = 1 - (1 - 0.9999)^2 = 1 - (0.0001)^2 = 1 - 0.00000001 = \mathbf{99.999999\%\text{ (Eight 9s!)}}$$
+*Practical Reality Check:* While the theoretical math yields eight 9s ($0.3\text{ seconds}$/year), in practice **shared control-plane dependencies** (global DNS, faulty global Terraform deployments, or schema migrations run globally at once) cap real-world availability around **$99.999\%$ ($5.26\text{ minutes}$/year)** unless deployments are strictly **Ring-Deployed** one region at a time with automated bake times.
+
+#### 3. DNS Failover TTL Pitfalls vs Anycast L7 Edge Failover
+- **The DNS Failover Trap:** If you rely on DNS (e.g., Azure Traffic Manager / Route53) to fail over from Region A to Region B, even if you set `DNS TTL = 60 seconds`, many corporate ISP resolvers and client OS / JVM DNS caches ignore short TTLs and cache the dead Region A IP for **5 to 30 minutes**!
+- **The Anycast Edge Solution:** Terminate clients at an **Anycast Global L7 Proxy (Azure Front Door / Cloudflare)**. The client's DNS IP *never changes* because the Anycast IP is announced globally. When Region A fails health probes, the Edge POP reroutes backend origin requests to Region B in **$<3\text{ seconds}$** with zero client DNS cache dependency.
+
+#### 4. Split-Brain Prevention During Failover
+If the network link between Region A (Primary DB) and Region B (Standby DB) severs, Region B might promote itself to Primary while Region A is still accepting writes from US clients (**Split-Brain**—two primaries accepting conflicting financial writes!).
+- **Prevention:** Use **Consensus Quorum (3 regions / witness zone)** and **Fencing Tokens (STONITH / Lease Epoch Numbers)**. When Region B acquires the new primary lease (`Epoch = 42`), storage nodes immediately reject any in-flight writes carrying Region A's stale `Epoch = 41`.
+
+---
+
+### Section 10 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions & Model Answers
+
+**Q1: In an Active-Active multi-region architecture, two users (or the same user on two devices) update the same record in `US-East` and `EU-West` within $20\text{ ms}$ of each other. How do you avoid write-write conflicts?**
+> **Model Answer:** Because cross-Atlantic fiber latency is $\sim 80\text{ ms}$, synchronous locking across continents destroys write latency. We use one of two patterns depending on the domain:
+> 1. **Geo-Homing (User/Tenant Pinning — Preferred for Strong Consistency):** Route each user or tenant deterministically to their "Home Region" (e.g., EU users always read/write in `EU-West`; US users always read/write in `US-East`) via a lightweight routing claim in their JWT. Each region is the single writer for its homed tenants, while asynchronously replicating to the other region for read/DR failover.
+> 2. **Multi-Master with Deterministic Conflict Resolution:** For collaborative or cart workloads in Azure Cosmos DB Multi-Write, use **CRDTs (Conflict-Free Replicated Data Types)** (e.g., grow-only counters, OR-Sets for shopping cart items) or custom stored-procedure conflict resolution rather than naive Last-Writer-Wins (`LWW`), which is vulnerable to NTP clock skew.
+
+**Q2: Why can a global CI/CD pipeline destroy the availability guarantee of a multi-region Active-Active architecture, and how do you design safe deployment rings?**
+> **Model Answer:** The composite availability formula $1 - (1 - A)^2$ assumes region failures are **statistically independent**. If a CI/CD pipeline deploys a bad configuration change or breaking database migration to `US-East` and `EU-West` simultaneously, both regions fail at the exact same second (a **correlated common-mode failure**). To preserve independence, enforce **Safe Deployment Practices (SDP)** with progressive rings: Ring 0 (Canary 1% in one AZ) $\to$ Ring 1 (Single small region, 2-hour automated SLO bake) $\to$ Ring 2 (Remaining regions sequentially, at least 24 hours apart).
+
+#### Practice Exercises
+
+1. **Exercise 10.1 — Calculating Real-World Multi-Region Availability with Control Plane Risk:**
+   Two regions each have $99.95\%$ independent availability, but they share a global Identity Provider (IdP) that has $99.99\%$ availability. Calculate the true composite availability of the system ($A_{\text{IdP}} \times [1 - (1 - A_{\text{region}})^2]$) and identify which component is now the bottleneck.
+2. **Exercise 10.2 — Designing an Automated Failover Runbook:**
+   Design a zero-data-loss failover state machine for an Active-Passive PostgreSQL cluster across `East US` and `West US`, specifying when replication is asynchronous vs synchronous and how fencing tokens prevent split-brain writes.
+
+---
+
+## Section 11 — Security Architecture, Zero-Trust & Multi-Tenant SaaS Isolation
+
+### 11.1 Zero-Trust Network Architecture, mTLS & Secret Rotation
+
+Modern enterprise cloud architecture operates under the **Zero-Trust Mandate**: *"Never trust the internal network perimeter; verify every identity explicitly, enforce least privilege, and assume the network is already breached."*
+
+```mermaid
+flowchart LR
+    Internet["Public Internet"] -->|"TLS 1.3 + WAF"| Edge["Azure Front Door"]
+    subgraph VNet["Private Virtual Network (Zero Public IPs on Backend)"]
+        Edge -->|"Private Link"| Ingress["Ingress Controller"]
+        Ingress -->|"SPIFFE mTLS (Service Mesh)"| OrderPod["Order API Pod\n(Managed Identity)"]
+        OrderPod -->|"SPIFFE mTLS"| PayPod["Payment Pod\n(Managed Identity)"]
+        OrderPod -->|"Private Endpoint (10.0.4.15)\nEntra OAuth Token"| SQL[("Azure SQL / Key Vault")]
+    end
+```
+
+#### 1. Eliminating Static Secrets with Workload Identity
+- **Zero Passwords in `appsettings.json` or Environment Variables:** Connection strings with passwords (`Password=...`) and static API keys are the #1 vector for credential leaks.
+- **Azure Workload Identity / Managed Identity:** Every Kubernetes Pod or Container App is federated with **Microsoft Entra ID** via OIDC projected service account tokens. When `OrderPod` connects to Azure SQL, Cosmos DB, Service Bus, or Key Vault, `DefaultAzureCredential` automatically exchanges the pod's short-lived OIDC token for an Entra access token—zero human-managed secrets exist!
+
+#### 2. Mutual TLS (mTLS) & East-West Traffic Encryption
+- Traditional perimeter security decrypts TLS at the ingress gateway and sends plaintext HTTP inside the Kubernetes cluster ("East-West traffic"). Under Zero-Trust ("Assume Breach"), an attacker who compromises a low-privilege pod could sniff internal network traffic or spoof requests to the Payment service.
+- **Service Mesh mTLS (Istio / Linkerd / Cilium):** Every pod receives a short-lived X.509 cryptographic workload certificate (`SPIFFE ID`, e.g., `spiffe://cluster.local/ns/prod/sa/order-service`) rotated automatically every 24 hours.
+- **Authorization Policies:** The Payment service cryptographically verifies the caller's client certificate and only accepts calls from `sa/order-service` on `POST /internal/payments/capture`.
+
+#### 3. Envelope Encryption (DEK + KEK) for Sensitive Data at Rest
+Why don't we send a $10\text{ MB}$ document directly to Azure Key Vault HSM to encrypt it? Because HSM network APIs have strict payload size limits (e.g., $4\text{ KB}$) and rate limits.
+- **Envelope Encryption:**
+  1. Generate a random 256-bit **Data Encryption Key (DEK)** locally in memory using `AesGcm`.
+  2. Encrypt the large payload locally at gigabytes/sec using `AES-256-GCM` with the DEK.
+  3. Call Azure Key Vault HSM (`WrapKeyAsync`) to encrypt *only the 32-byte DEK* using the master **Key Encryption Key (KEK)** stored inside the hardware HSM.
+  4. Store the wrapped (encrypted) DEK alongside the ciphertext in the database, and zero out the plaintext DEK from RAM (`CryptographicOperations.ZeroMemory`).
+
+---
+
+### 11.2 Multi-Tenant SaaS Isolation Models (Silo, Pool & Bridge)
+
+In a **Pool or Bridge** multi-tenant SaaS architecture, a single missing `WHERE TenantId = @tenantId` predicate causes a catastrophic **Cross-Tenant Data Leak**. Senior architects enforce isolation in depth across three layers:
+
+1. **Application Layer — Tenant Context Propagation & EF Core Global Query Filters:**
+   - Resolve `TenantId` strictly from the **cryptographically verified JWT claim (`tid` / `tenant_id`)**—never trust an unvalidated `X-Tenant-Id` query parameter or header from an untrusted client!
+   - Inject `ITenantContext` into `DbContext` and apply a global `HasQueryFilter(e => e.TenantId == _tenantContext.TenantId)` to every `IMultiTenantEntity`, plus an `SaveChanges` interceptor that stamps `TenantId` on all inserted entities.
+2. **Database Layer — PostgreSQL / SQL Server Row-Level Security (RLS):**
+   - Even if a developer writes a raw Dapper SQL query and forgets the `WHERE` clause, database-level **Row-Level Security (`CREATE SECURITY POLICY`)** inspects `SESSION_CONTEXT(N'TenantId')` set when opening the connection and blocks access to rows belonging to other tenants at the storage engine level.
+3. **Noisy Neighbor Protection & Per-Tenant Encryption Keys (CMK):**
+   - **Per-Tenant Rate Limiting:** Partition rate-limiter buckets by `TenantId` so a runaway script from Tenant A gets throttled (`HTTP 429`) while Tenant B enjoys $100\%$ availability.
+   - **Customer-Managed Keys (CMK):** In Envelope Encryption, wrap each tenant's DEK with that specific tenant's Key Vault KEK (`kek-tenant-{id}`). If an enterprise customer terminates their contract or revokes their key, revoking their KEK cryptographically shreds all of their data across shared backups instantly.
+
+```csharp
+using System.Security.Claims;
+using Microsoft.AspNetCore.Http;
+using Microsoft.EntityFrameworkCore;
+
+namespace EnterpriseSaaS.MultiTenancy;
+
+public interface IMultiTenantEntity
+{
+    Guid TenantId { get; set; }
+}
+
+public interface ITenantContext
+{
+    Guid TenantId { get; }
+    string Tier { get; } // Basic, Pro, Enterprise
+}
+
+// 1. Resolve Tenant strictly from verified JWT Claims
+public sealed class JwtTenantContextAccessor : ITenantContext
+{
+    public Guid TenantId { get; }
+    public string Tier { get; }
+
+    public JwtTenantContextAccessor(IHttpContextAccessor httpContextAccessor)
+    {
+        var user = httpContextAccessor.HttpContext?.User;
+        var tenantClaim = user?.FindFirstValue("tenant_id");
+        if (!Guid.TryParse(tenantClaim, out var tenantId) || tenantId == Guid.Empty)
+            throw new UnauthorizedAccessException("Authenticated request is missing a valid 'tenant_id' claim.");
+
+        TenantId = tenantId;
+        Tier = user?.FindFirstValue("tenant_tier") ?? "Basic";
+    }
+}
+
+// 2. Multi-Tenant DbContext enforcing both Read Isolation (Query Filter) and Write Stamping
+public sealed class MultiTenantSaasDbContext : DbContext
+{
+    private readonly ITenantContext _tenantContext;
+
+    public MultiTenantSaasDbContext(
+        DbContextOptions<MultiTenantSaasDbContext> options,
+        ITenantContext tenantContext) : base(options)
+    {
+        _tenantContext = tenantContext;
+    }
+
+    protected override void OnModelCreating(ModelBuilder modelBuilder)
+    {
+        // Automatically enforce WHERE TenantId = @currentTenantId on all queries
+        modelBuilder.Entity<InvoiceRecord>()
+            .HasQueryFilter(e => e.TenantId == _tenantContext.TenantId);
+    }
+
+    public override Task<int> SaveChangesAsync(CancellationToken cancellationToken = default)
+    {
+        foreach (var entry in ChangeTracker.Entries<IMultiTenantEntity>())
+        {
+            if (entry.State == EntityState.Added)
+            {
+                entry.Entity.TenantId = _tenantContext.TenantId;
+            }
+            else if (entry.State is EntityState.Modified or EntityState.Deleted &&
+                     entry.Entity.TenantId != _tenantContext.TenantId)
+            {
+                throw new InvalidOperationException("Security Violation: Cross-tenant entity mutation blocked.");
+            }
+        }
+        return base.SaveChangesAsync(cancellationToken);
+    }
+}
+
+public sealed class InvoiceRecord : IMultiTenantEntity
+{
+    public Guid Id { get; set; }
+    public Guid TenantId { get; set; }
+    public decimal Amount { get; set; }
+}
+```
+
+---
+
+### Section 11 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions & Model Answers
+
+**Q1: Why is relying solely on EF Core's `HasQueryFilter` insufficient for defense-in-depth in a Pooled Multi-Tenant database, and how do you back it up at the SQL engine layer?**
+> **Model Answer:** EF Core's `HasQueryFilter` can be bypassed if a developer calls `.IgnoreQueryFilters()`, executes raw SQL via `FromSqlRaw` / Dapper, or runs an ad-hoc reporting query. For defense-in-depth, we combine EF Core query filters with **Database Row-Level Security (RLS)** (in PostgreSQL or Azure SQL). When a connection is leased from the pool, a `DbConnectionInterceptor` executes `EXEC sp_set_session_context @key=N'TenantId', @value=@tenantId` (or `SET app.current_tenant_id = ...` in Postgres). The database engine's security policy predicates every `SELECT`, `UPDATE`, and `DELETE` on that session variable—making cross-tenant data leakage impossible even under SQL injection or developer error.
+
+**Q2: Walk through how Envelope Encryption works when encrypting sensitive PII fields per tenant, and why it enables instant key rotation without re-encrypting terabytes of database rows.**
+> **Model Answer:** With Envelope Encryption, the actual database rows are encrypted with a fast symmetric **Data Encryption Key (DEK)** (`AES-256-GCM`), and that 32-byte DEK is encrypted ("wrapped") by the **Key Encryption Key (KEK)** inside Azure Key Vault HSM. When compliance requires rotating the KEK every 90 days, we generate a new KEK version in Key Vault and only need to unwrap and re-wrap the small set of 32-byte DEKs—we do *not* need to decrypt and re-encrypt terabytes of underlying customer rows immediately!
+
+#### Practice Exercises
+
+1. **Exercise 11.1 — STRIDE Threat Model for a Multi-Tenant File Sharing API:**
+   Conduct a STRIDE analysis (Spoofing, Tampering, Repudiation, Information Disclosure, Denial of Service, Elevation of Privilege) on a multi-tenant document management API, listing one concrete attack scenario and one concrete architectural mitigation for each of the 6 categories.
+2. **Exercise 11.2 — Implementing an EF Core `DbConnectionInterceptor` for SQL Row-Level Security:**
+   Write a C# `DbConnectionInterceptor` (`ConnectionOpenedAsync`) that injects the current `ITenantContext.TenantId` into SQL Server's `sp_set_session_context` with `@read_only = 1` on every opened connection.
+
+---
+
+## Section 12 — Legacy Modernization: The Strangler Fig Pattern & Branch by Abstraction
+
+### 12.1 Executing a Zero-Downtime Strangler Fig Migration
+
+Big-bang rewrites of legacy monoliths almost always fail: they take 2+ years, freeze business feature delivery, and attempt to chase a moving target. **Martin Fowler's Strangler Fig Pattern** incrementally replaces specific capabilities of a legacy monolith behind an interception proxy until the legacy system shrinks and is safely decommissioned.
+
+```mermaid
+flowchart LR
+    Client["External Clients"] --> YARP["YARP Reverse Proxy\n(Strangler Facade)"]
+    YARP -->|"1. Legacy Routes (80%)\n/api/billing, /api/users"| Monolith["Legacy .NET Framework 4.8 Monolith"]
+    YARP -->|"2. Migrated Route (100%)\n/api/orders"| NewSvc["Modern .NET 9 Order Service"]
+    YARP -.->|"3. Shadow / Dark Traffic (Async Tee)\nCompare Responses & Latencies"| NewSvc
+    NewSvc -->|"Anti-Corruption Layer (ACL)"| LegacyDB[("Legacy Database")]
+    LegacyDB -->|"Debezium CDC"| NewDB[("New Order PostgreSQL DB")]
+```
+
+#### The 5-Phase Zero-Downtime Strangler Fig Playbook
+
+1. **Phase 1 — Introduce the Strangler Facade (YARP / Envoy API Gateway):**
+   - Place **YARP (Yet Another Reverse Proxy)** in front of the legacy monolith. Initially, $100\%$ of routes pass through to the monolith unchanged.
+2. **Phase 2 — Build New Service with an Anti-Corruption Layer (ACL) & CDC Sync:**
+   - Build the new `.NET 9 Order Service` with its own clean domain model.
+   - Use **Change Data Capture (Debezium)** or a **Transactional Outbox** to stream writes from the legacy database into the new Order database in real time. An **ACL** translates legacy schema quirks (e.g., `ORD_STS_CD = 'P'`) into clean domain enums (`OrderStatus.Paid`).
+3. **Phase 3 — Shadow Traffic (Dark Launching & Parity Verification):**
+   - Before switching live customer reads to the new service, YARP duplicates incoming `GET /api/orders/{id}` requests asynchronously to the new service (**Shadow Traffic**).
+   - A comparator compares the Legacy JSON response against the New Service JSON response, logging any field mismatches or P99 latency regressions without affecting the customer's response!
+4. **Phase 4 — Canary Cutover ($1\% \to 10\% \to 50\% \to 100\%$):**
+   - Once shadow parity reaches $100\%$ over 7 days, shift live traffic gradually via feature flags / YARP header weights, maintaining an **instant 1-second rollback toggle** back to the monolith.
+5. **Phase 5 — Retire Legacy Code & Tables:**
+   - Delete the dead code paths from the legacy monolith.
+
+```csharp
+using System.Text.Json;
+using Microsoft.AspNetCore.Http;
+using Microsoft.Extensions.Logging;
+
+namespace EnterpriseModernization.Strangler;
+
+// Shadow Traffic Parity Verifier Middleware:
+// Fires an asynchronous, non-blocking request to the new microservice during Strangler migration
+// and compares the payload with the legacy monolith's response.
+public sealed class ShadowTrafficParityMiddleware
+{
+    private readonly RequestDelegate _next;
+    private readonly IHttpClientFactory _httpClientFactory;
+    private readonly ILogger<ShadowTrafficParityMiddleware> _logger;
+
+    public ShadowTrafficParityMiddleware(
+        RequestDelegate next,
+        IHttpClientFactory httpClientFactory,
+        ILogger<ShadowTrafficParityMiddleware> logger)
+    {
+        _next = next;
+        _httpClientFactory = httpClientFactory;
+        _logger = logger;
+    }
+
+    public async Task InvokeAsync(HttpContext context)
+    {
+        // Only shadow idempotent GET requests on the route being migrated
+        if (!HttpMethods.IsGet(context.Request.Method) ||
+            !context.Request.Path.StartsWithSegments("/api/v1/orders"))
+        {
+            await _next(context);
+            return;
+        }
+
+        string pathAndQuery = context.Request.Path + context.Request.QueryString;
+
+        // Capture legacy response body while streaming to caller
+        var originalBodyStream = context.Response.Body;
+        using var buffer = new MemoryStream();
+        context.Response.Body = buffer;
+
+        await _next(context);
+
+        buffer.Position = 0;
+        string legacyBody = await new StreamReader(buffer).ReadToEndAsync();
+        buffer.Position = 0;
+        await buffer.CopyToAsync(originalBodyStream);
+        context.Response.Body = originalBodyStream;
+
+        if (context.Response.StatusCode == StatusCodes.Status200OK)
+        {
+            // Fire-and-forget shadow comparison off the critical user request path
+            _ = CompareWithCandidateServiceAsync(pathAndQuery, legacyBody);
+        }
+    }
+
+    private async Task CompareWithCandidateServiceAsync(string pathAndQuery, string legacyJson)
+    {
+        try
+        {
+            using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(2));
+            var client = _httpClientFactory.CreateClient("ModernOrderCandidate");
+            var shadowResponse = await client.GetAsync(pathAndQuery, cts.Token);
+            string candidateJson = await shadowResponse.Content.ReadAsStringAsync(cts.Token);
+
+            if (!JsonPayloadEquals(legacyJson, candidateJson))
+            {
+                _logger.LogWarning(
+                    "Strangler Parity Mismatch on {Path}. LegacyLength={LegacyLen}, CandidateLength={CandidateLen}",
+                    pathAndQuery, legacyJson.Length, candidateJson.Length);
+            }
+        }
+        catch (Exception ex)
+        {
+            // Never let shadow traffic errors impact production stability
+            _logger.LogDebug(ex, "Shadow traffic call failed for {Path}", pathAndQuery);
+        }
+    }
+
+    private static bool JsonPayloadEquals(string a, string b)
+    {
+        using var docA = JsonDocument.Parse(a);
+        using var docB = JsonDocument.Parse(b);
+        return docA.RootElement.GetRawText() == docB.RootElement.GetRawText();
+    }
+}
+```
+
+---
+
+### Section 12 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions & Model Answers
+
+**Q1: When migrating a stateful module out of a legacy monolith, why is decomposing the shared database much harder than extracting the stateless API code, and how do you cut over writes safely?**
+> **Model Answer:** In a legacy monolith, dozens of stored procedures and foreign keys join directly against the `Orders` table. Simply deleting the `Orders` table breaks the monolith immediately. To decouple the database safely:
+> 1. **Stop Cross-Domain Joins in the Monolith (Branch by Abstraction):** Refactor the monolith to access Order data through an internal `IOrderDataGateway` interface rather than raw SQL joins.
+> 2. **Replicate Legacy $\to$ New DB via CDC:** Stream changes from the legacy DB to the new service's DB and verify read parity via Shadow Traffic.
+> 3. **Flip the System of Record & Reverse CDC:** Cut writes over to the new Order Service, and set up **Reverse CDC** (`New DB -> Legacy Orders Table`) so any remaining legacy batch reports reading the old table continue working until they are retired!
+
+**Q2: Why must you only replay `GET` (or strictly idempotent) requests when running Shadow Traffic without special isolation?**
+> **Model Answer:** If you shadow a non-idempotent `POST /api/orders/checkout` to the candidate service connected to real downstream systems, the customer's credit card will be charged twice and two shipments will be dispatched! For write-path dark launching, the candidate service must run against isolated sandbox/mock adapters for external side effects (`IPaymentGateway`, `IShippingGateway`) and write to a shadow database schema.
+
+#### Practice Exercises
+
+1. **Exercise 12.1 — Writing an Architecture Decision Record (ADR) for a Strangler Migration:**
+   Write a complete, formal **ADR-014: Strangler Fig Migration of Legacy Billing Engine to .NET 9** containing `Status`, `Context`, `Options Considered` (Big-Bang Rewrite vs In-Place Upgrade vs Strangler Fig with YARP), `Decision`, and `Consequences` (both positive and negative).
+2. **Exercise 12.2 — Branch by Abstraction Refactoring:**
+   Design a C# `CompositeOrderRepository` controlled by an `IFeatureManager` flag (`UseNewOrderServiceForReads`, `DualWriteWithShadowCheck`) that allows toggling reads and writes between a legacy SQL repository and a new gRPC client at runtime without redeploying.
 
 ---
 
@@ -877,6 +1719,103 @@ flowchart LR
 1. **Chunking Strategy:** Fixed-size chunking (e.g., 500 tokens with 50-token overlap) vs Semantic chunking (chunking by paragraph/section).
 2. **Hybrid Search:** Combining **Vector Similarity Search (Dense)** with **BM25 Keyword Search (Sparse)** and a Reranker produces vastly superior retrieval accuracy than pure vector search alone.
 3. **Semantic Caching:** Caching user query embeddings in Redis. If a new prompt has a cosine similarity $> 0.98$ to a cached query, return the cached answer immediately, saving LLM cost and 1-3 seconds of latency!
+
+---
+
+### 13.2 Quantitative Fitness Functions & FinOps Cloud Cost Engineering
+
+In *Building Evolutionary Architectures* (Neal Ford et al.), an **Architectural Fitness Function** is an objective, automated integrity check that continuously verifies a system's architectural characteristics (modularity, latency, security, and cloud cost efficiency) in CI/CD and production.
+
+#### 1. Automated Architecture Fitness Tests in C# (Enforcing Clean/DDD Boundaries)
+Without automated checks, architectural boundaries erode under deadline pressure ("architectural drift"). Putting fitness tests in your xUnit test suite fails the PR build immediately if a developer adds an illegal dependency:
+
+```csharp
+using System.Reflection;
+
+namespace EnterpriseArchitecture.FitnessTests;
+
+public static class ArchitectureFitnessVerifier
+{
+    // Automated Fitness Function 1: Domain Layer Purity Check
+    public static void AssertDomainLayerHasZeroInfrastructureDependencies(Assembly domainAssembly)
+    {
+        string[] forbiddenPrefixes =
+        {
+            "Microsoft.EntityFrameworkCore",
+            "Microsoft.AspNetCore",
+            "Azure.",
+            "StackExchange.Redis",
+            "System.Data.SqlClient"
+        };
+
+        var referencedAssemblies = domainAssembly.GetReferencedAssemblies();
+        var violations = referencedAssemblies
+            .Where(a => forbiddenPrefixes.Any(prefix =>
+                a.Name != null && a.Name.StartsWith(prefix, StringComparison.OrdinalIgnoreCase)))
+            .Select(a => a.Name!)
+            .ToList();
+
+        if (violations.Count > 0)
+        {
+            throw new InvalidOperationException(
+                $"Architectural Fitness Violation! Domain assembly '{domainAssembly.GetName().Name}' " +
+                $"illegally references infrastructure packages: {string.Join(", ", violations)}");
+        }
+    }
+
+    // Automated Fitness Function 2: All Domain Events Must Be Sealed & Immutable
+    public static void AssertAllDomainEventsAreSealed(Assembly domainAssembly, Type domainEventInterface)
+    {
+        var unsealedEvents = domainAssembly.GetTypes()
+            .Where(t => t is { IsClass: true, IsAbstract: false } &&
+                        domainEventInterface.IsAssignableFrom(t) &&
+                        !t.IsSealed)
+            .Select(t => t.FullName)
+            .ToList();
+
+        if (unsealedEvents.Count > 0)
+        {
+            throw new InvalidOperationException(
+                $"Architectural Fitness Violation! Domain events must be sealed: {string.Join(", ", unsealedEvents)}");
+        }
+    }
+}
+```
+
+#### 2. FinOps & Cloud Cost Engineering (Unit Economics Telemetry)
+At Staff/Principal level, **Cost is a first-class Non-Functional Requirement** alongside latency and availability. In AI/RAG and Multi-Tenant SaaS systems, a single runaway tenant or unoptimized vector/LLM pipeline can burn **\$50,000/month** in days.
+- **Unit Economics Telemetry (Cost-Per-Tenant & Token Budgeting):**
+  - Instrument every request with OpenTelemetry metrics tracking **Cosmos DB Request Units (`RU`) consumed**, **LLM Prompt + Completion Tokens**, and **Compute CPU-milliseconds**, tagged by `tenant.id` and `tenant.tier`.
+  - Compare each tenant's monthly resource consumption cost against their subscription revenue to detect unprofitable "margin-negative" tenants early.
+- **High-ROI Cloud FinOps Levers:**
+  1. **Storage Tiering Lifecycle Policies:** Automatically transition blobs/logs from Hot (\$0.018/GB) $\to$ Cool (after 30 days, \$0.01/GB) $\to$ Archive (after 90 days, \$0.00099/GB — **$95\%$ cost reduction**).
+  2. **Model Routing in RAG:** Route simple classification/summarization queries to a small model (`GPT-4o-mini` at \$0.15/1M tokens) and reserve frontier reasoning models (`GPT-4o` / `o3-mini`) only for complex multi-hop queries (**$15\times$ cost reduction**).
+  3. **Cross-AZ Egress Elimination:** Cloud providers charge ~\$0.01/GB for cross-Availability-Zone data transfer. Configure zone-aware service routing (Kubernetes **Topology Aware Hints**) so API pods in `AZ-1` prefer reading from Redis and DB read-replicas in `AZ-1`.
+
+---
+
+### Section 13 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions & Model Answers
+
+**Q1: In an enterprise Multi-Tenant RAG system, how do you prevent an LLM from retrieving document chunks belonging to Tenant B when answering a prompt from Tenant A?**
+> **Model Answer:** You must **never** rely on system prompt instructions (e.g., *"Ignore documents not belonging to Tenant A"*) for security—that is trivially defeated by prompt injection! Security enforcement must happen strictly at the **Vector Database retrieval layer before the LLM ever sees the chunks**:
+> 1. Stamp every document chunk indexed in Azure AI Search / Qdrant with a mandatory metadata field `tenant_id` (and document-level RBAC ACL tags `allowed_group_ids`).
+> 2. In the retrieval API, extract `tenant_id` from the caller's verified JWT and apply a mandatory **Pre-Filter (`$filter=tenant_id eq '...'`)** on the HNSW vector search query so similarity scoring only evaluates vectors owned by that tenant.
+> 3. For regulated Silo tenants, use separate physical vector indexes or namespace partitions per tenant.
+
+**Q2: What is an Architectural Fitness Function, and give three examples across modularity, performance, and FinOps that you would wire into a CI/CD pipeline?**
+> **Model Answer:** An Architectural Fitness Function is an automated test or telemetry gate that objectively measures whether a system satisfies a target architectural quality attribute:
+> 1. **Modularity Fitness Function (Compile/PR Gate):** An ArchUnitNET test verifying that the `Ordering` module has zero references to `Billing.Internal` types and that `Domain` has zero infrastructure dependencies.
+> 2. **Performance Fitness Function (Staging Deployment Gate):** A k6 load test asserting that P99 latency stays $< 120\text{ ms}$ and memory allocations per request stay $< 8\text{ KB}$ before promoting to production.
+> 3. **FinOps Fitness Function (Runtime Alert Gate):** An OpenTelemetry metric alert that triggers if average Cosmos DB RUs per checkout exceed `25 RUs` or LLM cost per customer conversation exceeds `\$0.02`.
+
+#### Practice Exercises
+
+1. **Exercise 13.1 — RAG Token & Vector Storage FinOps Estimation:**
+   Your enterprise RAG assistant processes $500,000\text{ queries/day}$. Each query retrieves 5 chunks ($400\text{ tokens}$ each) + $300\text{ tokens}$ of system/user prompt, and generates a $300\text{ token}$ answer. If $1\text{M}$ input tokens cost `\$2.50` and $1\text{M}$ output tokens cost `\$10.00`, calculate the monthly LLM bill, and calculate how much money you save per month by introducing a Redis Semantic Cache with a $35\%$ cache hit rate.
+2. **Exercise 13.2 — Writing a Cyclic Dependency Fitness Function:**
+   Extend `ArchitectureFitnessVerifier` in C# to inspect all namespaces under `EnterpriseCommerce.Modules.*` and assert that no two modules have a circular reference between their assemblies.
 
 ---
 
@@ -916,6 +1855,272 @@ flowchart LR
 3. **HTTP 301 vs 302 Redirect:**
    - `301 Moved Permanently`: Browser caches the redirect locally. Subsequent clicks bypass your server entirely (lowest server load, but loses click analytics).
    - `302 Found`: Browser requests the redirect from your server every time (enables accurate real-time click tracking, slightly higher server load).
+
+---
+
+### 14.2 Capstone 2: Distributed Rate Limiter (500,000 QPS Sliding Window & Local Fallback)
+
+At **500,000 QPS** across 100 API Gateway pods, a rate limiter must add $<1\text{ ms}$ of P99 latency, avoid race conditions across distributed nodes, and degrade gracefully if Redis experiences a network partition.
+
+#### Algorithm Selection Matrix
+1. **Fixed Window Counter:** Simple `INCR key` + `EXPIRE`. *Flaw:* Allows $2\times$ burst traffic across the boundary of two windows (e.g., 100 requests at `00:59` and 100 requests at `01:01`).
+2. **Sliding Window Log (`ZSET`):** Stores every request timestamp in a Redis Sorted Set. Exact precision, but high memory footprint ($64\text{ bytes}$ per request) for high-volume tiers.
+3. **Sliding Window Counter (Weighted Hybrid — Production Gold Standard):** Approximates the sliding window using only **two integer counters** (`previous_window` and `current_window`):
+   $$\text{EstimatedCount} = \text{Count}_{\text{prev}} \times \left(1 - \frac{t_{\text{elapsed}}}{\text{WindowSize}}\right) + \text{Count}_{\text{curr}}$$
+4. **Resilient Fallback:** If Redis times out ($>5\text{ ms}$), immediately fall back to an in-memory `System.Threading.RateLimiting.TokenBucketRateLimiter` per pod (configured at $\frac{\text{GlobalLimit}}{\text{PodCount}}$) rather than failing open or blocking customer traffic!
+
+---
+
+### 14.3 Capstone 3: High-Concurrency Flash Sale / Ticketmaster Reservation System
+
+#### Problem Statement & Scale Bottlenecks
+Suppose **5 Million concurrent users** attempt to purchase **50,000 Taylor Swift concert seats** (or 10,000 limited-edition GPUs) at exactly 10:00:00 AM (`500,000+ RPS` at the moment the sale opens):
+- **Why Traditional Database Transactions Melt Down:** Executing `BEGIN TRAN; SELECT Status FROM Seats WHERE SeatId = @id FOR UPDATE;` across 500,000 concurrent requests causes catastrophic row-lock contention, connection pool starvation, and complete database collapse within 2 seconds.
+- **Core Requirements:**
+  1. Zero overselling (strict inventory/seat uniqueness).
+  2. When a user selects a seat (or reserves 1 flash-sale unit), hold it exclusively for **5 minutes (300 seconds)** while they enter credit card details.
+  3. If payment succeeds within 5 minutes, finalize the ticket; if payment fails or the 5-minute timer expires, automatically release the seat back to the pool.
+
+#### End-to-End Flash Sale Architecture
+
+```mermaid
+flowchart LR
+    Users["5M Concurrent Users"] -->|"1. Edge Queue"| VWR["CDN Virtual Waiting Room\n(Signed Admission Token Queue)"]
+    VWR -->|"2. Metered Admission (10k RPS)"| API["Reservation API (.NET 9)"]
+    API -->|"3. Atomic Lua Hold (0.3ms)"| Redis[("Redis Cluster\n(Seat Inventory + 300s Hold TTL)")]
+    API -->|"4. Enqueue Checkout Intent"| Bus["Azure Service Bus / Kafka"]
+    Bus -->|"5. Async Payment & DB Persist"| Worker["Checkout Saga Worker"]
+    Worker --> SQL[("PostgreSQL Ledger\n(ACID Final Ticket Issue)")]
+```
+
+#### Deep Dive: The 3-Layer Defense
+1. **Layer 1 — Edge Virtual Waiting Room (Cloudflare / Azure Front Door + WebSockets):**
+   - Absorb the 5M user stampede at the CDN Edge. Users enter a cryptographically signed FIFO waiting room queue and only receive a short-lived **Signed Admission JWT** into the Reservation API at a metered rate that matches backend capacity (e.g., $10,000\text{ admissions/sec}$).
+2. **Layer 2 — Atomic Redis Lua Inventory Reservation with 5-Minute TTL Hold:**
+   - Because Redis executes a **Lua script (`EVAL` / `EVALSHA`) atomically** without interleaving any other commands, we check seat availability (or flash-sale stock), decrement available stock, and create a per-user reservation key with a **300-second TTL (`SET key val EX 300 NX`)** in a single sub-millisecond operation ($0.3\text{ ms}$) with **zero database locks**!
+3. **Layer 3 — Asynchronous Payment Checkout & Hold Expiration Reconciliation:**
+   - Once the Lua script returns `1` (`Reserved`), the user has 300 seconds to complete Stripe/Adyen payment using `ReservationId` as the **Idempotency Key**.
+   - Before capturing payment at second $t$, verify the hold still has $>15\text{ seconds}$ remaining (`PTTL`) so a late payment doesn't race with hold expiration.
+
+```csharp
+using StackExchange.Redis;
+
+namespace EnterpriseScale.Capstones;
+
+public sealed record FlashSaleReservationResult(
+    bool IsReserved,
+    string? ReservationToken,
+    DateTimeOffset? ExpiresAtUtc,
+    string Reason);
+
+public sealed class FlashSaleInventoryCoordinator
+{
+    private readonly IConnectionMultiplexer _redis;
+
+    // Atomic Lua Script:
+    // KEYS[1] = inventory counter key (e.g., "{event:99}:available_stock")
+    // KEYS[2] = user hold key        (e.g., "{event:99}:hold:user:42")
+    // ARGV[1] = reservation token GUID
+    // ARGV[2] = hold TTL in seconds (300)
+    // Note: Hash tags {event:99} ensure both keys live in the exact same Redis Cluster hash slot!
+    private const string AtomicReserveLuaScript = @"
+        if redis.call('EXISTS', KEYS[2]) == 1 then
+            return -1 -- User already holds an active reservation for this event
+        end
+        local stock = tonumber(redis.call('GET', KEYS[1]) or '0')
+        if stock <= 0 then
+            return 0  -- Sold out!
+        end
+        redis.call('DECR', KEYS[1])
+        redis.call('SET', KEYS[2], ARGV[1], 'EX', tonumber(ARGV[2]))
+        return 1      -- Successfully reserved with 5-minute TTL hold
+    ";
+
+    // Atomic Lua Script for releasing an expired or cancelled hold back into stock
+    private const string AtomicReleaseHoldLuaScript = @"
+        if redis.call('GET', KEYS[2]) == ARGV[1] then
+            redis.call('DEL', KEYS[2])
+            redis.call('INCR', KEYS[1])
+            return 1
+        end
+        return 0
+    ";
+
+    public FlashSaleInventoryCoordinator(IConnectionMultiplexer redis) => _redis = redis;
+
+    public async Task<FlashSaleReservationResult> TryReserveTicketAsync(
+        string eventId,
+        string userId,
+        TimeSpan holdDuration)
+    {
+        var db = _redis.GetDatabase();
+        string stockKey = $"{{event:{eventId}}}:available_stock";
+        string userHoldKey = $"{{event:{eventId}}}:hold:user:{userId}";
+        string reservationToken = Guid.NewGuid().ToString("N");
+        int ttlSeconds = (int)holdDuration.TotalSeconds;
+
+        var result = (long)await db.ScriptEvaluateAsync(
+            AtomicReserveLuaScript,
+            new RedisKey[] { stockKey, userHoldKey },
+            new RedisValue[] { reservationToken, ttlSeconds });
+
+        return result switch
+        {
+            1 => new FlashSaleReservationResult(
+                true, reservationToken, DateTimeOffset.UtcNow.AddSeconds(ttlSeconds), "Reserved"),
+            -1 => new FlashSaleReservationResult(
+                false, null, null, "DuplicateHold: User already has an active reservation."),
+            _ => new FlashSaleReservationResult(
+                false, null, null, "SoldOut: No remaining inventory available.")
+        };
+    }
+
+    public async Task<bool> CancelAndReleaseHoldAsync(string eventId, string userId, string reservationToken)
+    {
+        var db = _redis.GetDatabase();
+        string stockKey = $"{{event:{eventId}}}:available_stock";
+        string userHoldKey = $"{{event:{eventId}}}:hold:user:{userId}";
+
+        var released = (long)await db.ScriptEvaluateAsync(
+            AtomicReleaseHoldLuaScript,
+            new RedisKey[] { stockKey, userHoldKey },
+            new RedisValue[] { reservationToken });
+
+        return released == 1;
+    }
+}
+```
+
+---
+
+### 14.4 Capstone 4: Multi-Tenant Webhook Delivery Platform
+
+#### Problem Statement
+Payment platforms (Stripe), source control providers (GitHub), and B2B SaaS platforms must deliver millions of outgoing HTTP webhooks per minute (`order.paid`, `invoice.failed`) to thousands of customer-owned HTTPS endpoints:
+- **Key Engineering Challenges:**
+  1. **Unreliable / Slow Customer Endpoints:** Customer servers crash, take 15 seconds to respond, or return `502 Bad Gateway`.
+  2. **Noisy Neighbor / Head-of-Line Blocking:** If Tenant A's endpoint is timing out and Tenant A generates 500,000 events, Tenant A must **never** delay webhook delivery for Tenant B!
+  3. **Security & Authenticity:** Customers must verify that the webhook genuinely came from your platform and is not a replay attack (**HMAC-SHA256 signature with timestamp**).
+  4. **SSRF (Server-Side Request Forgery) Prevention:** A malicious tenant might register `http://169.254.169.254/metadata/instance` (cloud IMDS) or `https://10.0.1.5/admin` as their webhook URL to probe your internal network!
+
+#### End-to-End Webhook Delivery Architecture
+
+```mermaid
+flowchart LR
+    CoreSvc["Core Domain Services"] -->|"1. Outbox Event"| Ingest["Webhook Fan-Out Router"]
+    Ingest -->|"2. Fast Lane"| FastQ["Fast Queue\n(Healthy Endpoints)"]
+    Ingest -->|"3. Throttled / Failing Tenant"| SlowQ["Isolated Retry / Delay Queues\n(15s, 1m, 10m, 1h, 6h)"]
+    FastQ --> Workers["Stateless Delivery Workers\n(Per-Endpoint Circuit Breaker + SSRF Safe SocketsHttpHandler)"]
+    SlowQ --> Workers
+    Workers -->|"X-Webhook-Signature (HMAC-SHA256)"| CustEndpoint["Customer HTTPS Endpoint"]
+    Workers -->|"After 10 Failures -> Disable Endpoint"| DLQ[("Dead-Letter Store + Tenant Alert")]
+```
+
+#### Critical Production Design Decisions
+1. **Fast-Lane vs Slow-Lane Queue Isolation (Preventing Head-of-Line Blocking):**
+   - Maintain a per-endpoint health score and **Circuit Breaker** in Redis.
+   - Endpoints with $<95\%$ success rate or average latency $>2\text{ s}$ are automatically demoted from the **Fast Queue** to a **Slow / Retry Queue** with per-tenant concurrency caps so healthy tenants always experience sub-second webhook delivery.
+2. **Exponential Backoff with Jitter & Dead-Lettering:**
+   - Schedule retries via delayed messages (`15s -> 1m -> 5m -> 30m -> 2h -> 6h -> 24h`). If an endpoint fails continuously for 72 hours, trip its status to `Disabled` and email the tenant administrator.
+3. **Cryptographic HMAC-SHA256 Signing + Timestamp Replay Protection:**
+   - Sign `"{timestamp}.{rawJsonBody}"` using the tenant's webhook signing secret so the customer can verify integrity and reject payloads older than 5 minutes.
+4. **SSRF-Safe `SocketsHttpHandler` ConnectCallback:**
+   - Resolve the customer's hostname DNS and inspect the resolved IP address **inside `ConnectCallback` before opening the TCP socket**, blocking loopback (`127.0.0.0/8`), RFC-1918 private networks (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`), and cloud link-local metadata (`169.254.169.254`).
+
+```csharp
+using System.Net;
+using System.Net.Sockets;
+using System.Security.Cryptography;
+using System.Text;
+
+namespace EnterpriseScale.Capstones;
+
+public static class WebhookSecurityDispatcher
+{
+    // 1. Generate Stripe-style HMAC-SHA256 Signature Header with Replay Timestamp
+    public static string ComputeSignatureHeader(string webhookSecret, long unixTimestampSeconds, string rawBody)
+    {
+        string signedPayload = $"{unixTimestampSeconds}.{rawBody}";
+        byte[] keyBytes = Encoding.UTF8.GetBytes(webhookSecret);
+        byte[] payloadBytes = Encoding.UTF8.GetBytes(signedPayload);
+
+        byte[] hash = HMACSHA256.HashData(keyBytes, payloadBytes);
+        string hexSignature = Convert.ToHexString(hash).ToLowerInvariant();
+
+        return $"t={unixTimestampSeconds},v1={hexSignature}";
+    }
+
+    // 2. SSRF-Safe SocketsHttpHandler preventing tenants from probing internal VNet / Cloud IMDS IPs
+    public static SocketsHttpHandler CreateSsrfSafeHttpHandler()
+    {
+        return new SocketsHttpHandler
+        {
+            AllowAutoRedirect = false, // Never follow redirects into internal private IPs!
+            ConnectTimeout = TimeSpan.FromSeconds(5),
+            ConnectCallback = async (context, ct) =>
+            {
+                IPAddress[] addresses = await Dns.GetHostAddressesAsync(context.DnsEndPoint.Host, ct);
+                foreach (var ip in addresses)
+                {
+                    if (IsPrivateOrReservedIp(ip))
+                    {
+                        throw new InvalidOperationException(
+                            $"SSRF Security Block: Webhook target '{context.DnsEndPoint.Host}' resolved to forbidden internal IP {ip}.");
+                    }
+                }
+
+                var socket = new Socket(SocketType.Stream, ProtocolType.Tcp) { NoDelay = true };
+                try
+                {
+                    await socket.ConnectAsync(addresses, context.DnsEndPoint.Port, ct);
+                    return new NetworkStream(socket, ownsSocket: true);
+                }
+                catch
+                {
+                    socket.Dispose();
+                    throw;
+                }
+            }
+        };
+    }
+
+    private static bool IsPrivateOrReservedIp(IPAddress ip)
+    {
+        if (IPAddress.IsLoopback(ip)) return true;
+        if (ip.AddressFamily == AddressFamily.InterNetwork)
+        {
+            byte[] b = ip.GetAddressBytes();
+            return b[0] == 10 ||                                // 10.0.0.0/8
+                   (b[0] == 172 && b[1] >= 16 && b[1] <= 31) || // 172.16.0.0/12
+                   (b[0] == 192 && b[1] == 168) ||              // 192.168.0.0/16
+                   (b[0] == 169 && b[1] == 254) ||              // 169.254.0.0/16 (Cloud IMDS!)
+                   b[0] == 127 || b[0] == 0;
+        }
+        return ip.IsIPv6LinkLocal || ip.IsIPv6SiteLocal;
+    }
+}
+```
+
+---
+
+### Section 14 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions & Model Answers
+
+**Q1: In the Flash Sale / Ticketmaster architecture (`FlashSaleInventoryCoordinator`), why did we wrap `{event:99}` in curly braces in both Redis key names (`{event:99}:available_stock` and `{event:99}:hold:user:42`), and what happens when a user's 300-second hold key expires automatically in Redis without explicit cancellation?**
+> **Model Answer:**
+> 1. **Redis Cluster Hash Tags (`{...}`):** In a multi-shard Redis Cluster, a Lua script (`EVAL`) can only execute if **all `KEYS` it touches reside on the exact same hash slot and shard** (otherwise Redis throws a `CROSSSLOT Keys in request don't hash to the same slot` error). Wrapping `{event:99}` in curly braces instructs Redis Cluster to compute `CRC16("event:99") mod 16384` for both keys, guaranteeing atomic execution on the same shard.
+> 2. **Handling Silent TTL Expiration:** When `SET ... EX 300` expires automatically because the user closed their browser without paying, Redis deletes the hold key, which does *not* automatically increment `available_stock`! To reclaim expired holds accurately, we also insert `(userId, expiresAtUnixTimestamp)` into a per-event Redis Sorted Set (`{event:99}:active_holds_zset`). A lightweight background reaper runs every second (or piggybacks on reserve requests), queries `ZRANGEBYSCORE {event:99}:active_holds_zset -inf <now>` inside a Lua script, removes expired entries, and increments `available_stock` atomically.
+
+**Q2: In the Multi-Tenant Webhook Delivery Platform, why must SSRF IP validation happen inside `SocketsHttpHandler.ConnectCallback` rather than validating `Dns.GetHostAddressesAsync(url.Host)` before calling `httpClient.PostAsync(url)`?**
+> **Model Answer:** Validating DNS *before* calling `HttpClient.PostAsync()` is vulnerable to a **DNS Rebinding (Time-of-Check to Time-of-Use / TOCTOU) attack**: an attacker configures their authoritative DNS server with `TTL = 0`. On the first DNS lookup (your validation check), it returns a safe public IP (`93.184.216.34`). Milliseconds later, when `HttpClient` performs its own internal DNS resolution to open the socket, the attacker's DNS server returns `169.254.169.254` (the Azure/AWS Instance Metadata Service) and steals the worker pod's IAM credentials! Performing DNS resolution and IP validation inside `ConnectCallback`—and passing the exact validated `IPAddress[]` array directly into `socket.ConnectAsync(addresses, ...)`—eliminates the second DNS lookup and makes DNS rebinding impossible.
+
+#### Practice Exercises
+
+1. **Exercise 14.1 — Extending the Flash Sale Coordinator with a Sorted Set Expiration Reaper:**
+   Write the Redis Lua script and C# wrapper method `ReclaimExpiredHoldsAsync(string eventId, long nowUnixSeconds)` that atomically pops up to 100 expired reservations from `{event:99}:active_holds_zset` using `ZRANGEBYSCORE` and increments `{event:99}:available_stock` by the exact count of reclaimed seats.
+2. **Exercise 14.2 — Designing a Customer-Side Webhook Receiver with Idempotency & Replay Defense:**
+   Write an ASP.NET Core Minimal API endpoint (`POST /webhooks/incoming`) that verifies the `X-Webhook-Signature` (`t=...,v1=...`) using constant-time comparison (`CryptographicOperations.FixedTimeEquals`), rejects timestamps older than 300 seconds, and deduplicates `EventId` in Redis.
 
 ---
 

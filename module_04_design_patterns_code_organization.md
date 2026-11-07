@@ -1004,6 +1004,263 @@ A frequent debate in senior interviews: *"Do we need a Generic Repository and Un
 
 ---
 
+### 6.2 Result Pattern, Value Objects & Domain Events with EF Core `SaveChangesInterceptor`
+
+#### Allocation-Free `Result<TValue, TError>` Pattern
+Throwing exceptions for expected domain outcomes (e.g., `DuplicateSku`, `InsufficientCredit`, `CouponExpired`) is an anti-pattern: stack trace capture in .NET costs $\approx 5\text{–}20\,\mu\text{s}$ per throw and treats predictable business rules as non-local `goto` jumps. A `readonly record struct Result<TValue, TError>` lives on the stack with zero heap allocation:
+
+```csharp
+public readonly record struct Error(string Code, string Description)
+{
+    public static readonly Error None = new(string.Empty, string.Empty);
+}
+
+public readonly record struct Result<TValue, TError>
+{
+    private readonly TValue? _value;
+    private readonly TError? _error;
+
+    public bool IsSuccess { get; }
+    public bool IsFailure => !IsSuccess;
+
+    private Result(TValue value)
+    {
+        IsSuccess = true;
+        _value = value;
+        _error = default;
+    }
+
+    private Result(TError error)
+    {
+        IsSuccess = false;
+        _value = default;
+        _error = error;
+    }
+
+    public TValue Value => IsSuccess
+        ? _value!
+        : throw new InvalidOperationException("Cannot access Value on a failed Result.");
+
+    public TError Error => !IsSuccess
+        ? _error!
+        : throw new InvalidOperationException("Cannot access Error on a successful Result.");
+
+    public static Result<TValue, TError> Success(TValue value) => new(value);
+    public static Result<TValue, TError> Failure(TError error) => new(error);
+
+    public static implicit operator Result<TValue, TError>(TValue value) => Success(value);
+    public static implicit operator Result<TValue, TError>(TError error) => Failure(error);
+}
+```
+
+#### Value Objects: Structural Equality & Self-Validation (`Money`)
+A **Value Object** has no conceptual identity (`Id`); it is defined strictly by its structural attributes, is immutable once created, and enforces its domain invariants upon construction:
+
+```csharp
+public readonly record struct Money
+{
+    public decimal Amount { get; }
+    public string Currency { get; }
+
+    public Money(decimal amount, string currency)
+    {
+        if (string.IsNullOrWhiteSpace(currency) || currency.Length != 3)
+            throw new ArgumentException("Currency must be a valid 3-letter ISO-4217 code.", nameof(currency));
+
+        Amount = Math.Round(amount, 2, MidpointRounding.ToEven);
+        Currency = currency.ToUpperInvariant();
+    }
+
+    public static Money operator +(Money left, Money right)
+    {
+        if (left.Currency != right.Currency)
+            throw new InvalidOperationException($"Cannot add {left.Currency} and {right.Currency} without FX conversion.");
+        return new Money(left.Amount + right.Amount, left.Currency);
+    }
+}
+```
+
+#### Domain Events & EF Core `SaveChangesInterceptor`
+Domain aggregates record **Domain Events** (`IDomainEvent`) in an internal list as state transitions occur, remaining 100% ignorant of databases or message buses. An EF Core `SaveChangesInterceptor` harvests and dispatches these events automatically during unit-of-work persistence:
+
+```csharp
+using Microsoft.EntityFrameworkCore;
+using Microsoft.EntityFrameworkCore.Diagnostics;
+
+public interface IDomainEvent
+{
+    Guid EventId { get; }
+    DateTimeOffset OccurredOnUtc { get; }
+}
+
+public abstract class AggregateRoot<TId>(TId id) where TId : notnull
+{
+    private readonly List<IDomainEvent> _domainEvents = [];
+    public TId Id { get; protected init; } = id;
+    public IReadOnlyCollection<IDomainEvent> DomainEvents => _domainEvents.AsReadOnly();
+
+    protected void RaiseDomainEvent(IDomainEvent domainEvent) => _domainEvents.Add(domainEvent);
+    public void ClearDomainEvents() => _domainEvents.Clear();
+}
+
+public sealed class DispatchDomainEventsInterceptor(IDomainEventDispatcher dispatcher) : SaveChangesInterceptor
+{
+    public override async ValueTask<InterceptionResult<int>> SavingChangesAsync(
+        DbContextEventData eventData,
+        InterceptionResult<int> result,
+        CancellationToken ct = default)
+    {
+        if (eventData.Context is not null)
+        {
+            await DispatchEventsAsync(eventData.Context, ct);
+        }
+
+        return await base.SavingChangesAsync(eventData, result, ct);
+    }
+
+    private async Task DispatchEventsAsync(DbContext context, CancellationToken ct)
+    {
+        // Loop handles cascading domain events raised by handlers during dispatch
+        while (true)
+        {
+            var aggregatesWithEvents = context.ChangeTracker
+                .Entries<AggregateRoot<Guid>>()
+                .Where(e => e.Entity.DomainEvents.Count != 0)
+                .Select(e => e.Entity)
+                .ToList();
+
+            if (aggregatesWithEvents.Count == 0) break;
+
+            var events = aggregatesWithEvents.SelectMany(a => a.DomainEvents).ToList();
+            aggregatesWithEvents.ForEach(a => a.ClearDomainEvents());
+
+            foreach (var domainEvent in events)
+            {
+                await dispatcher.PublishAsync(domainEvent, ct);
+            }
+        }
+    }
+}
+```
+
+---
+
+### 6.3 Repository vs Direct `DbContext` Debate & The Specification Pattern (`Expression<Func<T, bool>>`)
+
+When repositories proliferate into methods like `GetActiveOrdersOverAmountWithCustomerByRegionAsync(...)`, query predicates become duplicated across LINQ-to-Entities queries and in-memory domain validations.
+The **Specification Pattern** encapsulates a query predicate (`Expression<Func<T, bool>>`), eager-loading `.Includes`, and sorting rules into a reusable, composable object that EF Core can translate directly into SQL:
+
+```csharp
+using System.Linq.Expressions;
+using Microsoft.EntityFrameworkCore;
+
+public abstract class Specification<TEntity> where TEntity : class
+{
+    public Expression<Func<TEntity, bool>> Criteria { get; private set; } = _ => true;
+    public List<Expression<Func<TEntity, object>>> Includes { get; } = [];
+    public Expression<Func<TEntity, object>>? OrderByDescending { get; private set; }
+    public int? Take { get; private set; }
+    public bool AsNoTracking { get; protected init; } = true;
+
+    protected void AddCriteria(Expression<Func<TEntity, bool>> criteria) =>
+        Criteria = CombineAnd(Criteria, criteria);
+
+    protected void AddInclude(Expression<Func<TEntity, object>> includeExpression) =>
+        Includes.Add(includeExpression);
+
+    protected void ApplyOrderByDescending(Expression<Func<TEntity, object>> orderByDescExpression) =>
+        OrderByDescending = orderByDescExpression;
+
+    protected void ApplyPaging(int take) => Take = take;
+
+    // Expression-tree parameter rebinding so EF Core translates combined predicates into SQL AND
+    private static Expression<Func<TEntity, bool>> CombineAnd(
+        Expression<Func<TEntity, bool>> left,
+        Expression<Func<TEntity, bool>> right)
+    {
+        ParameterExpression param = Expression.Parameter(typeof(TEntity), "x");
+        Expression leftBody = ReplaceParameterVisitor.Replace(left.Body, left.Parameters[0], param);
+        Expression rightBody = ReplaceParameterVisitor.Replace(right.Body, right.Parameters[0], param);
+        return Expression.Lambda<Func<TEntity, bool>>(Expression.AndAlso(leftBody, rightBody), param);
+    }
+
+    private sealed class ReplaceParameterVisitor(ParameterExpression oldParam, ParameterExpression newParam)
+        : ExpressionVisitor
+    {
+        public static Expression Replace(Expression body, ParameterExpression oldParam, ParameterExpression newParam) =>
+            new ReplaceParameterVisitor(oldParam, newParam).Visit(body);
+
+        protected override Expression VisitParameter(ParameterExpression node) =>
+            ReferenceEquals(node, oldParam) ? newParam : base.VisitParameter(node);
+    }
+}
+
+// Concrete Domain Specification: High-Value Overdue Invoices for a Tenant
+public sealed class HighValueOverdueInvoicesSpec : Specification<InvoiceEntity>
+{
+    public HighValueOverdueInvoicesSpec(Guid tenantId, decimal minimumAmount, DateTimeOffset asOfUtc)
+    {
+        AddCriteria(i => i.TenantId == tenantId && !i.IsPaid);
+        AddCriteria(i => i.TotalAmount >= minimumAmount && i.DueDateUtc < asOfUtc);
+        AddInclude(i => i.LineItems);
+        ApplyOrderByDescending(i => i.TotalAmount);
+        ApplyPaging(take: 100);
+    }
+}
+
+// EF Core Specification Evaluator
+public static class SpecificationEvaluator
+{
+    public static IQueryable<TEntity> GetQuery<TEntity>(
+        IQueryable<TEntity> inputQuery,
+        Specification<TEntity> spec) where TEntity : class
+    {
+        IQueryable<TEntity> query = spec.AsNoTracking ? inputQuery.AsNoTracking() : inputQuery;
+        query = query.Where(spec.Criteria);
+        query = spec.Includes.Aggregate(query, (current, include) => current.Include(include));
+
+        if (spec.OrderByDescending is not null)
+            query = query.OrderByDescending(spec.OrderByDescending);
+
+        if (spec.Take is int take)
+            query = query.Take(take);
+
+        return query;
+    }
+}
+```
+
+---
+
+### Section 6 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions & Model Answers
+
+**Q1: Why does `Func<TEntity, bool>` inside a repository `.Where(Func<TEntity, bool>)` cause catastrophic production outages with EF Core, whereas `Expression<Func<TEntity, bool>>` does not?**
+> **Model Answer:**
+> `IQueryable<T>.Where(Expression<Func<T, bool>>)` passes an AST (Abstract Syntax Tree) to EF Core's query provider, which translates the expression tree into a parameterized SQL `WHERE` clause executed by the database engine.
+> Conversely, passing `Func<T, bool>` resolves to `IEnumerable<T>.Where(Func<T, bool>)` (LINQ-to-Objects), because `IQueryable<T>` inherits from `IEnumerable<T>` and a compiled delegate is an opaque IL method pointer that EF Core cannot inspect. EF Core therefore executes `SELECT * FROM Table` with **no `WHERE` clause**, pulls millions of rows over the network into app memory, and filters them in C#!
+
+**Q2: Should Domain Events be dispatched inside `SavingChangesAsync` (before `SaveChanges` commits) or `SavedChangesAsync` (after `SaveChanges` commits)?**
+> **Model Answer:**
+> It depends on whether the handler mutates the **same database transaction** or triggers **external side effects**:
+> - **Before Commit (`SavingChangesAsync`):** Ideal for in-process domain handlers that mutate other entities in the same `DbContext` or write **Transactional Outbox** (`OutboxMessage`) rows so state changes and outbox events commit atomically in a single database transaction.
+> - **After Commit (`SavedChangesAsync`):** Required if a handler performs immediate non-transactional external I/O (sending an email or publishing directly to RabbitMQ without an Outbox), because dispatching before commit risks sending an external message for a database transaction that subsequently fails and rolls back (a phantom event). In enterprise systems, writing an `OutboxMessage` inside `SavingChangesAsync` is the gold standard.
+
+**Q3: Why should a Repository never return `IQueryable<T>` to application or controller layers?**
+> **Model Answer:**
+> Returning `IQueryable<T>` creates a **Leaky Abstraction**:
+> 1. Callers can append arbitrary `.Where()` clauses that reference unindexed columns or non-translatable C# methods, causing runtime `InvalidOperationException` translation failures far away from the data access layer.
+> 2. Deferred execution means the SQL query actually executes outside the repository—potentially after the `DbContext` scope or stopwatch timer in the repository has already completed.
+> 3. Unit testing `IQueryable<T>` over in-memory lists (`AsQueryable()`) gives false confidence because LINQ-to-Objects accepts C# expressions and null semantics that fail in SQL Server/PostgreSQL.
+
+#### Practice Exercises
+
+1. **Composable Specification Builder:** Extend `Specification<TEntity>` in Section 6.3 with an `Or(Specification<TEntity> other)` combinator using `Expression.OrElse` and `ReplaceParameterVisitor`. Write an xUnit test verifying that combining `VipCustomerSpec` OR `HighSpendCustomerSpec` produces a single expression tree with one shared `ParameterExpression`.
+2. **Transactional Outbox Interceptor:** Modify `DispatchDomainEventsInterceptor` so that in addition to invoking in-process handlers, it serializes every `IDomainEvent` to JSON and inserts an `OutboxMessage(Guid Id, string Type, string PayloadJson, DateTimeOffset OccurredOnUtc)` into `context.Set<OutboxMessage>()` within the same `SavingChangesAsync` call.
+
+---
+
 ## Section 7 — In-Process CQRS & MediatR Pipeline Architecture
 
 ### 7.1 Command Query Responsibility Segregation (CQRS)
@@ -1042,6 +1299,39 @@ While MediatR is ubiquitous, senior engineers recognize its drawbacks:
 
 ---
 
+### Section 7 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions & Model Answers
+
+**Q1: How do you design a `ValidationBehavior<TRequest, TResponse>` in MediatR that returns a typed `Result<TValue, Error>` instead of throwing a `ValidationException`?**
+> **Model Answer:**
+> Throwing `ValidationException` for invalid user input violates the Result pattern and forces exception-handling middleware to catch control-flow exceptions. Instead, constrain `TResponse` to implement an `IResult` factory interface (or C# 11 `static abstract` member `TResponse.FromValidationErrors(Error[] errors)`):
+> ```csharp
+> public interface IValidationFailureFactory<out TResponse>
+> {
+>     static abstract TResponse CreateValidationFailure(IReadOnlyList<Error> errors);
+> }
+> ```
+> When `ValidationBehavior<TRequest, TResponse>` detects validation failures and `TResponse : IValidationFailureFactory<TResponse>`, it directly calls `return TResponse.CreateValidationFailure(errors);` without throwing an exception or allocating a stack trace!
+
+**Q2: Explain the difference between In-Process CQRS and Distributed Event-Driven CQRS. When does a team make the mistake of conflating them?**
+> **Model Answer:**
+> - **In-Process CQRS** separates read models (`IQueryHandler` projecting directly from SQL via Dapper/`AsNoTracking`) from write models (`ICommandHandler` loading rich DDD aggregates via EF Core) **over the same relational database** within a single process. It has zero eventual consistency lag and low operational complexity.
+> - **Distributed CQRS** physically separates the Write Store (e.g., PostgreSQL or EventStoreDB) from a denormalized Read Store (e.g., Elasticsearch or Redis) synchronized asynchronously via message brokers.
+> Teams frequently make the mistake of assuming "CQRS requires separate databases, Kafka, and eventual consistency" when 95% of enterprise bottlenecks are solved simply by separating the code paths (In-Process CQRS) so read queries stop hydrating 15-table EF Core entity graphs.
+
+**Q3: Give a 60-second whiteboarding script explaining how In-Process CQRS and Clean Architecture dependency arrows interact.**
+> **Model Answer (The 60-Second Whiteboarding Script):**
+> *"Let me draw four concentric rings—or three vertical boxes pointing inward. At the center is **Domain**: pure C# Aggregates, Value Objects, and Domain Events with zero NuGet packages. Surrounding it is **Application**: our Use Cases, split via CQRS into Commands and Queries, plus Port interfaces like `IPaymentGateway`. Outside sits **Infrastructure** (EF Core, Dapper, Stripe SDK) and **Presentation** (ASP.NET Core Minimal APIs).*
+> *Every source-code project reference arrow points **strictly inward** toward Domain. Presentation references Application; Infrastructure references Application and Domain; Application references only Domain. At runtime, Infrastructure implements Application's Port interfaces via Dependency Inversion, while Query Handlers in Application use fast read-only projections and Command Handlers orchestrate Domain Aggregates."*
+
+#### Practice Exercises
+
+1. **Zero-Exception Validation Pipeline:** Implement `ValidationBehavior<TRequest, TResponse>` using C# 11 `static abstract` interface members (`IValidationResult<TResponse>`) so that any `Result<T, Error[]>` returned from a command handler is automatically populated with validation errors without throwing `ValidationException`.
+2. **Transaction Pipeline Behavior with Execution Strategy:** Write a `TransactionBehavior<TCommand, TResponse>` that only wraps requests implementing `ICommand<TResponse>` (skipping `IQuery<TResponse>`) using `dbContext.Database.CreateExecutionStrategy().ExecuteAsync(...)` and `BeginTransactionAsync()`.
+
+---
+
 ## Section 8 — Clean, Onion & Hexagonal (Ports & Adapters) Architecture
 
 ### 8.1 The Dependency Rule
@@ -1063,6 +1353,65 @@ While MediatR is ubiquitous, senior engineers recognize its drawbacks:
 ```
 **The Inviolable Rule:** Dependencies must point **strictly inward**.
 The Domain Core has **zero dependencies** on external libraries (no EF Core, no ASP.NET Core, no cloud SDKs).
+
+---
+
+### 8.2 Ports & Adapters (Hexagonal) Mechanics & The 60-Second Whiteboarding Script
+
+#### Reconciling Clean, Onion, and Hexagonal (Ports & Adapters)
+Alistar Cockburn's **Hexagonal Architecture (Ports & Adapters)**, Jeffrey Palermo's **Onion Architecture**, and Robert C. Martin's **Clean Architecture** are variations of the exact same foundational principle: **Dependency Inversion at Architectural Boundaries**.
+
+- **Primary / Driving Adapters (Left Side of Hexagon):** Entry points that *drive* the application—ASP.NET Core Controllers, Minimal APIs, gRPC services, Service Bus consumers, CLI runners. They call **Inbound Ports** (Application Use Cases / Command Handlers).
+- **Secondary / Driven Adapters (Right Side of Hexagon):** Infrastructure implementations that are *driven by* the application—PostgreSQL EF Core repositories, Stripe HTTP clients, Redis caches, SMTP senders. They implement **Outbound Ports** (interfaces owned by the Application/Domain core).
+
+```text
+ [Driving Adapters]          [Application Core]           [Driven Adapters]
++------------------+     +------------------------+     +--------------------+
+| Minimal API /    | --> | Inbound Port           |     | SqlOrderRepository |
+| gRPC Endpoint    |     | (PlaceOrderUseCase)    |     | (EF Core / Npgsql) |
++------------------+     |           |            |     +--------------------+
+                         |           v            |               ^
++------------------+     |    [Domain Aggregate]  |               | (Implements)
+| ServiceBus       | --> |           |            |               |
+| Queue Consumer   |     |           v            |     +--------------------+
++------------------+     | Outbound Port          | <-- | StripePayment      |
+                         | (IOrderRepo, IPayment) |     | GatewayAdapter     |
+                         +------------------------+     +--------------------+
+```
+
+#### The 60-Second Whiteboarding Script for Drawing Clean Architecture Dependency Arrows
+When asked in a system design or architecture interview to diagram how a .NET solution is structured:
+1. **Draw the Core First (0–15s):** Draw `MyService.Domain` at the center. State clearly: *"This `.csproj` has zero `<PackageReference>` tags—only pure C# entities, value objects, domain exceptions, and domain events."*
+2. **Draw the Application Ring (15–30s):** Draw `MyService.Application` around `Domain` with a compile-time arrow `Application` $\to$ `Domain`. State: *"Application defines the use cases (commands/queries) and declares outbound Port interfaces (`IPaymentGateway`, `IOrderRepository`)."*
+3. **Draw Infrastructure & Web on the Outside (30–45s):** Draw `MyService.Infrastructure` and `MyService.Api` on the outer ring. Draw compile-time arrows pointing **inward** (`Infrastructure` $\to$ `Application`; `Api` $\to$ `Application`).
+4. **Explain the Runtime vs Compile-Time Inversion (45–60s):** Draw a dashed runtime control-flow arrow from `Application` out to `Infrastructure`, and explain: *"At runtime, `PlaceOrderHandler` invokes `StripePaymentGateway` in Infrastructure, but at compile time `Infrastructure` references `Application` to implement `IPaymentGateway`. That Dependency Inversion keeps our core testable in isolation without spinning up Docker or SQL."*
+
+---
+
+### Section 8 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions & Model Answers
+
+**Q1: If the Domain and Application layers cannot reference `Microsoft.EntityFrameworkCore`, where do you put EF Core `IEntityTypeConfiguration<T>` classes, and how do you map private collection fields on Domain Aggregates?**
+> **Model Answer:**
+> `IEntityTypeConfiguration<Order>` lives strictly inside the **Infrastructure** project (e.g., `Infrastructure/Persistence/Configurations/OrderConfiguration.cs`), which references both `Domain` and `Microsoft.EntityFrameworkCore`.
+> In the `Domain` project, the `Order` aggregate exposes `public IReadOnlyCollection<OrderLine> Lines => _lines.AsReadOnly();` backed by `private readonly List<OrderLine> _lines = [];` along with a `private Order() { }` parameterless constructor for EF materialization. Inside `OrderConfiguration`, EF Core 8+ maps the backing field cleanly via `builder.Navigation(o => o.Lines).UsePropertyAccessMode(PropertyAccessMode.Field);` without requiring a single `[Key]` or `[ForeignKey]` attribute in the `Domain` assembly.
+
+**Q2: Where should the Composition Root (`AddScoped`, `AddDbContext`) live when `Api` should not directly instantiate internal `Infrastructure` classes?**
+> **Model Answer:**
+> Each outer layer exposes a single public `IServiceCollection` extension method—`AddApplicationServices()` in `Application` and `AddInfrastructureServices(IConfiguration)` in `Infrastructure`—while keeping all concrete repository and adapter classes `internal sealed` inside `Infrastructure`.
+> The `Api` project (`Program.cs`) acts as the **Composition Root**, referencing `Infrastructure` solely to invoke `builder.Services.AddInfrastructureServices(builder.Configuration)` at startup. To prevent developers from accidentally referencing `Infrastructure` types inside `Api` endpoints, mark concrete classes in `Infrastructure` as `internal`.
+
+**Q3: When is full 4-project Clean Architecture the WRONG choice for a .NET service?**
+> **Model Answer:**
+> Full 4-project Clean Architecture is overkill when:
+> 1. **CRUD / Data-Driven Microservices:** If 90% of endpoints simply validate a payload and read/write rows to a database with minimal domain invariants, separating Domain, Application, Infrastructure, and Api creates pure pass-through ceremony ("Lasagna Architecture").
+> 2. **Small Single-Bounded-Context Services:** Splitting a 3,000-line service across 4 `.csproj` files slows MSBuild compilation and forces 5-file edits for every column addition. A single-project **Vertical Slice Architecture** is far more productive.
+
+#### Practice Exercises
+
+1. **Pure Domain Persistence Mapping:** Create an `Order` aggregate root in a class library with zero NuGet packages containing a strongly-typed `readonly record struct OrderId(Guid Value)`, a `Money` value object, and a private `List<OrderLine> _lines`. In a separate `Infrastructure` class library, write the complete `IEntityTypeConfiguration<Order>` using EF Core 8 Complex Types (`ComplexProperty`) for `Money` and value converters for `OrderId`.
+2. **Whiteboard Drill:** Practice delivering the 60-Second Clean Architecture Whiteboarding Script aloud while drawing the compile-time vs runtime arrows until you can explain the Dependency Inversion seam clearly in under 60 seconds.
 
 ---
 
@@ -1092,6 +1441,124 @@ Features/
 
 ---
 
+### 9.2 End-to-End Vertical Slice Implementation in C# 12
+
+In Vertical Slice Architecture (popularized by Jimmy Bogard), **high cohesion within a feature slice** supersedes artificial horizontal layer separation. Instead of jumping across 6 projects to trace a single HTTP `POST /api/orders` call, an entire feature can live in a single cohesive file (`Features/Orders/PlaceOrder.cs`) using `static class` scoping:
+
+```csharp
+// File: Features/Orders/PlaceOrder.cs
+using FluentValidation;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Http.HttpResults;
+using Microsoft.AspNetCore.Routing;
+using Microsoft.EntityFrameworkCore;
+
+namespace Ordering.Api.Features.Orders;
+
+public static class PlaceOrder
+{
+    // 1. Request / Command Contract (Scoped to this slice)
+    public sealed record Command(
+        Guid CustomerId,
+        string Currency,
+        IReadOnlyList<OrderLineDto> Lines);
+
+    public sealed record OrderLineDto(string Sku, int Quantity, decimal UnitPrice);
+
+    public sealed record Response(Guid OrderId, decimal TotalAmount, DateTimeOffset CreatedAtUtc);
+
+    // 2. Slice-Specific Input Validator
+    public sealed class Validator : AbstractValidator<Command>
+    {
+        public Validator()
+        {
+            RuleFor(x => x.CustomerId).NotEmpty();
+            RuleFor(x => x.Currency).Length(3);
+            RuleFor(x => x.Lines).NotEmpty();
+            RuleForEach(x => x.Lines).ChildRules(line =>
+            {
+                line.RuleFor(l => l.Sku).NotEmpty().MaximumLength(32);
+                line.RuleFor(l => l.Quantity).GreaterThan(0);
+                line.RuleFor(l => l.UnitPrice).GreaterThan(0m);
+            });
+        }
+    }
+
+    // 3. Minimal API Endpoint Registration
+    public static void MapEndpoint(IEndpointRouteBuilder app)
+    {
+        app.MapPost("/api/orders", HandleAsync)
+           .WithName("PlaceOrder")
+           .WithTags("Orders");
+    }
+
+    // 4. Handler (No MediatR ceremony required — direct DI into Minimal API handler)
+    public static async Task<Results<Created<Response>, ValidationProblem, Conflict<string>>> HandleAsync(
+        Command command,
+        IValidator<Command> validator,
+        OrderingDbContext dbContext,
+        TimeProvider timeProvider,
+        CancellationToken ct)
+    {
+        var validation = await validator.ValidateAsync(command, ct);
+        if (!validation.IsValid)
+        {
+            return TypedResults.ValidationProblem(validation.ToDictionary());
+        }
+
+        bool hasSuspendedAccount = await dbContext.Customers
+            .AsNoTracking()
+            .AnyAsync(c => c.Id == command.CustomerId && c.IsSuspended, ct);
+
+        if (hasSuspendedAccount)
+        {
+            return TypedResults.Conflict("Customer account is suspended and cannot place new orders.");
+        }
+
+        // Delegate invariant enforcement to the rich Domain Aggregate
+        var order = Order.Create(
+            command.CustomerId,
+            command.Currency,
+            command.Lines.Select(l => new OrderLine(l.Sku, l.Quantity, l.UnitPrice)).ToList(),
+            timeProvider.GetUtcNow());
+
+        dbContext.Orders.Add(order);
+        await dbContext.SaveChangesAsync(ct);
+
+        var response = new Response(order.Id, order.TotalAmount, order.CreatedAtUtc);
+        return TypedResults.Created($"/api/orders/{order.Id}", response);
+    }
+}
+```
+
+#### Sizing Slices & The "Duplication vs Coupling" Rule
+- **Never share Request/Response DTOs or Validators across slices.** Even if `CreateOrder` and `UpdateOrderDraft` look 90% identical today, coupling them into a shared `UpsertOrderDto` reintroduces horizontal fragility as soon as their business rules diverge.
+- **Where Shared Logic Belongs:** True domain invariants (e.g., `Order.Create(...)`, `Order.Cancel(...)`, `Money` arithmetic) are pushed down into rich **Domain Aggregates and Value Objects**, not copy-pasted across slice handlers.
+
+---
+
+### Section 9 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions & Model Answers
+
+**Q1: If Vertical Slice Architecture discourages shared service layers between slices, how do you prevent two slices (`PlaceOrder` and `ApplyPromoCode`) from duplicating core business rules?**
+> **Model Answer:**
+> Vertical Slice Architecture eliminates **shared orchestration layers** (`OrderService`, `GenericRepository`), **not** the shared **Domain Model**. When two slices share a genuine domain invariant (such as calculating order totals or enforcing credit limits), you refactor by **pushing behavior down into the Domain Entity, Aggregate Root, or Value Object** (`order.ApplyCoupon(coupon)`).
+> Duplication is preferred *only* for slice-specific DTOs, query projections, and input validators, where coupling two features together for incidental structural similarity causes fragile cross-feature regressions.
+
+**Q2: Why do many senior .NET architects combine Vertical Slice Architecture with Minimal APIs and drop MediatR entirely?**
+> **Model Answer:**
+> Historically, MVC Controllers became bloated `500`-line classes holding 12 endpoints, so teams introduced MediatR to split each controller action into an isolated `IRequestHandler` class.
+> In .NET 8/9 Minimal APIs, each endpoint (`PlaceOrder.HandleAsync`) is already a standalone method in its own feature file with first-class DI parameter binding, `IEndpointFilter` pipelines (replacing `IPipelineBehavior`), and compile-time `TypedResults` OpenAPI generation. Adding MediatR on top of a single-file Minimal API slice just adds an extra `Send()` hop, heap allocation, and broken IDE "Go To Implementation" with zero architectural benefit.
+
+#### Practice Exercises
+
+1. **Read-Slice Optimization:** Implement a `GetOrderSummary.cs` vertical slice alongside `PlaceOrder.cs` that uses an EF Core `.AsNoTracking().Where(...).Select(...)` projection (or Dapper query) to return `Results<Ok<OrderSummaryResponse>, NotFound>` in a single file without touching the `Order` aggregate's write methods.
+2. **Endpoint Filter Pipeline:** Replace `ValidationBehavior<TRequest, TResponse>` with an ASP.NET Core `IEndpointFilter` (`ValidationEndpointFilter<TRequest>`) and attach it to a route group so every vertical slice in the group automatically validates its request payload before entering `HandleAsync`.
+
+---
+
 ## Section 10 — Modular Monolith Architecture & Boundary Enforcement
 
 ### 10.1 Module Encapsulation & Automated Architecture Tests
@@ -1114,6 +1581,125 @@ public void DomainLayer_ShouldNotHaveDependencyOnInfrastructure()
     Assert.True(result.IsSuccessful, "Domain layer must not depend on Infrastructure!");
 }
 ```
+
+---
+
+### 10.2 Enforcing Module Boundaries with `ArchUnitNET` & In-Process Integration Events
+
+#### Physical & Logical Module Isolation
+In a Modular Monolith, each module (`Catalog`, `Ordering`, `Billing`) owns:
+1. **Its own internal implementation assembly** (`Modules.Ordering.Internal.csproj`) where all entities, `DbContext`, and handlers are marked `internal sealed` (exposing internals only to `Modules.Ordering.UnitTests` via `[assembly: InternalsVisibleTo("Modules.Ordering.UnitTests")]`).
+2. **Its own public contract assembly** (`Modules.Ordering.Contracts.csproj`) containing only public Integration Event records (`OrderPlacedIntegrationEvent`) and narrow module facade interfaces (`IOrderingModuleContract`) if synchronous queries are strictly necessary.
+3. **Its own database schema** (`ordering.orders` vs `billing.invoices` in PostgreSQL/SQL Server) with **zero cross-schema foreign keys or SQL `JOIN`s**.
+
+#### Enforcing Module Isolation in CI with `ArchUnitNET`
+Relying on human code reviews to prevent a developer from adding a project reference or namespace import between `Billing` and `Catalog` always fails under deadline pressure. `ArchUnitNET` verifies module isolation on every pull request:
+
+```csharp
+using ArchUnitNET.Domain;
+using ArchUnitNET.Loader;
+using ArchUnitNET.xUnit;
+using Xunit;
+using static ArchUnitNET.Fluent.ArchRuleDefinition;
+
+public sealed class ModularMonolithArchitectureTests
+{
+    private static readonly Architecture SystemArchitecture = new ArchLoader()
+        .LoadAssemblies(
+            typeof(OrderingModuleMarker).Assembly,
+            typeof(BillingModuleMarker).Assembly,
+            typeof(CatalogModuleMarker).Assembly)
+        .Build();
+
+    private readonly IObjectProvider<IType> _orderingInternalTypes =
+        Types().That().ResideInNamespace("Enterprise.Modules.Ordering.*", useRegularExpressions: true)
+               .And().DoNotResideInNamespace("Enterprise.Modules.Ordering.Contracts")
+               .As("Ordering Internal Module");
+
+    private readonly IObjectProvider<IType> _billingModuleTypes =
+        Types().That().ResideInNamespace("Enterprise.Modules.Billing.*", useRegularExpressions: true)
+               .As("Billing Module");
+
+    [Fact]
+    public void BillingModule_MustNotDependOn_OrderingInternalTypes()
+    {
+        // Billing may ONLY reference Enterprise.Modules.Ordering.Contracts
+        IArchRule rule = Types().That().Are(_billingModuleTypes)
+            .Should().NotDependOnAny(_orderingInternalTypes)
+            .Because("Modules in a Modular Monolith must communicate strictly via public Contracts or Integration Events.");
+
+        rule.Check(SystemArchitecture);
+    }
+
+    [Fact]
+    public void DomainEntities_MustBeSealedOrAbstract_AndHavePrivateParameterlessConstructor()
+    {
+        IArchRule rule = Classes().That().AssignTo(typeof(AggregateRoot<>))
+            .And().AreNotAbstract()
+            .Should().BeSealed()
+            .Because("Concrete Aggregate Roots must be sealed to protect invariant encapsulation.");
+
+        rule.Check(SystemArchitecture);
+    }
+}
+```
+
+#### In-Process Integration Event Bus (Eventual Consistency Across Modules)
+When `Ordering` completes an order, it does **not** inject `BillingDbContext`. Instead, `Ordering` persists an `OutboxMessage` in the `ordering` schema, and a background worker publishes `OrderPlacedIntegrationEvent` to an in-process `Channel<T>` (or MassTransit In-Memory/RabbitMQ transport) consumed asynchronously by `Billing`:
+
+```csharp
+// In Modules.Ordering.Contracts:
+public sealed record OrderPlacedIntegrationEvent(
+    Guid EventId,
+    Guid OrderId,
+    Guid CustomerId,
+    decimal TotalAmount,
+    string Currency,
+    DateTimeOffset OccurredAtUtc);
+
+// In Modules.Billing.Internal (Idempotent Consumer):
+internal sealed class OrderPlacedBillingConsumer(BillingDbContext billingDb)
+{
+    public async Task ConsumeAsync(OrderPlacedIntegrationEvent evt, CancellationToken ct)
+    {
+        // Idempotency guard (Inbox pattern)
+        if (await billingDb.ProcessedEvents.AnyAsync(e => e.EventId == evt.EventId, ct))
+            return;
+
+        var invoice = Invoice.CreateForOrder(evt.OrderId, evt.CustomerId, evt.TotalAmount, evt.Currency);
+        billingDb.Invoices.Add(invoice);
+        billingDb.ProcessedEvents.Add(new ProcessedIntegrationEvent(evt.EventId, DateTimeOffset.UtcNow));
+
+        await billingDb.SaveChangesAsync(ct);
+    }
+}
+```
+
+---
+
+### Section 10 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions & Model Answers
+
+**Q1: Why is a Modular Monolith almost always superior to Microservices for a new or mid-sized enterprise product, and what ensures a Modular Monolith doesn't decay into a "Big Ball of Mud"?**
+> **Model Answer:**
+> Microservices introduce massive distributed systems taxes from day one: network serialization latency, distributed tracing complexity, partial failure cascades, multi-repo CI/CD coordination, and distributed saga orchestration. If a team cannot maintain clean module boundaries in a single process, splitting it across network boundaries simply produces a **Distributed Monolith**—the worst of both worlds.
+> A Modular Monolith keeps deployment, debugging, and refactoring single-process while enforcing logical autonomy through three hard guardrails:
+> 1. **Compiler Visibility:** `internal` classes + separate `.Contracts` assemblies.
+> 2. **CI Fitness Functions:** `ArchUnitNET` / `NetArchTest` rules failing the build on unauthorized cross-module dependencies.
+> 3. **Database Schema Isolation:** Separate `DbContext` per module (`ordering.*`, `billing.*`) with distinct connection strings or schema permissions prohibiting cross-module SQL joins.
+
+**Q2: How do you handle a UI screen that needs to display Order details alongside Catalog product thumbnails and Billing invoice statuses in a Modular Monolith where cross-module SQL `JOIN`s are forbidden?**
+> **Model Answer:**
+> There are three architectural patterns, ordered from simplest to most scalable:
+> 1. **API / Gateway Composition (In-Memory Join):** An API composition endpoint queries `Ordering`, `Catalog`, and `Billing` via their read contracts in parallel (`Task.WhenAll` over separate connections) and merges the small page of 20 items in memory by `OrderId` / `Sku`.
+> 2. **Local Read-Model Cache (Event-Carried State Transfer):** The `Ordering` module subscribes to `ProductUpdatedIntegrationEvent` and `InvoicePaidIntegrationEvent` and maintains a local denormalized read table (`ordering.order_summary_view`) within its own schema.
+> 3. **Dedicated Reporting / Read Schema:** For complex analytical grids filtering across modules simultaneously, replicate or project events into a read-only reporting view owned by a dedicated `Reporting` module.
+
+#### Practice Exercises
+
+1. **ArchUnitNET Boundary Suite:** Write an `ArchUnitNET` test that dynamically discovers all top-level module namespaces under `Enterprise.Modules.<ModuleName>` and asserts that no module `A` references any type in `Enterprise.Modules.<ModuleB>.Internal`.
+2. **Schema-Isolated DbContext Migration:** Configure two `DbContext` classes (`OrderingDbContext` using `modelBuilder.HasDefaultSchema("ordering")` and `BillingDbContext` using `modelBuilder.HasDefaultSchema("billing")`) sharing a single PostgreSQL database connection string, each maintaining its own isolated `__EFMigrationsHistory` table inside its respective schema.
 
 ---
 
@@ -1144,6 +1730,115 @@ result.Switch(
 
 ---
 
+### 11.2 Railway-Oriented Programming (Monadic `Bind`, `Map`, `Tap`, `Match` Extensions in C#)
+
+**Railway-Oriented Programming (ROP)** (coined by Scott Wlaschin) treats a business workflow as a two-track railway: a **Success Track** and a **Failure Track**.
+Every step in the pipeline accepts a value on the Success track; if a step fails, the pipeline switches to the Failure track and bypasses all subsequent steps until the terminal `Match()` method translates the outcome into an HTTP response.
+
+```text
+Success Track:  [ValidateInput] ---> [CalculatePricing] ---> [PersistOrder] ---> [201 Created]
+                      |                     |                      |
+Failure Track:        +-------------------->+--------------------->+-----------> [400 / 422 Problem]
+```
+
+#### Complete Async & Sync Monadic Extensions (`Bind`, `Map`, `Tap`, `Match`)
+```csharp
+public static class ResultExtensions
+{
+    // MAP (Functor): Transforms TIn -> TOut when on the Success track
+    public static Result<TOut, TError> Map<TIn, TOut, TError>(
+        this Result<TIn, TError> result,
+        Func<TIn, TOut> mapper) =>
+        result.IsSuccess
+            ? Result<TOut, TError>.Success(mapper(result.Value))
+            : Result<TOut, TError>.Failure(result.Error);
+
+    // BIND (Monad / FlatMap): Chains a fallible operation TIn -> Result<TOut, TError>
+    public static Result<TOut, TError> Bind<TIn, TOut, TError>(
+        this Result<TIn, TError> result,
+        Func<TIn, Result<TOut, TError>> binder) =>
+        result.IsSuccess
+            ? binder(result.Value)
+            : Result<TOut, TError>.Failure(result.Error);
+
+    // ASYNC BIND: Chains an async fallible operation Task<Result<TIn, TError>> -> Task<Result<TOut, TError>>
+    public static async Task<Result<TOut, TError>> BindAsync<TIn, TOut, TError>(
+        this Result<TIn, TError> result,
+        Func<TIn, Task<Result<TOut, TError>>> asyncBinder) =>
+        result.IsSuccess
+            ? await asyncBinder(result.Value)
+            : Result<TOut, TError>.Failure(result.Error);
+
+    // TAP: Executes a side-effect (logging, metrics) on the Success track without altering the value
+    public static async Task<Result<TValue, TError>> TapAsync<TValue, TError>(
+        this Task<Result<TValue, TError>> resultTask,
+        Func<TValue, Task> sideEffect)
+    {
+        var result = await resultTask;
+        if (result.IsSuccess)
+        {
+            await sideEffect(result.Value);
+        }
+        return result;
+    }
+
+    // MATCH: Terminal fold that forces exhaustive handling of both tracks
+    public static async Task<TOut> MatchAsync<TValue, TError, TOut>(
+        this Task<Result<TValue, TError>> resultTask,
+        Func<TValue, TOut> onSuccess,
+        Func<TError, TOut> onFailure)
+    {
+        var result = await resultTask;
+        return result.IsSuccess ? onSuccess(result.Value) : onFailure(result.Error);
+    }
+}
+
+// End-to-End Functional Pipeline (Zero nested if/try blocks):
+public sealed class CheckoutWorkflow(
+    IPricingPolicy pricing,
+    IOrderRepository repository,
+    IAuditLogger audit)
+{
+    public Task<IResult> ExecuteAsync(CheckoutRequest request, CancellationToken ct) =>
+        ValidateRequest(request)
+            .Bind(validReq => pricing.QuoteOrder(validReq))
+            .BindAsync(quotedOrder => repository.SaveOrderAsync(quotedOrder, ct))
+            .TapAsync(savedOrder => audit.LogOrderCreatedAsync(savedOrder.Id, ct))
+            .MatchAsync(
+                onSuccess: order => Results.Created($"/api/orders/{order.Id}", new { order.Id, order.Total.Amount }),
+                onFailure: error => Results.UnprocessableEntity(new { error.Code, error.Description }));
+
+    private static Result<CheckoutRequest, Error> ValidateRequest(CheckoutRequest req) =>
+        req.Items.Count == 0
+            ? new Error("Order.Empty", "An order must contain at least one item.")
+            : req;
+}
+```
+
+---
+
+### Section 11 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions & Model Answers
+
+**Q1: Explain the difference between `Map` and `Bind` in a functional `Result<T, TError>` pipeline.**
+> **Model Answer:**
+> - **`Map` (Functor projection):** Takes a function `Func<TIn, TOut>` that **cannot fail** (returns a plain `TOut` value) and wraps its output back into `Result<TOut, TError>`. If you passed a function returning `Result<TOut, TError>` into `Map`, you would get a nested `Result<Result<TOut, TError>, TError>`.
+> - **`Bind` (Monadic bind / `SelectMany` in LINQ):** Takes a function `Func<TIn, Result<TOut, TError>>` that **can fail**, flattening the result so the pipeline stays a single-level `Result<TOut, TError>`.
+
+**Q2: When does Railway-Oriented Programming become an anti-pattern in C#?**
+> **Model Answer:**
+> ROP becomes an anti-pattern when teams force **every trivial local expression** or **truly exceptional infrastructure failure** into `Bind`/`Map` chains:
+> 1. **Closure Allocations & Debugging Friction:** Deeply nested lambda chains allocate delegate closures on the heap when capturing local variables, and stepping through 12 chained extension methods in a debugger is harder than reading 4 lines of guard-clause early returns.
+> 2. **Swallowing Infrastructure Exceptions:** Unexpected infrastructure crashes (`OutOfMemoryException`, `DbUpdateConcurrencyException`, deadlocks, network socket drops) are **not** business validation errors; catching `Exception` inside `Bind` and turning them into HTTP `400 Bad Request` masks 500-level production outages and prevents transaction rollback middleware from firing.
+
+#### Practice Exercises
+
+1. **LINQ Query Comprehension Syntax for `Result<T, TError>`:** Implement `Select` and `SelectMany` extension methods on `Result<TValue, TError>` so developers can write multi-step railway pipelines using native C# LINQ syntax (`from valid in Validate(req) from quote in Quote(valid) select quote`) without closure nesting.
+2. **Exhaustive Discriminated Union Hierarchy:** Model a `ShippingQuoteResult` in pure C# 12 without external NuGet packages using an `abstract record ShippingQuoteResult` with private constructor and nested `sealed record Quoted(Money Cost, int EstimatedDays)`, `sealed record EmbargoedCountry(string IsoCode)`, and `sealed record HazmatRestricted(string Sku)`.
+
+---
+
 ## Section 12 — Senior Scenarios, Codebase Refactoring & Capstone
 
 ### 12.1 Refactoring an Over-Engineered Enterprise Codebase
@@ -1158,6 +1853,162 @@ You are brought in as a Staff Engineer to review a microservice that processes 2
 1. **Flatten Read Paths:** Remove MediatR and repository layers for queries. Execute read-only queries directly in Minimal API endpoints using EF Core `AsNoTracking()` projections or Dapper.
 2. **Eliminate Generic Repositories:** Expose focused aggregate root repositories only where complex multi-entity domain invariants require encapsulation.
 3. **Migrate to Vertical Slices:** Co-locate feature commands, handlers, and endpoints to reduce cognitive friction and build times.
+
+---
+
+### 12.2 Refactoring Walkthrough: Untangling a 2,500-Line `OrderManager` God Class
+
+A classic senior/staff coding and design interview scenario presents a legacy `OrderManager` "God Class" that mixes validation, discount branching, tax calculation, SQL persistence, credit card charging, caching, and email notifications in a single 2,500-line procedural method.
+
+#### BEFORE: The Legacy `OrderManager` God Class (Anti-Pattern)
+```csharp
+// ANTI-PATTERN: Violates SRP, OCP, DIP; untestable without live SQL, Stripe, and SMTP servers
+public class OrderManager
+{
+    public async Task<Guid> ProcessOrderAsync(OrderDto dto, string customerTier, string paymentProvider)
+    {
+        using var db = new AppDbContext(); // Hidden dependency (new is glue)
+
+        // 1. Inline procedural discount branching (Violates OCP)
+        decimal discount = 0m;
+        if (customerTier == "VIP") discount = dto.Total * 0.20m;
+        else if (customerTier == "Partner") discount = dto.Total * 0.15m;
+        else if (customerTier == "Employee") discount = dto.Total * 0.30m;
+
+        decimal finalAmount = dto.Total - discount;
+
+        // 2. Inline payment gateway branching + hardcoded HTTP calls
+        if (paymentProvider == "Stripe")
+        {
+            using var http = new HttpClient(); // Socket exhaustion bug!
+            var resp = await http.PostAsJsonAsync("https://api.stripe.com/v1/charges", new { finalAmount });
+            resp.EnsureSuccessStatusCode();
+        }
+        else if (paymentProvider == "Adyen")
+        {
+            // 150 lines of Adyen XML/JSON plumbing...
+        }
+
+        // 3. Anemic entity mutation
+        var entity = new OrderEntity
+        {
+            Id = Guid.NewGuid(),
+            CustomerId = dto.CustomerId,
+            TotalAmount = finalAmount,
+            Status = "Paid",
+            CreatedAt = DateTime.Now // Non-deterministic local clock!
+        };
+        db.Orders.Add(entity);
+        await db.SaveChangesAsync();
+
+        // 4. Synchronous side-effects after DB commit (partial failure risk!)
+        using var smtp = new SmtpClient("smtp.corp.local");
+        await smtp.SendMailAsync("noreply@corp.local", dto.CustomerEmail, "Order Confirmed", $"Order {entity.Id}");
+
+        return entity.Id;
+    }
+}
+```
+
+#### AFTER: Decomposed Architecture (Rich Aggregate + Strategy + Keyed Adapter + Domain Events)
+We systematically untangle `OrderManager` along four clean architectural seams:
+1. **Rich Domain Aggregate (`Order`):** Owns invariant enforcement and raises `OrderPaidDomainEvent` (which the `SaveChangesInterceptor` persists to the Transactional Outbox, eliminating synchronous `SmtpClient` calls on the request thread).
+2. **Strategy Pattern (`IDiscountStrategy`):** Extracts tier pricing rules into open/closed strategies.
+3. **Keyed Port & Adapter (`IPaymentGateway`):** Replaces `new HttpClient()` and `if (paymentProvider == ...)` with Keyed Services backed by `IHttpClientFactory` resilience pipelines.
+4. **Decorator (`IdempotentOrderPlacementDecorator`):** Extracts cross-cutting idempotency/telemetry out of the business workflow.
+
+```csharp
+// 1. Rich Domain Aggregate (Encapsulates State & Raises Domain Events)
+public sealed class Order : AggregateRoot<Guid>
+{
+    public Guid CustomerId { get; private init; }
+    public Money Total { get; private set; }
+    public string PaymentReference { get; private set; }
+    public DateTimeOffset PaidAtUtc { get; private init; }
+
+    private Order(Guid id, Guid customerId, Money total, string paymentReference, DateTimeOffset paidAtUtc)
+        : base(id)
+    {
+        CustomerId = customerId;
+        Total = total;
+        PaymentReference = paymentReference;
+        PaidAtUtc = paidAtUtc;
+    }
+
+    public static Order CreatePaid(
+        Guid customerId,
+        Money grossTotal,
+        Money discount,
+        string paymentReference,
+        DateTimeOffset nowUtc)
+    {
+        var netTotal = new Money(Math.Max(0m, grossTotal.Amount - discount.Amount), grossTotal.Currency);
+        var order = new Order(Guid.NewGuid(), customerId, netTotal, paymentReference, nowUtc);
+
+        // Side effects (Email, Analytics, Loyalty points) are decoupled via Domain Event!
+        order.RaiseDomainEvent(new OrderPaidDomainEvent(
+            Guid.NewGuid(), order.Id, customerId, netTotal, nowUtc));
+
+        return order;
+    }
+}
+
+// 2. Clean, Focused Use-Case Handler (< 30 lines, 100% unit-testable)
+public sealed class PlacePaidOrderHandler(
+    DiscountCalculator discountCalculator,
+    Func<string, IPaymentGateway> paymentGatewayFactory,
+    IOrderRepository orderRepository,
+    TimeProvider timeProvider)
+{
+    public async Task<Result<Guid, Error>> HandleAsync(PlaceOrderCommand cmd, CancellationToken ct)
+    {
+        Money discount = discountCalculator.ApplyDiscount(cmd.CustomerTier, cmd.GrossTotal);
+        Money netPayable = new(cmd.GrossTotal.Amount - discount.Amount, cmd.GrossTotal.Currency);
+
+        IPaymentGateway gateway = paymentGatewayFactory(cmd.PaymentProviderKey);
+        Result<string, Error> chargeResult = await gateway.ChargeAsync(cmd.CustomerId, netPayable, ct);
+        if (chargeResult.IsFailure)
+        {
+            return chargeResult.Error;
+        }
+
+        var order = Order.CreatePaid(
+            cmd.CustomerId,
+            cmd.GrossTotal,
+            discount,
+            chargeResult.Value,
+            timeProvider.GetUtcNow());
+
+        await orderRepository.AddAsync(order, ct);
+        return order.Id;
+    }
+}
+```
+
+---
+
+### Section 12 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions & Model Answers
+
+**Q1: When untangling a 2,500-line legacy God class in production that has zero unit tests, how do you refactor it safely without breaking live traffic?**
+> **Model Answer:**
+> Never attempt a "Big Bang" rewrite on untested legacy code. Follow Michael Feathers' *Working Effectively with Legacy Code* and the **Strangler Fig** sequence:
+> 1. **Establish Characterization Tests (Golden Master):** Capture real production request/response payloads and assert the exact outputs and database state mutations using Testcontainers before changing a single line of logic.
+> 2. **Extract Seams without Changing Behavior:** Replace inline `new HttpClient()`, `new AppDbContext()`, and `DateTime.Now` with constructor-injected interfaces (`TimeProvider`, `IPaymentGateway`) defaulted or registered in DI.
+> 3. **Sprout & Strangle:** Extract one cohesive responsibility at a time (first the stateless `IDiscountStrategy`, then the `SmtpClient` side-effect into an Outbox event handler) behind a feature flag or shadow-mode comparison before deleting the legacy branch.
+
+**Q2: In an executive or Architecture Review Board (ARB) meeting, how do you defend choosing a Modular Monolith with Vertical Slices over a 12-microservice Clean Architecture proposal?**
+> **Model Answer:**
+> Frame the argument around **Total Cost of Ownership (TCO), Deployment Velocity, and Change Locality**:
+> - **Change Locality:** With Vertical Slices inside a Modular Monolith, 90% of product features touch a single folder in a single repository and deploy atomically.
+> - **Operational Efficiency:** We avoid running 12 separate Kubernetes deployments, 12 database clusters, and distributed network sagas while our domain boundaries are still evolving.
+> - **Guaranteed Extraction Path:** Because `ArchUnitNET` enforces strict module isolation (`Ordering`, `Billing`, `Catalog`) and each module owns an isolated database schema and communicates via `IntegrationEvents`, any single module that genuinely needs independent horizontal scaling later can be extracted into a standalone microservice in days by swapping the in-process event bus for RabbitMQ/Service Bus.
+
+#### Practice Exercises
+
+1. **God-Class Decomposition Kata:** Take the legacy `OrderManager.ProcessOrderAsync` snippet from Section 12.2 and write 3 unit tests for `PlacePaidOrderHandler` using fake in-memory implementations of `IPaymentGateway`, `IOrderRepository`, and `FakeTimeProvider` (`Microsoft.Extensions.TimeProvider.Testing`), verifying 100% deterministic execution in $< 5\text{ ms}$.
+2. **Capstone Architecture Blueprint:** Design the folder structure, `.csproj` dependency graph, and `ArchUnitNET` test suite for a Multi-Tenant Enterprise Billing Engine containing three modules (`Subscriptions`, `UsageMetering`, `Invoicing`), where `UsageMetering` ingests $5{,}000\text{ events/sec}$ via an `ObjectPool`-backed Vertical Slice and publishes hourly rollup integration events to `Invoicing`.
 
 ---
 

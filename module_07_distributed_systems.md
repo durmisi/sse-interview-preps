@@ -1155,6 +1155,315 @@ When a business transaction spans multiple microservices (e.g. Order $\to$ Payme
 
 ---
 
+### 9.4 Why 2PC Fails at Scale, Outbox Background Publisher & MassTransit State Machine Saga in C#
+
+#### 1. Why Two-Phase Commit (2PC / XA Transactions) Is an Anti-Pattern in Microservices
+Two-Phase Commit attempts to provide atomic ACID transactions across multiple databases via a central **Transaction Coordinator**:
+1. **Phase 1 (Prepare / Vote):** Coordinator asks all participants (`OrderDB`, `PaymentDB`, `InventoryDB`) to prepare the transaction, acquire exclusive row/table locks, flush undo/redo logs to disk, and vote `YES` or `NO`.
+2. **Phase 2 (Commit / Abort):** If all vote `YES`, the Coordinator broadcasts `COMMIT`; if any votes `NO` or times out, it broadcasts `ABORT`.
+
+**Why 2PC Fails in Cloud Microservices:**
+- **Synchronous Blocking Protocol:** Once a participant votes `YES` in Phase 1, it **cannot release its database locks** or unilaterally abort until it hears the Coordinator's Phase 2 decision. If the Coordinator crashes or a network partition occurs after Phase 1, participant databases hold exclusive row locks indefinitely, freezing the entire system!
+- **Multiplicative Availability Degradation ($A_{\text{total}} = A^N$):** If 5 participating services each have $99.9\%$ availability, a synchronous 2PC transaction across all 5 has composite availability $0.999^5 \approx 99.5\%$ (over $43\text{ hours}$ of downtime per year).
+
+#### 2. Production Outbox Background Publisher (`UPDLOCK, READPAST, ROWLOCK`)
+To scale the Transactional Outbox pattern across multiple concurrent worker pods without publishing duplicate batches or blocking competing workers, we query SQL Server using **`WITH (UPDLOCK, READPAST, ROWLOCK)`** (or `FOR UPDATE SKIP LOCKED` in PostgreSQL):
+
+```csharp
+using Azure.Messaging.ServiceBus;
+using Microsoft.EntityFrameworkCore;
+
+public sealed class OutboxPublisherWorker(
+    IServiceScopeFactory scopeFactory,
+    ServiceBusSender serviceBusSender,
+    ILogger<OutboxPublisherWorker> logger) : BackgroundService
+{
+    protected override async Task ExecuteAsync(CancellationToken stoppingToken)
+    {
+        while (!stoppingToken.IsCancellationRequested)
+        {
+            int publishedCount = await PublishBatchAsync(stoppingToken);
+            if (publishedCount == 0)
+            {
+                await Task.Delay(TimeSpan.FromMilliseconds(500), stoppingToken);
+            }
+        }
+    }
+
+    private async Task<int> PublishBatchAsync(CancellationToken ct)
+    {
+        using var scope = scopeFactory.CreateScope();
+        var dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
+
+        await using var transaction = await dbContext.Database.BeginTransactionAsync(ct);
+
+        // UPDLOCK + ROWLOCK locks selected rows; READPAST skips rows locked by other worker pods!
+        var messages = await dbContext.OutboxMessages
+            .FromSqlRaw("""
+                SELECT TOP (50) *
+                FROM OutboxMessages WITH (UPDLOCK, READPAST, ROWLOCK)
+                WHERE ProcessedAtUtc IS NULL
+                ORDER BY CreatedAt ASC
+                """)
+            .ToListAsync(ct);
+
+        if (messages.Count == 0)
+            return 0;
+
+        foreach (var msg in messages)
+        {
+            var sbMessage = new ServiceBusMessage(BinaryData.FromString(msg.Payload))
+            {
+                MessageId = msg.Id.ToString(), // Deterministic ID for Idempotent Consumer / Duplicate Detection!
+                Subject = msg.Type,
+                ContentType = "application/json"
+            };
+
+            await serviceBusSender.SendMessageAsync(sbMessage, ct);
+            msg.ProcessedAtUtc = DateTimeOffset.UtcNow;
+        }
+
+        await dbContext.SaveChangesAsync(ct);
+        await transaction.CommitAsync(ct);
+        logger.LogInformation("Published {Count} outbox messages.", messages.Count);
+        return messages.Count;
+    }
+}
+```
+
+#### 3. Complete MassTransit State Machine Saga with Compensating Transactions
+Below is a production C# **MassTransit State Machine Saga (`MassTransitStateMachine<OrderSagaState>`)** orchestrating `OrderSubmitted` $\to$ `ChargePayment` $\to$ `ReserveInventory`, and executing a **Compensating Transaction (`RefundPayment`)** when inventory reservation fails:
+
+```csharp
+using MassTransit;
+
+// 1. Persisted Saga State Instance (stored in SQL / Postgres / Cosmos DB with Optimistic Concurrency)
+public sealed class OrderSagaState : SagaStateMachineInstance
+{
+    public Guid CorrelationId { get; set; } // Matches OrderId
+    public string CurrentState { get; set; } = default!;
+    public Guid CustomerId { get; set; }
+    public decimal TotalAmount { get; set; }
+    public Guid? PaymentTransactionId { get; set; }
+    public byte[] RowVersion { get; set; } = default!; // Optimistic concurrency token
+}
+
+// 2. Saga Events & Commands
+public record OrderSubmitted(Guid OrderId, Guid CustomerId, decimal TotalAmount);
+public record ChargePaymentCommand(Guid OrderId, Guid CustomerId, decimal Amount);
+public record PaymentSucceeded(Guid OrderId, Guid PaymentTransactionId);
+public record PaymentFailed(Guid OrderId, string Reason);
+public record ReserveInventoryCommand(Guid OrderId);
+public record InventoryReserved(Guid OrderId);
+public record InventoryReservationFailed(Guid OrderId, string Reason);
+public record RefundPaymentCommand(Guid OrderId, Guid PaymentTransactionId, decimal Amount);
+public record PaymentRefunded(Guid OrderId);
+
+// 3. State Machine Orchestrator Definition
+public sealed class OrderFulfillmentStateMachine : MassTransitStateMachine<OrderSagaState>
+{
+    public State AwaitingPayment { get; private set; } = default!;
+    public State AwaitingInventory { get; private set; } = default!;
+    public State CompensatingPayment { get; private set; } = default!;
+    public State Completed { get; private set; } = default!;
+    public State Faulted { get; private set; } = default!;
+
+    public Event<OrderSubmitted> OrderSubmittedEvent { get; private set; } = default!;
+    public Event<PaymentSucceeded> PaymentSucceededEvent { get; private set; } = default!;
+    public Event<PaymentFailed> PaymentFailedEvent { get; private set; } = default!;
+    public Event<InventoryReserved> InventoryReservedEvent { get; private set; } = default!;
+    public Event<InventoryReservationFailed> InventoryFailedEvent { get; private set; } = default!;
+    public Event<PaymentRefunded> PaymentRefundedEvent { get; private set; } = default!;
+
+    public OrderFulfillmentStateMachine()
+    {
+        InstanceState(x => x.CurrentState);
+
+        Event(() => OrderSubmittedEvent, x => x.CorrelateById(ctx => ctx.Message.OrderId));
+        Event(() => PaymentSucceededEvent, x => x.CorrelateById(ctx => ctx.Message.OrderId));
+        Event(() => PaymentFailedEvent, x => x.CorrelateById(ctx => ctx.Message.OrderId));
+        Event(() => InventoryReservedEvent, x => x.CorrelateById(ctx => ctx.Message.OrderId));
+        Event(() => InventoryFailedEvent, x => x.CorrelateById(ctx => ctx.Message.OrderId));
+        Event(() => PaymentRefundedEvent, x => x.CorrelateById(ctx => ctx.Message.OrderId));
+
+        Initially(
+            When(OrderSubmittedEvent)
+                .Then(ctx =>
+                {
+                    ctx.Saga.CustomerId = ctx.Message.CustomerId;
+                    ctx.Saga.TotalAmount = ctx.Message.TotalAmount;
+                })
+                .Publish(ctx => new ChargePaymentCommand(
+                    ctx.Saga.CorrelationId, ctx.Saga.CustomerId, ctx.Saga.TotalAmount))
+                .TransitionTo(AwaitingPayment));
+
+        During(AwaitingPayment,
+            When(PaymentSucceededEvent)
+                .Then(ctx => ctx.Saga.PaymentTransactionId = ctx.Message.PaymentTransactionId)
+                .Publish(ctx => new ReserveInventoryCommand(ctx.Saga.CorrelationId))
+                .TransitionTo(AwaitingInventory),
+            When(PaymentFailedEvent)
+                .TransitionTo(Faulted)
+                .Finalize());
+
+        During(AwaitingInventory,
+            When(InventoryReservedEvent)
+                .TransitionTo(Completed)
+                .Finalize(),
+            When(InventoryFailedEvent)
+                // COMPENSATING TRANSACTION: Undo the committed payment via semantic refund!
+                .Publish(ctx => new RefundPaymentCommand(
+                    ctx.Saga.CorrelationId,
+                    ctx.Saga.PaymentTransactionId!.Value,
+                    ctx.Saga.TotalAmount))
+                .TransitionTo(CompensatingPayment));
+
+        During(CompensatingPayment,
+            When(PaymentRefundedEvent)
+                .TransitionTo(Faulted)
+                .Finalize());
+
+        SetCompletedWhenFinalized();
+    }
+}
+```
+
+---
+
+### Section 9 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions
+1. **Q: Does the Transactional Outbox pattern guarantee "Exactly-Once" message publishing to Azure Service Bus?**
+   - **Model Answer:** No—it guarantees **At-Least-Once** publishing. If the `OutboxPublisherWorker` successfully sends the message to Azure Service Bus on line 43, and the pod crashes or loses SQL connectivity *before* committing `msg.ProcessedAtUtc = DateTimeOffset.UtcNow` on line 47, the next polling cycle will select that same outbox row and publish it a second time. That is why the Outbox pattern must always be paired with either **Service Bus Duplicate Detection** (matching on the deterministic `OutboxMessage.Id` assigned to `ServiceBusMessage.MessageId`) or an **Idempotent Consumer (Inbox table)** on the receiving side.
+2. **Q: Since Sagas lack the `Isolation` property of ACID (making them `ACD`), what is a "Dirty Read / Lack of Isolation" anomaly in a Saga, and how do you mitigate it?**
+   - **Model Answer:** In a Saga, each local step commits immediately to its local database before the overall Saga finishes. If Saga A adds `\$500` credit to a user's account in Step 1 and later compensates (`-\$500`) in Step 3, another concurrent workflow (Saga B) might read that temporary `\$500` balance between Step 1 and Step 3 and allow a withdrawal! We mitigate lack of isolation using **Semantic Locks** (marking the record as `Status = PendingApproval` or moving funds into a `ReservedBalance` escrow column during the forward phase, and only moving to `AvailableBalance` upon the Saga's final pivot/completion step).
+
+#### Practice Exercises
+1. **Choreography vs Orchestration Refactoring:** Draw the communication topology of a 6-step international loan approval workflow using Choreography vs Orchestration. Identify how cyclic event dependencies ("Event Pinball") can arise in Choreography and how the State Machine prevents them.
+2. **Outbox vs CDC (Debezium):** Compare polling the `OutboxMessages` table via `READPAST` vs tailing the database transaction log (SQL Server CDC / PostgreSQL WAL) via Debezium + Kafka Connect. List two operational pros and cons of each.
+
+---
+
+## Section 10 — Event-Driven Architecture, Event Sourcing & Projections
+
+### 10.1 Event Sourcing Mechanics: Event Streams, Aggregate Reconstruction & Snapshots in C#
+
+In traditional CRUD systems, we overwrite the current state in place (`UPDATE Accounts SET Balance = 450`), destroying the history of *how* and *why* the state was reached unless a separate audit log is maintained.
+**Event Sourcing** persists the state of a domain aggregate as an **append-only, immutable sequence of Domain Events**:
+
+$$\text{CurrentState}(T) = \text{Fold}\!\left(\text{InitialState}, \left[e_1, e_2, \dots, e_n\right]\right)$$
+
+```csharp
+public abstract record BankAccountEvent(Guid AccountId, int Version, DateTimeOffset OccurredAtUtc);
+public sealed record AccountOpened(Guid AccountId, string Currency, DateTimeOffset OccurredAtUtc)
+    : BankAccountEvent(AccountId, 1, OccurredAtUtc);
+public sealed record FundsDeposited(Guid AccountId, int Version, decimal Amount, DateTimeOffset OccurredAtUtc)
+    : BankAccountEvent(AccountId, Version, OccurredAtUtc);
+public sealed record FundsWithdrawn(Guid AccountId, int Version, decimal Amount, DateTimeOffset OccurredAtUtc)
+    : BankAccountEvent(AccountId, Version, OccurredAtUtc);
+
+public sealed class BankAccountAggregate
+{
+    private readonly List<BankAccountEvent> _uncommittedEvents = [];
+
+    public Guid Id { get; private set; }
+    public decimal Balance { get; private set; }
+    public int Version { get; private set; }
+
+    public IReadOnlyList<BankAccountEvent> UncommittedEvents => _uncommittedEvents;
+
+    // Reconstruct aggregate state by replaying historical event stream
+    public static BankAccountAggregate Replay(IEnumerable<BankAccountEvent> history)
+    {
+        var account = new BankAccountAggregate();
+        foreach (var @event in history)
+        {
+            account.Apply(@event);
+        }
+        return account;
+    }
+
+    public void Withdraw(decimal amount, DateTimeOffset now)
+    {
+        if (amount <= 0) throw new ArgumentOutOfRangeException(nameof(amount));
+        if (Balance < amount) throw new InvalidOperationException("Insufficient funds.");
+
+        RaiseEvent(new FundsWithdrawn(Id, Version + 1, amount, now));
+    }
+
+    private void RaiseEvent(BankAccountEvent @event)
+    {
+        Apply(@event);
+        _uncommittedEvents.Add(@event);
+    }
+
+    // Pure deterministic state mutation (NEVER throws or calls external I/O!)
+    private void Apply(BankAccountEvent @event)
+    {
+        switch (@event)
+        {
+            case AccountOpened opened:
+                Id = opened.AccountId;
+                Balance = 0m;
+                break;
+            case FundsDeposited deposited:
+                Balance += deposited.Amount;
+                break;
+            case FundsWithdrawn withdrawn:
+                Balance -= withdrawn.Amount;
+                break;
+        }
+        Version = @event.Version;
+    }
+}
+```
+
+#### Optimistic Concurrency & Snapshots
+1. **Optimistic Concurrency on Append:** The `Events` table has a unique constraint on `(StreamId, Version)`. When appending `Version = 14`, if another thread concurrently appended `Version = 14`, the database rejects the insert, preventing lost updates without distributed locks!
+2. **Snapshots:** If a high-frequency aggregate accumulates $50,000$ events, replaying from `Version = 1` on every command is too slow. We periodically store a **Snapshot** at version $V_s$ (e.g., every $500$ events). Reconstruction loads the latest snapshot at $V_s$ and only replays events where $\text{Version} > V_s$.
+
+---
+
+### 10.2 CQRS Projections & Handling Eventual Consistency in User Interfaces
+
+Because you cannot efficiently run SQL `JOIN` or `WHERE Balance > 1000` queries across raw JSON event streams, Event Sourcing is almost always paired with **CQRS (Command Query Responsibility Segregation)**:
+- **Write Side:** Appends events to the Event Store (`Marten` / `EventStoreDB` / Cosmos DB Change Feed).
+- **Read Side (Projections):** Asynchronous background workers subscribe to the event stream and materialize denormalized Read Models optimized for specific UI screens (e.g., SQL tables, Redis hashes, Elasticsearch indices).
+
+#### Solving the "Eventual Consistency UX Gap"
+If a user submits a command (`POST /orders`) and the UI immediately redirects to `GET /orders` (which queries an asynchronous CQRS projection that lags by $250\text{ ms}$), the user won't see the order they just created!
+**Three Production Solutions:**
+1. **Command Returns Projection Version (`ExpectedVersion`):** The write command returns `StreamVersion = 42` to the browser. When the browser queries the Read API (`GET /orders?minVersion=42`), if the read projection is still at `Version = 41`, the API either waits briefly ($50\text{–}200\text{ ms}$) for the projection to catch up or reads from the write store.
+2. **Optimistic UI / Client-Side Cache Update:** The command returns the newly created resource DTO (or ID), and the SPA (React/Blazor) immediately injects it into local client state while the projection catches up in the background.
+3. **Inline (Synchronous) Projections:** Using libraries like **Marten (PostgreSQL)**, critical user-facing projections can be updated inside the *exact same database transaction* as the appended event, providing immediate Read-Your-Writes consistency!
+
+---
+
+### 10.3 Event Schema Evolution & Upcasting
+
+Events in an Event Store are **immutable**, yet business requirements evolve constantly (e.g., `OrderCreated_V1` had a single `string Address`, while `OrderCreated_V2` splits it into `Street`, `City`, `PostalCode`).
+- **Rule 1 (Additive Weak Schema):** Prefer nullable/defaulted properties so a single C# record can deserialize both old and new JSON payloads.
+- **Rule 2 (Event Upcasters):** When a structural breaking change occurs, register an **Upcaster** pipeline during deserialization that transforms raw `OrderCreated_V1` JSON (`JsonNode`) into `OrderCreated_V2` in memory on the fly, so domain aggregate code only ever deals with the latest event version!
+
+---
+
+### Section 10 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions
+1. **Q: Why must an Event Sourced Aggregate's `Apply(Event)` method never throw business validation exceptions or call external services?**
+   - **Model Answer:** The `Apply(Event)` method is executed not only when raising new events, but also when **replaying historical events** from the Event Store to reconstruct the aggregate's current state. Because an event in the Event Store represents an immutable historical fact that *already happened*, throwing a validation exception inside `Apply` (for instance, if a business rule changed two years later) would crash aggregate loading and brick the entire stream! All validation and external checks must happen in the **Command Handler / Public Command Method** *before* `RaiseEvent` is called.
+2. **Q: How do you comply with GDPR "Right to be Forgotten" (erasing a user's PII) in an immutable Event Sourced system where events can never be modified or deleted?**
+   - **Model Answer:** We use **Crypto-Shredding**:
+     1. Never store raw PII (names, emails, SSNs) in plain text inside immutable events.
+     2. Encrypt PII fields inside the event payload using a **per-user symmetric encryption key** (`UserKeyId`) stored in a separate mutable key-management table / Vault.
+     3. When a user exercises their GDPR Right to be Forgotten, simply **delete their encryption key** from the key store. All historical events remain intact for financial auditing and stream replay, while the PII inside them becomes permanently undecipherable ciphertext.
+
+#### Practice Exercises
+1. **Event Upcaster Implementation:** Write a C# `IEventUpcaster` using `System.Text.Json.Nodes.JsonObject` that upgrades an old `"CustomerRegistered_v1"` JSON payload containing `"fullName": "Ada Lovelace"` into a `"CustomerRegistered_v2"` payload containing `"firstName": "Ada"` and `"lastName": "Lovelace"`.
+2. **Idempotent Projection Rebuild:** Design a blue-green projection rebuild pipeline that replays $10\text{ million}$ events into a new shadow table `OrderSummary_v2` without causing downtime on the live `OrderSummary_v1` table, then swaps them atomically.
+
+---
+
 ## Section 13 — Senior Scenarios, Distributed Incidents & Capstone
 
 ### 13.1 Capstone Scenario: E-Commerce Fulfillment Saga Architecture
