@@ -19,26 +19,6 @@ Every section in Part II provides comprehensive senior-level instruction:
 6. **Interview Questions with Model Answers:** Real interview questions with structured, senior-level responses.
 7. **Practical Exercises:** Test harness design, contract verification, and mutation test suite repairs.
 
-## Progress tracker
-
-| Section | Topic | Status |
-|---|---|---|
-| Section 1 | Testing Philosophy, Taxonomy & Strategy Shapes | Complete |
-| Section 2 | Unit Testing Foundations & Modern .NET Tooling | Complete |
-| Section 3 | Test Doubles: Mocks, Stubs, Fakes, Spies & Dummies | Complete |
-| Section 4 | Testability, Seams & Clean Architecture Testing | Complete |
-| Section 5 | Integration Testing with WebApplicationFactory & Testcontainers | Complete |
-| Section 6 | Consumer-Driven Contract Testing (Pact & Schemas) | Complete |
-| Section 7 | End-to-End (E2E) & UI Automation Testing (Playwright) | Complete |
-| Section 8 | Test-Driven Development (TDD), BDD & ATDD | Complete |
-| Section 9 | Advanced Testing: Mutation (Stryker) & Property-Based | Complete |
-| Section 10 | Non-Functional Testing: Performance, Load & Security | Complete |
-| Section 11 | Test Reliability, Flakiness & Suite Speed Optimization | Complete |
-| Section 12 | Quality Engineering Strategy & Shift-Left Culture | Complete |
-| Section 13 | Senior Scenarios, Strategy Design & Capstone | Complete |
-
-**Current position:** Full curriculum complete. Ready for self-study, exercises, and interview drills.
-
 ## Module boundaries
 
 - **This module owns:** Testing taxonomy, unit/integration/contract/E2E test architecture, test doubles, Testcontainers, WebApplicationFactory, mutation testing, property testing, and test suite reliability.

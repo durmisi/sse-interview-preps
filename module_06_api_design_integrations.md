@@ -19,26 +19,6 @@ Every section in Part II provides comprehensive senior-level instruction:
 6. **Interview Questions with Model Answers:** Real interview questions with structured, senior-level responses.
 7. **Practical Exercises:** Security audits, contract design drills, and webhook verification implementations.
 
-## Progress tracker
-
-| Section | Topic | Status |
-|---|---|---|
-| Section 1 | HTTP Protocol Semantics & RFC 9110 Mastery | Complete |
-| Section 2 | RESTful Resource Modeling & Richardson Maturity Model | Complete |
-| Section 3 | Standardized Error Handling & Problem Details (RFC 9457) | Complete |
-| Section 4 | API Contracts, OpenAPI & Versioning Strategies | Complete |
-| Section 5 | High-Performance ASP.NET Core Minimal APIs Engineering | Complete |
-| Section 6 | Alternative API Styles: gRPC, GraphQL & Real-Time | Complete |
-| Section 7 | Identity, Authentication & OAuth 2.0 / OIDC Architecture | Complete |
-| Section 8 | API Security & OWASP API Security Top 10 (2023) | Complete |
-| Section 9 | Idempotency at the API Boundary & Request Deduplication | Complete |
-| Section 10 | Webhooks Architecture & Cryptographic Signature Verification | Complete |
-| Section 11 | Resilient Third-Party Integrations & `IHttpClientFactory` | Complete |
-| Section 12 | Observability, Distributed Tracing & W3C Trace Context | Complete |
-| Section 13 | Senior Scenarios, API Governance & Capstone | Complete |
-
-**Current position:** Full curriculum complete. Ready for self-study, exercises, and interview drills.
-
 ## Module boundaries
 
 - **This module owns:** HTTP protocol semantics, REST resource modeling, Minimal APIs, OAuth 2.0, OIDC, JWTs, OWASP API security, idempotency keys, webhooks, Polly HTTP resilience, and W3C distributed trace propagation.
@@ -511,6 +491,161 @@ public sealed class GlobalDomainExceptionHandler(
 
 ---
 
+## Section 4 — API Contracts, OpenAPI & Versioning Strategies
+
+### 4.1 Contract-First vs Code-First & OpenAPI 3.1 in .NET 9
+
+1. **Contract-First vs Code-First:**
+   - **Contract-First:** Teams co-author the `openapi.yaml` or `.proto` specification first, review it in PRs (`oasdiff`), and generate server stubs and client SDKs in parallel. Eliminates integration bottlenecks between frontend/mobile and backend teams.
+   - **Code-First (.NET 9 `Microsoft.AspNetCore.OpenApi`):** Generates OpenAPI 3.1 specifications directly from Minimal API `TypedResults` and XML comments at build or runtime with native support for `IOpenApiDocumentTransformer` and `IOpenApiOperationTransformer`.
+2. **Breaking vs Non-Breaking Schema Evolution Rules:**
+   - **Non-Breaking (Additive):** Adding an optional request field with a sensible default; adding a new field to a response payload (assuming clients obey Postel's Law and ignore unknown fields: `JsonUnmappedMemberHandling.Skip`); adding a new endpoint.
+   - **Breaking (Requires New Major Version):** Removing or renaming a response property; changing a property type (`int` $\to$ `string` or `object`); adding a **required** request field or tightening validation constraints; changing HTTP status code semantics.
+
+### 4.2 API Versioning Strategies & Sunset Lifecycle (RFC 8594)
+
+| Versioning Strategy | Example | Pros | Cons |
+|---|---|---|---|
+| **URI Path Versioning** | `GET /api/v2/orders/42` | Explicit, easy to cache at CDN/API Gateway, trivial for developers to curl/test. | Violates strict HATEOAS resource identity (same entity has two URIs). |
+| **HTTP Header Versioning** | `api-version: 2025-05-01` | Keeps URIs clean and stable across versions. | Harder to test in browsers; requires `Vary: api-version` header for CDN caching. |
+| **Media Type (Content Negotiation)** | `Accept: application/vnd.acme.order.v2+json` | Version is scoped per representation rather than the entire API surface. | High cognitive friction for external third-party integrators. |
+
+```csharp
+// Emitting RFC 8594 Sunset & Deprecation Headers via an Endpoint Filter
+public sealed class ApiDeprecationHeaderFilter(DateTimeOffset deprecationDate, DateTimeOffset sunsetDate, string migrationDocUrl)
+    : IEndpointFilter
+{
+    public async ValueTask<object?> InvokeAsync(EndpointFilterInvocationContext context, EndpointFilterDelegate next)
+    {
+        var headers = context.HttpContext.Response.Headers;
+        headers["Deprecation"] = $"@{deprecationDate.ToUnixTimeSeconds()}";
+        headers["Sunset"] = sunsetDate.ToString("R"); // IMF-fixdate (RFC 1123)
+        headers["Link"] = $"<{migrationDocUrl}>; rel=\"sunset\"";
+
+        return await next(context);
+    }
+}
+```
+
+### Section 4 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions
+1. **Q: Why is adding a new `enum` value to a response DTO often a hidden breaking change for strongly-typed C# or TypeScript clients, and how do you prevent it?**
+   - **Model Answer:** When `System.Text.Json`'s `JsonStringEnumConverter` (or NSwag/Kiota generated clients) encounters an unknown enum string sent by a newer server, it throws a `JsonException` during deserialization, crashing the client! Prevent this by configuring unknown-enum fallback defaults (`[JsonConverter]` mapping unrecognized values to `OrderStatus.Unknown = 0`) or representing extensible status codes as strings in client SDKs.
+2. **Q: How do you safely retire `/api/v1/orders` in a B2B platform with 400 external enterprise customers?**
+   - **Model Answer:** Follow a 4-stage deprecation lifecycle: (1) Emit `Deprecation`, `Sunset`, and `Link` headers on all `v1` responses 6 months prior to retirement; (2) Instrument per-tenant `api-version` telemetry (`client.id` + `version`) to identify active `v1` callers and notify their engineering contacts; (3) Schedule controlled **Brownouts** (returning `HTTP 410 Gone` for 5 minutes every Tuesday) 2 weeks before the Sunset date so silent callers notice and switch; (4) Return `410 Gone` permanently with a `ProblemDetails` link to the `v2` migration guide.
+
+#### Practice Exercise
+- **Automated Breaking-Change CI Gate:** Configure a GitHub Actions workflow using `oasdiff breaking base-openapi.json pr-openapi.json` that fails the PR build whenever a developer introduces a breaking OpenAPI contract change without bumping `/v2/`.
+
+---
+
+## Section 5 — ASP.NET Core Minimal APIs vs Controllers & Request Pipeline
+
+### 5.1 Architectural Trade-Offs: Minimal APIs vs Controllers
+
+In .NET 8 and .NET 9, **Minimal APIs** are the high-performance default for microservices and Native AOT workloads:
+- **Zero-Reflection RequestDelegate Generation (RDG):** At compile time, the Roslyn source generator emits direct C# parameter binding and serialization code without MVC's `ControllerActionInvoker`, model-state dictionary allocations, or filter pipeline overhead.
+- **Compile-Time OpenAPI Safety with `TypedResults`:** Returning `Task<Results<Created<OrderDto>, ValidationProblem, Conflict<ProblemDetails>>>` automatically registers all possible HTTP status codes and response schemas in OpenAPI without `[ProducesResponseType]` attribute drift!
+
+### 5.2 Endpoint Filters (`IEndpointFilter`) & Source-Generated JSON (`JsonSerializerContext`)
+
+```csharp
+// 1. Native AOT & High-Throughput Source-Generated JSON Context (Zero Reflection!)
+[JsonSerializable(typeof(CreateOrderRequest))]
+[JsonSerializable(typeof(OrderResponseDto))]
+[JsonSerializable(typeof(ProblemDetails))]
+[JsonSourceGenerationOptions(PropertyNamingPolicy = JsonKnownNamingPolicy.CamelCase)]
+internal partial class OrderApiJsonContext : JsonSerializerContext;
+
+// 2. Reusable Generic Validation Endpoint Filter
+public sealed class ValidationFilter<TRequest>(IValidator<TRequest> validator) : IEndpointFilter
+    where TRequest : class
+{
+    public async ValueTask<object?> InvokeAsync(EndpointFilterInvocationContext context, EndpointFilterDelegate next)
+    {
+        if (context.Arguments.OfType<TRequest>().FirstOrDefault() is not { } request)
+            return TypedResults.BadRequest();
+
+        var validation = await validator.ValidateAsync(request, context.HttpContext.RequestAborted);
+        if (!validation.IsValid)
+        {
+            return TypedResults.ValidationProblem(validation.ToDictionary());
+        }
+
+        return await next(context);
+    }
+}
+```
+
+### Section 5 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions
+1. **Q: Why should Minimal API handlers return `TypedResults.Ok(dto)` instead of `Results.Ok(dto)`?**
+   - **Model Answer:** `Results.Ok(dto)` returns the untyped `IResult` interface, erasing the compile-time return type so unit tests have to cast the result and OpenAPI generators cannot infer the response schema without manual `.Produces<T>()` metadata. `TypedResults.Ok(dto)` returns the concrete struct/class `Ok<T>` implementing `IEndpointMetadataProvider`, enabling both compile-time OpenAPI schema inference and direct strongly-typed unit test assertions (`Assert.IsType<Ok<OrderDto>>(result.Result)`).
+2. **Q: How does `JsonSerializerContext` source generation improve cold-start time and memory usage in containerized .NET APIs?**
+   - **Model Answer:** Reflection-based `JsonSerializer` must inspect type metadata via `System.Reflection` and dynamically emit IL on the first serialization of each type (warming up slowly and failing under Native AOT trimming). Source generation (`[JsonSerializable]`) generates explicit UTF-8 `Utf8JsonWriter` / `Utf8JsonReader` C# code at compile time, cutting startup warmup to zero and enabling full Native AOT compilation.
+
+#### Practice Exercise
+- **Minimal API Vertical Slice Group:** Group all `/api/v1/orders` endpoints using `app.MapGroup("/api/v1/orders").RequireAuthorization().AddEndpointFilter<AuditLoggingFilter>()` and verify in an integration test that every endpoint in the group inherits both auth and auditing automatically.
+
+---
+
+## Section 6 — Modern API Paradigms: gRPC, GraphQL & Real-Time Protocols
+
+### 6.1 High-Performance gRPC & Protocol Buffers in .NET
+
+For internal service-to-service East-West traffic, **gRPC over HTTP/2** outperforms JSON-over-REST by $3\text{--}8\times$ in serialization CPU and payload size:
+- **Wire Format Mechanics:** Protobuf encodes fields using compact **Tag-Length-Value (TLV)** binary tags (field number `1`, `2`, `3` rather than repeating ASCII field names `"customerAccountNumber"`) and **Varint** integer compression.
+- **4 Streaming Modes:** Unary (`Req -> Res`), Server Streaming (`Req -> Stream<Res>`), Client Streaming (`Stream<Req> -> Res`), and Bidirectional Streaming (`Stream<Req> <-> Stream<Res>`).
+- **Mandatory Production Rule — Always Set a gRPC Deadline:** Every outbound gRPC call must specify `deadline: DateTime.UtcNow.AddSeconds(2)`. gRPC automatically propagates the remaining deadline budget across downstream hops via the `grpc-timeout` HTTP/2 header, canceling work across the entire microservice tree if the budget expires!
+
+### 6.2 GraphQL (HotChocolate) & Solving the $N+1$ Problem with `DataLoader`
+
+In GraphQL, a client can request nested graphs (`orders { id customer { name } }`). If a query returns 50 orders and the `customer` field resolver executes `SELECT * FROM Customers WHERE Id = @id` per order, it triggers **51 SQL queries ($N+1$ problem)**!
+**`BatchDataLoader<TKey, TValue>`** coalesces all 50 keys requested within a single execution tick into a **single batched SQL query (`WHERE Id IN (...)`)**:
+
+```csharp
+public sealed class CustomerByIdDataLoader(
+    IDbContextFactory<AppDbContext> dbFactory,
+    IBatchScheduler batchScheduler,
+    DataLoaderOptions options)
+    : BatchDataLoader<Guid, CustomerDto>(batchScheduler, options)
+{
+    protected override async Task<IReadOnlyDictionary<Guid, CustomerDto>> LoadBatchAsync(
+        IReadOnlyList<Guid> keys, CancellationToken ct)
+    {
+        await using var db = await dbFactory.CreateDbContextAsync(ct);
+        return await db.Customers
+            .AsNoTracking()
+            .Where(c => keys.Contains(c.Id))
+            .Select(c => new CustomerDto(c.Id, c.Name, c.Tier))
+            .ToDictionaryAsync(c => c.Id, ct);
+    }
+}
+```
+
+### 6.3 Real-Time APIs: WebSockets vs Server-Sent Events (SSE) vs SignalR
+
+| Protocol | Directionality | Transport & Framing | Ideal Enterprise Use Case |
+|---|---|---|---|
+| **Server-Sent Events (SSE)** | **Unidirectional** (Server $\to$ Client) | Standard HTTP (`text/event-stream`); native browser `EventSource` auto-reconnects with `Last-Event-ID`. | **LLM token streaming**, live stock tickers, build log tailing, order status notifications. |
+| **WebSockets** | **Full-Duplex Bidirectional** | Upgraded TCP connection (`101 Switching Protocols`); low-overhead binary/text frames. | Multiplayer gaming, collaborative whiteboarding, high-frequency trading order books. |
+| **ASP.NET Core SignalR** | **Bidirectional Abstraction** | Negotiates WebSockets $\to$ SSE $\to$ Long Polling automatically; supports **Redis / Azure SignalR Service backplane** for multi-pod scale-out. | Enterprise chat, real-time collaborative dashboards across scaled Kubernetes pods. |
+
+### Section 6 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions
+1. **Q: Why must you NEVER reuse a deleted field's numeric tag (`= 4;`) in a `.proto` file, and what keyword enforces this?**
+   - **Model Answer:** Protobuf binary payloads do not contain field names—only numeric field tags and wire types. If field `4` (`bool is_admin = 4;`) is deleted and a developer later adds `int32 loyalty_points = 4;`, older services still running in production will deserialize `loyalty_points` as `is_admin` (corrupting data and security)! Always mark deleted tags and names with the **`reserved`** keyword (`reserved 4; reserved "is_admin";`) so `protoc` rejects any attempt to reuse them.
+2. **Q: Why do ChatGPT/Claude-style AI streaming endpoints prefer Server-Sent Events (`text/event-stream`) over WebSockets?**
+   - **Model Answer:** A prompt request followed by a unidirectional stream of generated tokens maps naturally to a single standard HTTP `POST`/`GET` response with `Content-Type: text/event-stream`. Unlike WebSockets, SSE works seamlessly over HTTP/2 and HTTP/3 multiplexing, traverses corporate HTTP proxies and API Gateways without special `Upgrade` connection state, and handles automatic reconnection out of the box.
+
+#### Practice Exercise
+- **GraphQL Query Depth & Cost Defense:** Explain how a malicious client can craft a deeply nested circular GraphQL query (`author { books { author { books { ... } } } }`) to DoS your server, and configure HotChocolate's `AddMaxExecutionDepthRule(6)` and cost analyzer to block it.
+
+---
+
 ## Section 7 — Identity, Authentication & OAuth 2.0 / OIDC Architecture
 
 ### 7.1 OAuth 2.0 Authorization Code Flow with PKCE (RFC 7636)
@@ -532,6 +667,27 @@ The **BFF Pattern** deploys a lightweight server-side backend (e.g., in ASP.NET 
 - The browser authenticates via an encrypted, `SameSite=Strict`, `HttpOnly`, `Secure` cookie.
 - The BFF server holds the OAuth tokens securely in server-side session memory.
 - When the browser calls an API, the BFF intercepts the cookie, attaches the Bearer JWT to the header, and proxies the request to downstream microservices.
+
+---
+
+### 7.3 JWT Validation Internals, JWKS Key Rotation & Resource-Based Authorization
+
+1. **Asymmetric Signature Verification & JWKS (`/.well-known/openid-configuration`):**
+   - Never sign production microservice JWTs with a shared symmetric secret (`HS256`)—if any consumer service is compromised, it can forge tokens for the entire platform!
+   - Use asymmetric signing (**`RS256` or `ES256`**). Only the Identity Provider holds the **Private Key**; API resource servers fetch and cache the IdP's **JSON Web Key Set (JWKS)** public keys keyed by `kid` (Key ID) in the JWT header.
+2. **The JWT Revocation Dilemma & Refresh Token Rotation:**
+   - Because JWTs are validated statelessly in memory, an issued JWT remains valid until its `exp` claim! Keep Access Token TTL short ($5\text{--}15\text{ minutes}$). For immediate revocation on logout/compromise, either revoke the stateful **Refresh Token** (using Refresh Token Rotation with reuse detection) or check a fast Redis deny-list of revoked `jti` (JWT ID) claims.
+
+### Section 7 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions
+1. **Q: What happens during a zero-downtime signing key rollover at the Identity Provider, and how does ASP.NET Core's `JwtBearerHandler` handle an unrecognized `kid` (Key ID)?**
+   - **Model Answer:** The IdP publishes the *new* public key (`kid: "key-2025-05"`) in its JWKS endpoint hours before it starts signing tokens with the corresponding private key, while keeping the *old* public key (`kid: "key-2025-04"`) in the JWKS array until all tokens signed by the old key expire. If `JwtBearerHandler` receives a token whose `kid` is not in its cached `ConfigurationManager` key set, it automatically refreshes metadata from `/.well-known/openid-configuration` (throttled by `RefreshInterval` to prevent DoS) and validates the signature seamlessly.
+2. **Q: What is the "Confused Deputy" attack in microservice JWT validation when the `aud` (Audience) claim is not checked?**
+   - **Model Answer:** If `BillingService` and `PublicBlogService` share the same Identity Provider (`iss`), and `BillingService` validates the issuer and signature without checking `ValidateAudience = true` (`aud == "api://billing-service"`), an attacker or compromised `PublicBlogService` can take a valid low-privilege JWT issued for `PublicBlogService` and replay it against `BillingService` to execute financial operations!
+
+#### Practice Exercise
+- **Resource-Based Authorization Handler:** Implement an ASP.NET Core `AuthorizationHandler<SameTenantRequirement, Invoice>` that verifies `context.User.FindFirst("tenant_id")?.Value == resource.TenantId.ToString()` via `IAuthorizationService.AuthorizeAsync`.
 
 ---
 
@@ -561,6 +717,64 @@ app.MapGet("/api/v1/invoices/{id}", async (Guid id, ClaimsPrincipal user, AppDbC
     return invoice is not null ? Results.Ok(invoice) : Results.NotFound();
 });
 ```
+
+### 8.2 Defending Against Mass Assignment, Rate Limiting (.NET 8/9) & SSRF
+
+1. **API3 — Broken Object Property Level Authorization (Mass Assignment):**
+   - Never bind HTTP request bodies directly to EF Core entities (`Order` or `User`). If `User` has `public bool IsAdmin { get; set; }`, an attacker sending `{"name": "Bob", "isAdmin": true}` elevates their privileges! Always bind to dedicated, minimal `record` Request DTOs.
+2. **API4 — Unrestricted Resource Consumption (Per-Tenant Rate Limiting in .NET 8/9):**
+   - Partition rate limiters by authenticated `TenantId` (or client IP for anonymous routes) and return `HTTP 429 Too Many Requests` with a standard `Retry-After` header:
+3. **API7 — Server-Side Request Forgery (SSRF):**
+   - When your API accepts a user-supplied URL (e.g., webhook callback URL or avatar import URL), an attacker can supply `http://169.254.169.254/latest/meta-data/` (Cloud IMDSv1) or `http://10.0.0.5:6379/` (internal Redis)!
+   - *Why URL string validation is NOT enough:* Attackers use **DNS Rebinding** (a domain `evil.com` that resolves to a public IP during validation and resolves to `127.0.0.1` 10ms later when `HttpClient` connects). Defend at the socket layer via `SocketsHttpHandler.ConnectCallback` by inspecting the resolved `IPAddress` right before opening the TCP socket!
+
+```csharp
+// Configure Partitioned Per-Tenant Rate Limiting in ASP.NET Core (.NET 8/9)
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.OnRejected = async (context, ct) =>
+    {
+        if (context.Lease.TryGetMetadata(MetadataName.RetryAfter, out var retryAfter))
+        {
+            context.HttpContext.Response.Headers.RetryAfter =
+                ((int)retryAfter.TotalSeconds).ToString(CultureInfo.InvariantCulture);
+        }
+        await context.HttpContext.Response.WriteAsJsonAsync(new ProblemDetails
+        {
+            Status = StatusCodes.Status429TooManyRequests,
+            Title = "Rate limit exceeded",
+            Detail = "Quota exceeded for your tenant tier. Respect the Retry-After header."
+        }, ct);
+    };
+
+    options.AddPolicy("per-tenant-token-bucket", httpContext =>
+    {
+        string tenantKey = httpContext.User.FindFirst("tenant_id")?.Value
+            ?? httpContext.Connection.RemoteIpAddress?.ToString()
+            ?? "anonymous";
+
+        return RateLimitPartition.GetTokenBucketLimiter(tenantKey, _ => new TokenBucketRateLimiterOptions
+        {
+            TokenLimit = 100,
+            TokensPerPeriod = 20,
+            ReplenishmentPeriod = TimeSpan.FromSeconds(1),
+            QueueLimit = 0
+        });
+    });
+});
+```
+
+### Section 8 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions
+1. **Q: Why does checking `Uri.Host` against a blocklist (`localhost`, `127.0.0.1`, `169.254.169.254`) before calling `httpClient.GetAsync(userUrl)` fail to prevent SSRF?**
+   - **Model Answer:** Two reasons: (1) **Alternative IP Representations** (`http://2130706433/`, octal/hex IPs, or IPv6 mapped addresses `[::ffff:127.0.0.1]`), and (2) **DNS Rebinding TOCTOU (Time-of-Check to Time-of-Use)**: the attacker's DNS server returns a safe public IP (`93.184.216.34`) with `TTL=0` during your validator's `Dns.GetHostAddressesAsync` check, and then returns `169.254.169.254` milliseconds later when `HttpClient` performs its own DNS lookup to connect! The only bulletproof fix is resolving DNS inside `SocketsHttpHandler.ConnectCallback`, verifying that the resolved `IPAddress` is not loopback, link-local (`169.254.0.0/16`), or RFC 1918 private space, and connecting directly to that verified IP.
+2. **Q: Why should `QueueLimit` usually be set to `0` (fail fast with `429`) rather than `500` in an API rate limiter during a DDoS or runaway client loop?**
+   - **Model Answer:** Queuing 500 rate-limited requests in memory holds open HTTP request state and buffers inside Kestrel while clients time out and send *more* retries. Failing fast with `429 Too Many Requests` + `Retry-After` frees server memory immediately and signals well-behaved SDKs to back off.
+
+#### Practice Exercise
+- **SSRF-Safe `SocketsHttpHandler`:** Write a custom `ConnectCallback` for `SocketsHttpHandler` that resolves host IPs via `Dns.GetHostAddressesAsync`, throws an `InvalidOperationException` if any resolved IP is loopback or in `10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, or `169.254.0.0/16`, and connects a `Socket` directly to the validated IP.
 
 ---
 

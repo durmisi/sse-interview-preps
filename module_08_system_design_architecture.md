@@ -19,27 +19,6 @@ Every section in Part II provides comprehensive senior-level instruction:
 6. **Interview Questions with Model Answers:** Real interview questions with structured, senior-level responses.
 7. **Practical Exercises:** Full design challenges with requirements and capacity constraints.
 
-## Progress tracker
-
-| Section | Topic | Status |
-|---|---|---|
-| Section 1 | The Senior System Design Interview Framework & Estimation | Complete |
-| Section 2 | Quality Attributes, SLAs & Availability Mathematics | Complete |
-| Section 3 | Scaling Infrastructure: Compute, Load Balancing & Networking | Complete |
-| Section 4 | System-Level Caching Architecture & CDN Topologies | Complete |
-| Section 5 | Storage Tier Selection & Polyglot Persistence | Complete |
-| Section 6 | Strategic Domain-Driven Design (DDD) & Context Mapping | Complete |
-| Section 7 | Tactical Domain-Driven Design (DDD) in C# | Complete |
-| Section 8 | Architectural Styles: Monolith, Microservices & Serverless | Complete |
-| Section 9 | High Availability (HA), Multi-Region & Disaster Recovery (DR) | Complete |
-| Section 10 | Multi-Tenant SaaS Architecture & Isolation Models | Complete |
-| Section 11 | Enterprise Security Architecture & Threat Modeling (STRIDE) | Complete |
-| Section 12 | Architecture Decisions, Documentation & C4 Modeling | Complete |
-| Section 13 | AI-Powered System Design: RAG & Vector Search Architectures | Complete |
-| Section 14 | Classic System Design Case Studies & Capstone | Complete |
-
-**Current position:** Full curriculum complete. Ready for self-study, exercises, and interview drills.
-
 ## Module boundaries
 
 - **This module owns:** System design interview framework, back-of-the-envelope estimation, high-level cloud architecture, strategic/tactical DDD, architectural styles, multi-tenancy models, high availability/disaster recovery, ADRs, C4 modeling, and RAG architectures.

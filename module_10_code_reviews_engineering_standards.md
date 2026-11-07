@@ -19,26 +19,6 @@ Every section in Part II provides comprehensive senior-level instruction:
 6. **Interview Questions with Model Answers:** Real interview questions with structured, senior-level responses.
 7. **Practical Exercises:** Full code review simulations with seeded enterprise defects.
 
-## Progress tracker
-
-| Section | Topic | Status |
-|---|---|---|
-| Section 1 | The Purpose, Psychology & Science of Code Review | Complete |
-| Section 2 | Authoring Great Pull Requests & Atomic Changes | Complete |
-| Section 3 | Review Methodology & Cognitive Prioritization Hierarchy | Complete |
-| Section 4 | Correctness, Concurrency & Reliability Review in C# | Complete |
-| Section 5 | Design, Maintainability & Architectural Boundary Review | Complete |
-| Section 6 | Secure Code Review & OWASP Top 10 for .NET | Complete |
-| Section 7 | Performance, Memory & Scalability Review | Complete |
-| Section 8 | Test Suite Review & Verification Quality | Complete |
-| Section 9 | Giving Constructive Feedback & Conventional Comments | Complete |
-| Section 10 | Receiving Feedback, Disagreements & Escalation Protocols | Complete |
-| Section 11 | Engineering Standards, Tooling & Automated Quality Gates | Complete |
-| Section 12 | Documentation Standards & RFC Design Reviews | Complete |
-| Section 13 | Senior Scenarios & Capstone PR Review Walkthrough | Complete |
-
-**Current position:** Full curriculum complete. Ready for self-study, exercises, and interview drills.
-
 ## Module boundaries
 
 - **This module owns:** Pull request authoring, review methodology, feedback psychology, secure code review, .NET correctness auditing, automated analyzers (`.editorconfig`, Roslyn), and engineering documentation standards.

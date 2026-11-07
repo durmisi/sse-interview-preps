@@ -19,27 +19,6 @@ Every section in Part II provides comprehensive senior-level instruction:
 6. **Interview Questions with Model Answers:** Real interview questions with structured, senior-level responses.
 7. **Practical Exercises:** Diagnostic queries and schema optimization challenges.
 
-## Progress tracker
-
-| Section | Topic | Status |
-|---|---|---|
-| Section 1 | Relational Model, Keys & Normalization vs Denormalization | Complete |
-| Section 2 | SQL Mastery, Window Functions & Sargability | Complete |
-| Section 3 | Storage & Indexing Internals (B+Trees, Clustered, Nonclustered) | Complete |
-| Section 4 | Query Execution Plans, Optimizer & Parameter Sniffing | Complete |
-| Section 5 | Transactions, ACID & Write-Ahead Logging (WAL) | Complete |
-| Section 6 | Concurrency Control, Isolation Levels & MVCC | Complete |
-| Section 7 | Entity Framework Core Deep Dive & Performance Optimization | Complete |
-| Section 8 | Schema Evolution & Zero-Downtime Migrations | Complete |
-| Section 9 | NoSQL Architectures, Document Stores & Cosmos DB | Complete |
-| Section 10 | Scaling Data: Replication, Sharding & High Availability | Complete |
-| Section 11 | In-Memory Caching, Redis & .NET 9 HybridCache | Complete |
-| Section 12 | Data Engineering, Pipelines, CDC & Streaming | Complete |
-| Section 13 | Data Security, Operations, Backups & Disaster Recovery | Complete |
-| Section 14 | Senior Scenarios, Troubleshooting & Capstone | Complete |
-
-**Current position:** Full curriculum complete. Ready for self-study, exercises, and interview drills.
-
 ## Module boundaries
 
 - **This module owns:** Relational database storage, SQL query optimization, B+Trees, indexing, transactions, isolation levels, MVCC, EF Core internals, zero-downtime migrations, NoSQL data modeling (Cosmos DB), caching strategies, and data pipeline fundamentals.
@@ -841,6 +820,43 @@ In Cosmos DB, data is distributed across physical partitions based on the hash o
 
 ---
 
+## Section 10 — Database Scaling: Replication, Read Replicas, Sharding & Azure SQL Hyperscale
+
+### 10.1 Synchronous vs Asynchronous Replication & Read-Replica Routing in EF Core
+
+1. **Synchronous Replication (High Availability / Zero Data Loss):**
+   - The Primary node does not acknowledge `COMMIT` to the client until at least one Secondary replica has hardened the WAL log records (`RPO = 0`). Used within the same availability zone/region (e.g., SQL Server Always On Synchronous Availability Groups).
+2. **Asynchronous Replication (Read Scale-Out & Geo-DR):**
+   - The Primary commits immediately after local WAL flush and ships log records asynchronously to Read Replicas. Eliminates cross-region latency on writes, but introduces **Replication Lag** (milliseconds to seconds).
+   - **Read-Your-Own-Writes Hazard:** If a user updates their profile (routed to Primary) and immediately refreshes the page (routed to an async Read Replica via `ApplicationIntent=ReadOnly`), they may see stale data! Solve by routing read queries within $N$ seconds of a user mutation—or using a causal LSN token—to the Primary.
+
+```csharp
+// Connection-string Read-Replica Routing in SQL Server / Azure SQL:
+// "Server=tcp:prod-ag.database.windows.net;Database=OrdersDb;ApplicationIntent=ReadOnly;"
+```
+
+### 10.2 Horizontal Sharding & Azure SQL Hyperscale Architecture
+
+1. **Horizontal Sharding:** Partitions rows across $N$ independent database servers using a **Shard Key** (`TenantId` or `CustomerId`).
+   - *Range Sharding:* Easy range queries, but risks hot spots on sequential keys (e.g., current month).
+   - *Hash Sharding:* Uniform write distribution via Consistent Hashing, but range queries require expensive scatter-gather fan-out across all shards.
+2. **Azure SQL Hyperscale (Cloud-Native Disaggregated Storage):**
+   - Decouples **Compute Nodes** from **Page Servers** and the **Log Service** up to **100 TB+**:
+   - Compute nodes maintain an SSD cache (RBPEX), while changes flow through a distributed Log Service to scale-out **Page Servers** (each managing 128 GB slices in RAM/SSD backed by Azure Blob Storage). Provisioning a new Read Replica or performing database backups/restores is an $O(1)$ metadata/snapshot operation regardless of database size!
+
+### Section 10 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions
+1. **Q: How do you prevent the "Read-Your-Writes" anomaly when offloading `GET` requests to an asynchronous SQL Read Replica?**
+   - **Model Answer:** Three production techniques: (1) **Sticky Primary Window:** After any `POST/PUT/DELETE`, set a short-lived cookie or Redis flag (`last_write_ts`, TTL 3 seconds) that forces the user's subsequent `GET` requests to route to the Primary; (2) **LSN / Commit-Token Causal Gating:** Return the Primary's commit LSN to the client and have the read replica check `sys.dm_hadr_database_replica_states` (or wait briefly) if its replayed LSN is behind the client's token; (3) **CQRS Read-Through Cache:** Update the Redis cache synchronously upon write.
+2. **Q: Why does a cross-shard `JOIN` or `ORDER BY ... OFFSET 0 ROWS FETCH NEXT 20 ROWS ONLY` degrade poorly in a 16-shard database?**
+   - **Model Answer:** Without a single `ShardKey` filter in the `WHERE` clause, the coordinator must execute a **Scatter-Gather** query across all 16 shards, fetch the top 20 sorted rows from *each* shard ($16 \times 20 = 320$ rows), merge-sort them in memory, and tail-latency is bounded by the **slowest of the 16 shards** ($P_{99}$ amplification).
+
+#### Practice Exercise
+- **Shard Router Design:** Implement a C# `IShardConnectionFactory` that inspects the current tenant's tier (`Free`, `Pro`, `Enterprise`) from a cached directory table and returns a pooled `SqlConnection` pointing either to a shared multi-tenant pool shard or a dedicated isolated database.
+
+---
+
 ## Section 11 — In-Memory Caching, Redis & .NET 9 `HybridCache`
 
 ### 11.1 Cache Stampede Protection with .NET 9 `HybridCache`
@@ -871,6 +887,133 @@ public sealed class CatalogService(HybridCache cache, AppDbContext dbContext)
 }
 ```
 
+### 11.2 Caching Topologies & Redis Data Structures (`String`, `Hash`, `ZSET`, `Streams`)
+
+1. **Caching Topologies:**
+   - **Cache-Aside (Lazy Loading):** App checks Redis $\to$ on miss, queries DB and populates Redis. Resilient to Redis failure, but first request pays cache-miss latency.
+   - **Write-Through / Write-Behind:** Writes update cache and DB together (or queue async DB writes); risks caching data that is never read ("cache pollution").
+   - **Cache Penetration Defense (Null Caching / Bloom Filter):** When attackers request millions of non-existent IDs (`GET /users/99999999`), every request misses both Redis and SQL! Mitigate by caching a short-lived sentinel (`null` / Tombstone with 30s TTL) or checking a **Bloom Filter** before hitting SQL.
+2. **Choosing the Right Redis Data Structure (`StackExchange.Redis`):**
+   - **`String`:** Simple serialized JSON blobs, atomic counters (`INCR`, `DECR`), and distributed locks (`SET key val NX PX 5000`).
+   - **`Hash` (`HSET` / `HGET`):** Stores object fields individually (`HSET user:42 tier "VIP"`) without deserializing/rewriting the entire JSON document.
+   - **`Sorted Set (ZSET)`:** Stores unique members ordered by a `double` score in $O(\log N)$ time (`ZADD`, `ZRANGEBYSCORE`, `ZREMRANGEBYSCORE`)—ideal for **real-time leaderboards**, **sliding-window rate limiters**, and **delayed job schedulers**.
+   - **`Streams` (`XADD` / `XREADGROUP`):** Append-only log with consumer groups and acknowledgments (`XACK`).
+
+### Section 11 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions
+1. **Q: Why is executing `KEYS product:*` in production Redis a career-limiting mistake, and what should you use instead?**
+   - **Model Answer:** Redis executes commands on a **single main event-loop thread**. `KEYS` performs an $O(N)$ linear scan across the entire keyspace (e.g., 20 million keys) without yielding, blocking *every other client request* for hundreds of milliseconds or seconds and triggering cluster failover timeouts! Instead, use **`SCAN`** (which iterates incrementally in small non-blocking cursor batches) or **Tag-Based Invalidation** (`HybridCache.RemoveByTagAsync("catalog")`).
+2. **Q: In Cache-Aside, why should you invalidate (`DEL`) the cache key after a database `UPDATE` rather than updating (`SET`) the cache key from the application thread?**
+   - **Model Answer:** If Request A (`Update price = 10`) and Request B (`Update price = 20`) execute concurrently: Request A updates SQL first (`price = 10`), then Request B updates SQL second (`price = 20`). If Request B finishes its Redis `SET` *before* Request A (due to a GC pause or network jitter on A), Request A overwrites Redis with `price = 10`, leaving Redis permanently inconsistent with SQL (`20`) until TTL expiration! Deleting (`DEL`) the key forces the next reader to lazily load the true committed state from SQL.
+
+#### Practice Exercise
+- **Tag-Based Invalidation in .NET 9:** Configure `HybridCache` with a secondary Redis `IDistributedCache` backend and assign tags (`tags: ["category:electronics", "brand:sony"]`) inside `GetOrCreateAsync`, then demonstrate invalidating all Sony electronics via `RemoveByTagAsync("brand:sony")`.
+
+---
+
+## Section 12 — Data Engineering, OLAP, Columnar Storage & Change Data Capture (CDC)
+
+### 12.1 OLTP vs OLAP, Columnar Storage (Parquet / Delta Lake) & Medallion Lakehouse
+
+1. **Row-Oriented (OLTP) vs Column-Oriented (OLAP) Storage:**
+   - **OLTP (`SQL Server / PostgreSQL Rowstore`):** Stores all columns of a row contiguously on 8KB pages (`[Id, Name, Date, Amount]`). Fast for point lookups and single-row inserts, slow for scanning `SUM(Amount)` across 1 billion rows because the engine must read all unused columns from disk.
+   - **OLAP (`Apache Parquet / Delta Lake / Columnstore`):** Stores each column contiguously (`[Amount1, Amount2, ...]`). Enables **Run-Length Encoding (RLE)**, **Dictionary Compression**, and **SIMD Vectorized Execution** while skipping 95% of columns not referenced in the query.
+2. **The Medallion Lakehouse Architecture:**
+   - **Bronze (Raw Ingestion):** Immutable append-only raw events/CDC payloads in Delta Lake / Parquet.
+   - **Silver (Cleansed & Conformed):** Deduplicated, schema-validated, joined enterprise entities.
+   - **Gold (Curated Business Aggregates):** Star-schema Fact and Dimension tables optimized for BI dashboards and ML features.
+
+### 12.2 Change Data Capture (CDC) & Streaming Pipelines
+
+Polling OLTP tables with `SELECT * FROM Orders WHERE UpdatedAt > @LastRun` misses hard deletes, hammers OLTP indexes, and acoplates analytics to operational schemas.
+**Log-Based Change Data Capture (SQL Server CDC / Debezium / PostgreSQL Logical Replication)** reads committed mutations directly from the **Transaction Log (WAL)** with near-zero OLTP CPU impact and streams `{ before, after, op: 'c'|'u'|'d', lsn }` events into **Apache Kafka / Azure Event Hubs**.
+
+### Section 12 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions
+1. **Q: Why does a Star Schema (Fact table surrounded by denormalized Dimension tables) outperform a 3NF schema in analytical OLAP queries?**
+   - **Model Answer:** Analytical queries aggregate millions of fact measures filtered by dimension attributes (e.g., `Region`, `ProductCategory`, `Quarter`). A Star Schema reduces multi-hop Snowflake joins to a single-hop join between the compressed Fact table and small Dimension tables that fit entirely in memory for broadcast hash joins.
+2. **Q: How do you handle duplicate or out-of-order CDC events when ingesting from Kafka into a Silver Delta Lake table?**
+   - **Model Answer:** Use an idempotent **`MERGE INTO target USING source ON target.Id = source.Id`** operation gated by the source database's monotonic **Log Sequence Number (`__$start_lsn`)**: `WHEN MATCHED AND source.lsn > target.lsn THEN UPDATE ...`, ensuring out-of-order replays never overwrite newer state with older state.
+
+#### Practice Exercise
+- **SQL Server CDC Setup:** Write the T-SQL commands to enable CDC on a database (`sys.sp_cdc_enable_db`) and on the `dbo.Orders` table (`sys.sp_cdc_enable_table`), and explain why the SQL Server Agent log-reader job must be monitored to prevent transaction log growth.
+
+---
+
+## Section 13 — Database Security, Encryption, Multi-Tenancy (RLS) & Disaster Recovery
+
+### 13.1 Defense-in-Depth Encryption: TDE vs Always Encrypted vs Dynamic Data Masking
+
+| Technology | Protects Against | Where Encryption Keys Live | Query Capabilities on Encrypted Columns |
+|---|---|---|---|
+| **Transparent Data Encryption (TDE)** | Physical theft of `.mdf`/`.ldf` disk media or backup files (**Encryption at Rest**). | Database Engine / Azure Key Vault (DEK + Master Key). | **100% transparent**—buffer pool decrypts pages in RAM; full indexing and range queries work. |
+| **Always Encrypted** | Rogue DBAs, compromised cloud admins, and SQL memory dumps (**Client-Side Encryption in Transit & in Use**). | **Client application only (`ADO.NET` / Azure Key Vault)**. SQL Server never sees plaintext keys! | **Deterministic:** Equality (`=`, `JOIN`, `GROUP BY`). **Randomized:** Zero indexing/filtering (unless **Secure Enclaves** are enabled). |
+| **Dynamic Data Masking (DDM)** | Accidental PII exposure on support screens (`XXXX-XXXX-XXXX-1234`). | Not encryption! Runtime output obfuscation rule. | Data is stored in plaintext; unprivileged users can still infer values via `WHERE Salary > 100000` brute-forcing. |
+
+### 13.2 Multi-Tenant Row-Level Security (RLS) with EF Core `DbConnectionInterceptor`
+
+In a pooled multi-tenant database (shared table with `TenantId`), relying solely on developer discipline (`.Where(x => x.TenantId == currentTenant)`) or even EF Core Global Query Filters (which can be bypassed by `.IgnoreQueryFilters()` or raw Dapper/SQL queries) risks catastrophic cross-tenant data leaks.
+**Database-Level Row-Level Security (RLS)** enforces tenant isolation inside the SQL Server / PostgreSQL engine kernel:
+
+```sql
+-- 1. SQL Server Security Predicate Function reading SESSION_CONTEXT
+CREATE FUNCTION Security.fn_TenantAccessPredicate(@TenantId UNIQUEIDENTIFIER)
+RETURNS TABLE WITH SCHEMABINDING AS
+RETURN SELECT 1 AS fn_accessResult
+WHERE @TenantId = CAST(SESSION_CONTEXT(N'TenantId') AS UNIQUEIDENTIFIER);
+GO
+
+-- 2. Bind Filter & Block Predicates to tables (enforces SELECT, UPDATE, INSERT, DELETE!)
+CREATE SECURITY POLICY Security.TenantIsolationPolicy
+ADD FILTER PREDICATE Security.fn_TenantAccessPredicate(TenantId) ON dbo.Orders,
+ADD BLOCK PREDICATE Security.fn_TenantAccessPredicate(TenantId) ON dbo.Orders AFTER INSERT,
+ADD BLOCK PREDICATE Security.fn_TenantAccessPredicate(TenantId) ON dbo.Orders BEFORE UPDATE;
+GO
+```
+
+```csharp
+// 3. EF Core DbConnectionInterceptor that sets SESSION_CONTEXT on every opened connection
+public sealed class TenantSessionContextInterceptor(ITenantProvider tenantProvider)
+    : DbConnectionInterceptor
+{
+    public override async Task ConnectionOpenedAsync(
+        DbConnection connection,
+        ConnectionEndEventData eventData,
+        CancellationToken cancellationToken = default)
+    {
+        await using var cmd = connection.CreateCommand();
+        // @read_only = 1 prevents any downstream SQL injection from altering TenantId in this session!
+        cmd.CommandText = "EXEC sp_set_session_context @key=N'TenantId', @value=@tenantId, @read_only=1;";
+
+        var param = cmd.CreateParameter();
+        param.ParameterName = "@tenantId";
+        param.Value = tenantProvider.GetCurrentTenantId();
+        cmd.Parameters.Add(param);
+
+        await cmd.ExecuteNonQueryAsync(cancellationToken);
+    }
+}
+```
+
+### 13.3 Disaster Recovery: PITR, RPO & RTO
+
+- **RPO (Recovery Point Objective):** Maximum acceptable **data loss measured in time** (e.g., RPO = 5 minutes means backups/replication must capture mutations at least every 5 minutes).
+- **RTO (Recovery Time Objective):** Maximum acceptable **downtime duration** required to restore service (e.g., RTO = 15 minutes).
+- **Point-in-Time Recovery (PITR):** Combines weekly **Full Backups**, daily **Differential Backups**, and every-5-minute **Transaction Log (`.trn`) Backups** to restore a database to the exact second before an accidental `DROP TABLE` or corruption event (`STOPAT = '2025-05-01T14:22:59Z'`).
+
+### Section 13 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions
+1. **Q: If a customer requires searching for users by exact `NationalIdNumber` (equality lookup) while guaranteeing that even a database administrator with `sysadmin` rights cannot view plaintext `NationalIdNumber` values, which SQL Server feature do you choose?**
+   - **Model Answer:** **Always Encrypted with Deterministic Encryption** (or **Always Encrypted with Secure Enclaves** if `LIKE` / range queries are also required). The ADO.NET driver on the .NET application server fetches the Column Encryption Key (CEK) from Azure Key Vault, encrypts the parameter deterministically in client memory, and sends only ciphertext over the wire. Because deterministic encryption always produces the same ciphertext for the same plaintext, SQL Server can maintain a B+Tree index and execute `WHERE NationalIdNumber = @CipherParam` without ever possessing the decryption key.
+2. **Q: Why must `sp_set_session_context` be beachten with ADO.NET Connection Pooling when `@read_only = 1` is used?**
+   - **Model Answer:** When an ADO.NET `SqlConnection` is closed (`Dispose()`), the underlying physical TCP socket is returned to the **Connection Pool** and reused by the next HTTP request! Fortunately, the TDS protocol sends a **`sp_reset_connection`** packet when reusing a pooled connection, which clears `SESSION_CONTEXT` (even keys marked `@read_only = 1` during the prior logical connection)—and `ConnectionOpenedAsync` fires on every logical `OpenAsync()`, guaranteeing fresh tenant context binding per request.
+
+#### Practice Exercise
+- **RPO/RTO Architecture Matrix:** Design a multi-region Azure SQL architecture meeting **RPO = 0** for intra-region zone failures and **RPO < 5 seconds, RTO < 60 seconds** for full regional disasters using Auto-Failover Groups.
+
 ---
 
 ## Section 14 — Senior Scenarios, Troubleshooting & Capstone
@@ -885,6 +1028,33 @@ A deadlock graph reveals:
 #### Senior Root Cause & Remediation:
 1. **Root Cause:** Asymmetric object access order. Transaction A accessed `Orders` then `Customers`, while Transaction B accessed `Customers` then `Orders`.
 2. **Remediation Rule:** Ensure all transactions acquire locks on tables in the **exact same consistent alphabetical or architectural order** across all services.
+
+### 14.2 Parameter Sniffing Incident Triage & Multi-Tenant Database Capstone
+
+#### Scenario: The 3:00 AM Parameter Sniffing Meltdown
+A multi-tenant `GetTenantOrders(@TenantId UNIQUEIDENTIFIER)` stored procedure normally runs in $4\text{ ms}$. At 3:00 AM after a plan cache eviction, a background job invokes `GetTenantOrders` for a tiny sandbox tenant with **2 rows**.
+- The optimizer **sniffs** `@TenantId = 'Sandbox'` and compiles a plan using a **Nonclustered Index Seek + Nested Loops Key Lookup** cached for all callers.
+- At 8:00 AM, an enterprise tenant with **1,500,000 rows** calls `GetTenantOrders`. SQL Server reuses the cached Nested Loops plan, executing **1.5 million individual random Key Lookups**, pegging CPU at 100%!
+
+#### Senior Remediation Playbook:
+1. **Immediate Mitigation (< 60 seconds):** Force the known-good Hash Match / Covering Index plan in **Query Store** (`sp_query_store_force_plan`).
+2. **Structural Fix:**
+   - Make the index **Covering** (`INCLUDE (TotalAmount, Status, CreatedAt)`) so the Key Lookup disappears completely, OR
+   - Enable SQL Server 2022 **Parameter Sensitive Plan (PSP) Optimization** (`COMPATIBILITY_LEVEL = 160`), OR
+   - Add `OPTION (RECOMPILE)` to high-skew analytical queries so each execution compiles a plan tailored to its exact cardinality.
+
+### Section 14 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions
+1. **Q: Why can putting `OPTION (RECOMPILE)` on a query executed 5,000 times per second cause a worse outage than parameter sniffing?**
+   - **Model Answer:** Query compilation is CPU-intensive. Compiling an execution plan 5,000 times per second burns massive CPU cycles in the optimizer and causes `CMEMTHREAD` / compilation latch contention. For ultra-high-frequency OLTP queries with skewed tenants, use a **Covering Index** (so the same Index Seek plan works efficiently without Key Lookups), **SQL Server 2022 PSP Optimization**, or split the procedure into two targeted branches (`IF @IsEnterpriseTenant = 1 ... ELSE ...`).
+2. **Q: Walk through how you would architect a database tier for a B2B SaaS platform serving 10,000 small free-tier tenants and 50 regulated enterprise tenants requiring strict data isolation and custom backup schedules.**
+   - **Model Answer:** Implement a **Hybrid (Bridge/Pod) Multi-Tenant Architecture**:
+     - Place the 10,000 small tenants into **Pooled Shards** protected by both EF Core Global Query Filters and SQL Server **Row-Level Security (`SESSION_CONTEXT`)** inside an **Azure SQL Elastic Pool** (sharing eDTUs/vCores across bursty workloads).
+     - Provision the 50 regulated enterprise tenants into **Dedicated Single-Tenant Databases** (Silo model) with tenant-owned **Customer-Managed Keys (CMK)** for TDE/Always Encrypted and independent PITR retention policies, routed transparently via a cached **Tenant Catalog Directory** and EF Core dynamic connection string factory.
+
+#### Practice Exercise
+- **End-to-End Diagnostic Drill:** Given a slow EF Core endpoint taking 4.2 seconds at P99, list the exact sequence of inspections you perform across OpenTelemetry spans, generated SQL (`ToQueryString()`), `SET STATISTICS IO, TIME ON`, the Actual Execution Plan XML, and `sys.dm_os_wait_stats` to isolate whether the bottleneck is network serialization, missing covering index, parameter sniffing, or lock contention.
 
 ---
 

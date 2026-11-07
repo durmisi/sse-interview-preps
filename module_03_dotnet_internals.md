@@ -19,23 +19,6 @@ Every section in Part II provides comprehensive senior-level instruction:
 6. **Interview Questions with Model Answers:** Real interview questions with structured, senior-level responses.
 7. **Practical Exercises:** Diagnostic labs and deep technical questions without inline solutions.
 
-## Progress tracker
-
-| Section | Topic | Status |
-|---|---|---|
-| Section 1 | CLR Architecture, Execution Pipeline & JIT Compilation | Complete |
-| Section 2 | C# Compiler Lowering & Language Internals | Complete |
-| Section 3 | Type System, Object Layout & Memory Fundamentals | Complete |
-| Section 4 | Garbage Collector Internals & Memory Management | Complete |
-| Section 5 | Resource Lifetime, Finalization & Native Interoperability | Complete |
-| Section 6 | Asynchronous Programming Internals (`async`/`await`) | Complete |
-| Section 7 | Threading, Concurrency, Synchronization & Memory Model | Complete |
-| Section 8 | ASP.NET Core Architecture & Request Pipeline Internals | Complete |
-| Section 9 | Performance Engineering, Profiling & Diagnostics Toolkit | Complete |
-| Section 10 | Runtime Configuration, Containers & Incident Capstone | Complete |
-
-**Current position:** Full curriculum complete. Ready for self-study, exercises, and interview drills.
-
 ## Module boundaries
 
 - **This module owns:** CoreCLR architecture, JIT compilation, Native AOT, C# compiler lowering, memory layout, GC mechanics, asynchronous state machines, ThreadPool, synchronization primitives, memory barriers, ASP.NET Core request pipeline, and runtime diagnostic tools.

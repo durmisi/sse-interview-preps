@@ -19,26 +19,6 @@ Every section in Part II provides comprehensive senior-level instruction:
 6. **Interview Questions with Model Answers:** Real interview questions with structured, senior-level responses.
 7. **Practical Exercises:** Distributed consensus proofs, failure simulations, and Outbox implementations.
 
-## Progress tracker
-
-| Section | Topic | Status |
-|---|---|---|
-| Section 1 | Distributed Systems Fundamentals & The 8 Fallacies | Complete |
-| Section 2 | Time, Physical Clocks, Skew & Logical Ordering | Complete |
-| Section 3 | CAP Theorem, PACELC & Consistency Models Spectrum | Complete |
-| Section 4 | Replication Mechanics, Quorums & Consensus Protocols | Complete |
-| Section 5 | Partitioning, Sharding & Consistent Hashing | Complete |
-| Section 6 | Messaging Architectures: Queues, Topics & Event Streams | Complete |
-| Section 7 | Delivery Semantics, Idempotency & Poison Handling | Complete |
-| Section 8 | Distributed Reliability Patterns (Polly v8, Circuit Breakers) | Complete |
-| Section 9 | Cross-Service Consistency: Sagas & Transactional Outbox | Complete |
-| Section 10 | Event-Driven Architecture, Event Sourcing & Projections | Complete |
-| Section 11 | Distributed Observability, Tracing & W3C Correlation | Complete |
-| Section 12 | Chaos Engineering & Fault Injection Verification | Complete |
-| Section 13 | Senior Scenarios, Distributed Incidents & Capstone | Complete |
-
-**Current position:** Full curriculum complete. Ready for self-study, exercises, and interview drills.
-
 ## Module boundaries
 
 - **This module owns:** Distributed computing fallacies, time and ordering, CAP/PACELC, replication, consensus (Raft/Paxos), distributed locking, message brokers (Service Bus/Kafka), Sagas, Transactional Outbox/Inbox, and distributed resilience.
@@ -1464,6 +1444,131 @@ Events in an Event Store are **immutable**, yet business requirements evolve con
 
 ---
 
+## Section 11 — Resilience Engineering: Retries, Jitter, Circuit Breakers & Bulkheads
+
+### 11.1 Retry Storms & Exponential Backoff with Full Jitter
+
+When a downstream microservice or database experiences a transient CPU spike or brief network blip and returns `HTTP 503 Service Unavailable`, naive clients that retry immediately (or retry at fixed $1\text{-second}$ intervals) synchronize into a **Thundering Herd / Retry Storm**:
+- If 1,000 clients fail at $t = 0\text{s}$ and retry at $t = 1\text{s}, 2\text{s}, 4\text{s}$ without randomization, all 1,000 retries hit the recovering server in lockstep waves,加上 new incoming traffic, guaranteeing the downstream service never recovers!
+- **Exponential Backoff with Full Jitter (AWS Architecture Formula):** Randomizes the wait duration uniformly across the exponential window to spread retry load flat across time:
+
+$$T_{\text{sleep}} = \text{Random}\!\left(0,\; \min\!\left(T_{\max},\; T_{\text{base}} \times 2^{\text{attempt}}\right)\right)$$
+
+### 11.2 Circuit Breakers, Bulkhead Isolation, Hedging & Polly v8 (`Microsoft.Extensions.Resilience`)
+
+1. **Circuit Breaker State Machine (`Closed` $\to$ `Open` $\to$ `Half-Open`):**
+   - **Closed:** Requests flow normally while a sliding window tracks failure rate (e.g., $\ge 50\%$ failures over $30\text{s}$ with minimum throughput $\ge 20$ requests).
+   - **Open:** Trips when the threshold is breached; **fails fast** locally (`BrokenCircuitException` in $< 1\text{ }\mu\text{s}$) for the break duration ($15\text{s}$) without touching the network, shedding load from the dying downstream dependency.
+   - **Half-Open:** Allows a single probe request through after the break duration; if it succeeds, transitions back to `Closed`; if it fails, re-opens immediately.
+2. **Bulkhead Isolation:** Caps the maximum concurrent calls (`ConcurrencyLimiter`) to a specific dependency so a slow third-party API cannot exhaust all Kestrel worker threads or socket connections needed by healthy endpoints.
+3. **Request Hedging:** Combats $P_{99}$ tail-latency spikes on idempotent reads by firing a secondary parallel request to another replica if the primary doesn't respond within the $P_{95}$ threshold (e.g., $40\text{ ms}$), returning whichever finishes first.
+
+```csharp
+// Production .NET 8/9 Resilience Pipeline using Microsoft.Extensions.Http.Resilience (Polly v8)
+builder.Services.AddHttpClient<IPaymentGatewayClient, StripeGatewayClient>()
+    .AddResilienceHandler("payment-pipeline", static pipeline =>
+    {
+        // 1. Bulkhead Isolation: Cap max concurrent outbound calls to protect local pool
+        pipeline.AddConcurrencyLimiter(permitLimit: 100, queueLimit: 50);
+
+        // 2. Total Request Timeout (outer bound across all retries)
+        pipeline.AddTimeout(TimeSpan.FromSeconds(10));
+
+        // 3. Retry with Exponential Backoff + Full Jitter
+        pipeline.AddRetry(new HttpRetryStrategyOptions
+        {
+            MaxRetryAttempts = 3,
+            BackoffType = DelayBackoffType.Exponential,
+            UseJitter = true,
+            Delay = TimeSpan.FromMilliseconds(200)
+        });
+
+        // 4. Circuit Breaker: Fail fast when downstream error rate >= 50%
+        pipeline.AddCircuitBreaker(new HttpCircuitBreakerStrategyOptions
+        {
+            FailureRatio = 0.5,
+            SamplingDuration = TimeSpan.FromSeconds(30),
+            MinimumThroughput = 20,
+            BreakDuration = TimeSpan.FromSeconds(15)
+        });
+
+        // 5. Per-Attempt Timeout (inner bound for a single HTTP try)
+        pipeline.AddTimeout(TimeSpan.FromSeconds(2));
+    });
+```
+
+### Section 11 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions
+1. **Q: In a Polly v8 resilience pipeline combining Total Timeout, Retry, Circuit Breaker, and Attempt Timeout, what is the exact correct outer-to-inner ordering and why?**
+   - **Model Answer:** From outermost to innermost: **`Total Timeout` $\to$ `Retry` $\to$ `Circuit Breaker` $\to$ `Attempt Timeout`**.
+     - `Total Timeout` must wrap `Retry` so the caller never waits longer than the overall SLA budget across all attempts combined.
+     - `Retry` must sit *outside* `Circuit Breaker` so that when the circuit is `Open`, `Retry` sees the fast-fail `BrokenCircuitException` (or skips retrying while broken), and each failed attempt reported by `Attempt Timeout` is counted by the `Circuit Breaker` right below it.
+     - `Attempt Timeout` must be innermost so a hung socket on attempt #1 is aborted after $2\text{s}$ and triggers the outer `Retry`.
+2. **Q: Why can retrying non-idempotent operations or retrying in multiple layers of a 4-tier microservice call chain (`Gateway -> Order -> Payment -> Bank`) cause a catastrophic outage?**
+   - **Model Answer:** **Multiplicative Retry Amplification:** If each of the 4 tiers configures 3 retries (4 total attempts per tier), a single failure at the `Bank` layer causes $4^4 = \mathbf{256\text{ requests}}$ to hit the bank for every 1 user request! Senior rule: **retry at a single responsible boundary** (typically the immediate caller of the external dependency), enforce a retry budget (e.g., max 10% of total traffic can be retries), and require an `Idempotency-Key` on any retried mutation.
+
+#### Practice Exercise
+- **Chaos Resilience Test:** Write an xUnit test using Polly v8's `ChaosOutcomeStrategy` (`AddChaosOutcome`) that injects a 30% `HttpRequestException` fault rate and verifies that your pipeline recovers gracefully and trips the circuit breaker when the fault rate is raised to 70%.
+
+---
+
+## Section 12 — Distributed Observability, Context Propagation & Chaos Engineering
+
+### 12.1 W3C `traceparent` Propagation Across Asynchronous Message Brokers
+
+While `HttpClient` in .NET 8/9 automatically injects the W3C Trace Context header (`traceparent: 00-<16-byte-trace-id>-<8-byte-span-id>-01`), asynchronous message brokers (Azure Service Bus, Kafka, RabbitMQ) require propagating `ActivityContext` inside message metadata properties so distributed traces remain connected across producer, broker queue wait time, and consumer:
+
+```csharp
+public sealed class TracedServiceBusPublisher(ServiceBusSender sender)
+{
+    private static readonly ActivitySource MessagingSource = new("Enterprise.Messaging", "1.0.0");
+    private static readonly DistributedContextPropagator Propagator = DistributedContextPropagator.Current;
+
+    public async Task PublishWithTraceContextAsync<T>(T payload, CancellationToken ct)
+    {
+        using Activity? activity = MessagingSource.StartActivity(
+            "servicebus.publish", ActivityKind.Producer);
+
+        var message = new ServiceBusMessage(JsonSerializer.SerializeToUtf8Bytes(payload));
+
+        // Inject W3C traceparent & tracestate into ServiceBusMessage.ApplicationProperties
+        if (activity is not null)
+        {
+            Propagator.Inject(activity, message.ApplicationProperties, static (carrier, key, value) =>
+            {
+                if (carrier is IDictionary<string, object> props && value is not null)
+                {
+                    props[key] = value;
+                }
+            });
+        }
+
+        await sender.SendMessageAsync(message, ct);
+    }
+}
+```
+
+### 12.2 Chaos Engineering & Game Days (Azure Chaos Studio)
+
+**Chaos Engineering** is the discipline of experimenting on a distributed system in production (or production-like environments) to build confidence in the system's capability to withstand turbulent conditions:
+1. **Define the Steady-State Hypothesis:** Measurable business metrics (e.g., `Order Checkout Success Rate >= 99.95%`, `P99 Latency < 250ms`), not just infrastructure CPU metrics.
+2. **Hypothesize that Steady State Continues:** Predict that killing 1 of 3 AKS availability zones, injecting $150\text{ ms}$ Redis latency, or blackholing a secondary payment provider will automatically trigger circuit breakers and failover without breaching the steady-state SLO.
+3. **Minimize Blast Radius & Ensure an Instant Stop Button:** Run experiments in scoped canary rings with automated abort triggers if live error budgets are threatened.
+
+### Section 12 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions
+1. **Q: Why should a message consumer create a new `Activity` linked via `ActivityLink` (or parented via extracted `ActivityContext`) rather than sharing a long-lived span across a batch of 100 Kafka messages?**
+   - **Model Answer:** In batch stream processing, the 100 messages in a single poll batch were produced by 100 *different* upstream user HTTP requests (100 distinct `TraceId`s). Creating a batch processing span with **`ActivityLink`s** pointing back to each message's producer `(TraceId, SpanId)` preserves exact causal correlation to all 100 originating user traces without corrupting parent-child hierarchy.
+2. **Q: What is the difference between Testing and Chaos Engineering?**
+   - **Model Answer:** Testing (unit/integration) verifies whether a known condition produces a known outcome in isolation (**validation of knowns**). Chaos Engineering injects real infrastructure faults (network partitions, clock skew, DNS failure, pod eviction) into a running distributed topology to uncover **unknown systemic interactions** (e.g., discovering that a circuit breaker timeout was longer than the API Gateway timeout).
+
+#### Practice Exercise
+- **Consumer Context Extraction:** Write the matching `ServiceBusProcessor` consumer code that uses `DistributedContextPropagator.Current.ExtractTraceIdAndState` on `args.Message.ApplicationProperties` and starts an `ActivityKind.Consumer` span parented to the upstream producer's `ActivityContext`.
+
+---
+
 ## Section 13 — Senior Scenarios, Distributed Incidents & Capstone
 
 ### 13.1 Capstone Scenario: E-Commerce Fulfillment Saga Architecture
@@ -1495,6 +1600,30 @@ Events in an Event Store are **immutable**, yet business requirements evolve con
                        v                                                  v
              [ Dispatch Shipping ]                               [ Send Refund Command ]
 ```
+
+### 13.2 Distributed Incident Postmortem: Resolving a Cascading Retry Storm & Outbox Backlog
+
+#### Incident Summary
+During a flash-sale event ($8\times$ normal traffic), the `InventoryService` SQL database experienced a 12-second failover.
+1. **Failure Mode 1 (Retry Storm):** `OrderSagaOrchestrator` had a naive retry policy (`Retry(5, immediate)`). When `InventoryService` blipped for 12 seconds, 40,000 in-flight saga instances fired 200,000 immediate retries, saturating Azure Service Bus and exhausting the SQL connection pool on `InventoryService` the moment the new primary came online.
+2. **Failure Mode 2 (Single-Threaded Outbox Bottleneck):** Meanwhile, `OrderApi` accumulated 1.2 million rows in `OutboxMessages` because a single background worker was polling `TOP (50)` sequentially every $1,000\text{ ms}$ ($50\text{ msgs/sec}$ ceiling).
+
+#### Architectural Remediation
+1. Replaced immediate retries with **Exponential Backoff + Full Jitter** (`200ms -> 800ms -> 3.2s`) and a **Circuit Breaker** that pauses Service Bus message consumption for 15 seconds when downstream SQL connections fail.
+2. Scaled the `OutboxPublisherWorker` horizontally across 16 pods using **`WITH (UPDLOCK, READPAST, ROWLOCK)`** batch size `500` and `SendMessagesAsync(batch)` batching, increasing Outbox throughput from $50\text{ msgs/sec}$ to $24,000\text{ msgs/sec}$.
+
+### Section 13 Review: Interview Questions & Practice Exercises
+
+#### Interview Questions
+1. **Q: In the E-Commerce Fulfillment Saga above, what happens if the user clicks "Cancel Order" at the exact millisecond that `PaymentService` is charging their credit card in flight?**
+   - **Model Answer:** Because distributed messages cross on the wire, `CancelOrderCommand` and `PaymentSucceededEvent` race at the Saga Orchestrator. The Saga State Machine handles this deterministically using **State-Driven Message Handling** and **Optimistic Concurrency (`RowVersion`)** on the `OrderSagaState` row:
+     - If `CancelOrderCommand` arrives while in `AwaitingPayment`, the Saga transitions to `CancellingWaitPayment` (it does *not* finalize yet!).
+     - When `PaymentSucceededEvent` arrives 100ms later against the `CancellingWaitPayment` state, the Saga immediately dispatches `RefundPaymentCommand` and transitions to `Cancelled`. Never drop or ignore in-flight payment events when a cancellation arrives early!
+2. **Q: How do you prevent an Outbox table with 50 million historical processed rows from slowing down live `INSERT` and polling `SELECT` queries?**
+   - **Model Answer:** Two complementary practices: (1) Create a **Filtered Index** `CREATE INDEX IX_Outbox_Unprocessed ON OutboxMessages (CreatedAtUtc) INCLUDE (Type, Payload) WHERE ProcessedAtUtc IS NULL` so polling queries only ever scan the tiny active subset of unprocessed rows; and (2) Either `DELETE` rows immediately upon successful broker acknowledgment or partition the `OutboxMessages` table by day and `TRUNCATE TABLE ... WITH (PARTITIONS (...))` once a partition is 100% processed.
+
+#### Practice Exercise
+- **Full Saga State Machine Edge Case:** Extend the `OrderFulfillmentStateMachine` from Section 9.3 to handle a **Saga Timeout (`Schedule`)**: if `PaymentService` neither succeeds nor fails within 5 minutes, send a `QueryPaymentStatusCommand` (using the deterministic `IdempotencyKey`) before deciding whether to compensate or advance.
 
 ---
 

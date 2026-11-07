@@ -19,34 +19,13 @@ Every section in Part II provides comprehensive senior- and staff-level instruct
 
 ---
 
-## Progress Tracker
-
-| Section | Topic | Status |
-|---|---|---|
-| 1 | The Senior & Staff Archetypes: Scope, Impact, Autonomy, Ambiguity & Engineering Ladders | Completed |
-| 2 | Extreme Ownership & Operational Accountability: Beyond Code to Systems Stewardship | Completed |
-| 3 | Technical Leadership Without Authority: Influence, Consensus, RFCs & Technical Vision | Completed |
-| 4 | Strategic Communication: Audience Adaptation, BLUF, Trade-off Pitches & Executive Alignment | Completed |
-| 5 | Mentoring, Coaching & Growing Engineers: SBI Feedback Model, Delegation & Raising the Bar | Completed |
-| 6 | Software Estimation & Probabilistic Forecasting: PERT, Reference Class & Monte Carlo Models | Completed |
-| 7 | Rigorous Prioritization: RICE, WSJF (Cost of Delay), Tech Debt vs Feature Portfolios & Saying No | Completed |
-| 8 | High-Stakes Decision-Making: One-Way Doors, DACI/RACI, Pre-Mortems & Disagree and Commit | Completed |
-| 9 | Stakeholder Management & Product Partnership: Scope Creep, Business Value & Shared Roadmaps | Completed |
-| 10 | Conflict Resolution & Psychological Safety: Crucial Conversations, Radical Candor & Team Dynamics | Completed |
-| 11 | Execution & Delivery Leadership: Critical Path, Risk Registers, Dependency Unblocking & Launch | Completed |
-| 12 | Crisis & Incident Leadership: The Incident Commander Mindset & Executive Communications | Completed |
-| 13 | Behavioral Interviews & The STAR/CARL Protocol: 12-Competency Story Bank & Staff Levelling | Completed |
-| 14 | Senior Leadership Capstone: RFC Defense, Backlog Prioritization & Conflict Role-Play | Completed |
-
----
-
 ## Module Boundaries
 
 - **This module owns:** Engineering career ladders and Staff archetypes, extreme operational ownership, influence without authority, RFC/ADR governance, executive BLUF communication, SBI feedback and technical mentorship, probabilistic software estimation (PERT and Monte Carlo), economic backlog prioritization (RICE and WSJF), Type 1/Type 2 decision frameworks (DACI, Pre-Mortems), conflict resolution, critical path execution, incident command communications, and STAR/CARL behavioral interview mastery.
 - **Upstream Dependencies:**
-  - [Module 08 — System Design & Architecture](file:///module_08_system_design_architecture.md): Architectural Decision Records (ADRs), trade-off matrices, and non-functional requirements (NFRs).
-  - [Module 10 — Code Reviews & Engineering Standards](file:///module_10_code_reviews_engineering_standards.md): Review ethics, technical coaching in PRs, and driving engineering standards.
-  - [Module 11 — DevOps & Engineering Processes](file:///module_11_devops_engineering_processes.md): Flow metrics, incident response mechanics, and blameless postmortem culture.
+  - [Module 08 — System Design & Architecture](module_08_system_design_architecture.md): Architectural Decision Records (ADRs), trade-off matrices, and non-functional requirements (NFRs).
+  - [Module 10 — Code Reviews & Engineering Standards](module_10_code_reviews_engineering_standards.md): Review ethics, technical coaching in PRs, and driving engineering standards.
+  - [Module 11 — DevOps & Engineering Processes](module_11_devops_engineering_processes.md): Flow metrics, incident response mechanics, and blameless postmortem culture.
 - **Downstream Dependents:**
   - None — This capstone leadership module consolidates the entire 12-module Senior Software Engineer Academy curriculum for technical interviews and career promotion.
 

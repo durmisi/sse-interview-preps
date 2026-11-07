@@ -19,27 +19,6 @@ Every section in Part II provides comprehensive senior-level instruction:
 6. **Interview Questions with Model Answers:** Real interview questions with structured, senior-level responses.
 7. **Practical Exercises:** Deep problems without inline solutions, designed to test operational and architectural judgment.
 
-## Progress tracker
-
-| Section | Topic | Status |
-|---|---|---|
-| Section 1 | DevOps Foundations: CALMS, The Three Ways, DORA Metrics & Team Topologies | Complete |
-| Section 2 | Git Internals & Branching Strategies: Object Model, Rebase vs Merge, Bisect & Trunk-Based Development | Complete |
-| Section 3 | Continuous Integration: Stages, Reproducible Builds, Central Package Management, SBOM & Test Parallelism | Complete |
-| Section 4 | CI/CD Platforms & Secure Automation: GitHub Actions & Azure DevOps YAML, OIDC Workload Identity | Complete |
-| Section 5 | Continuous Delivery & Pipeline Architecture: Build Once Deploy Many, Env Config & DB Migration Gates | Complete |
-| Section 6 | Deployment Strategies: Rolling, Blue-Green, Canary, Feature Flags (Azure App Configuration) & Rollbacks | Complete |
-| Section 7 | Containers & Orchestration: Multi-Stage Docker, Chiseled .NET, Kubernetes AKS Architecture & Probes | Complete |
-| Section 8 | Infrastructure as Code (IaC): Declarative Bicep vs Terraform, State Drift, Managed Identities & GitOps | Complete |
-| Section 9 | Observability Engineering: OpenTelemetry in .NET, Activity/Meter, Azure Monitor, KQL & SLO Burn Alerts | Complete |
-| Section 10 | Incident Management & Operations: On-Call, Severity Levels, Incident Commander & Blameless Postmortems | Complete |
-| Section 11 | DevSecOps & Supply Chain Security: SLSA Framework, Secret/Container Scanning & Branch Protection | Complete |
-| Section 12 | Agile Flow Metrics & Lean Delivery: Scrum Anti-Patterns, Kanban WIP Limits, Cycle Time & CFD | Complete |
-| Section 13 | Enterprise Change Management: Automated Audit Trails, SOC 2 / ISO 27001 Compliance & Modern CAB | Complete |
-| Section 14 | DevOps Capstone: End-to-End GitOps on Azure AKS with Bicep, Canary Rollout & Sev-1 Postmortem | Complete |
-
-**Current position:** Full curriculum complete. Ready for self-study, exercises, and interview drills.
-
 ## Module boundaries
 
 - **This module owns:** DevOps culture and DORA metrics, Git internals and trunk-based workflows, CI/CD pipeline engineering, OIDC workload federation, progressive delivery strategies, Docker and Kubernetes orchestration for .NET, Bicep/Terraform IaC and GitOps, OpenTelemetry observability, incident command and blameless postmortems, SLSA supply-chain security, Kanban flow metrics, and continuous compliance.
