@@ -98,7 +98,7 @@ Technical competence gets you into the room; engineering leadership determines y
 **Outcome:** Replace single-point estimation theater with probabilistic 3-point PERT distributions, Cone of Uncertainty bounds, and Monte Carlo throughput simulations.
 - 6.1 Cognitive Biases & The Planning Fallacy: Why optimism bias, anchoring, and Hofstadter's Law cause single-point estimates to fail systematically.
 - 6.2 Three-Point Beta-PERT Estimation & Standard Deviation Aggregation: Computing expected duration $E = (O + 4M + P)/6$, task standard deviation $\sigma = (P - O)/6$, and portfolio variance $\sum \sigma^2$.
-- 6.3 Communicating Confidence Intervals & Monte Carlo Forecasting: Computing 90% confidence commitment dates ($\sum E + 1.645\sqrt{\sum \sigma^2}$) and running empirical throughput simulations.
+- 6.3 Communicating Forecast Percentiles & Monte Carlo Forecasting: Approximating a one-sided 90th-percentile date ($\sum E + 1.282\sqrt{\sum \sigma^2}$ under an independent-task normal approximation) and testing assumptions against delivery history.
 **Senior-level bar:** Defend a probabilistic 90% confidence delivery window for a multi-sprint migration against executive pressure for an arbitrary single-date promise.
 
 ---
@@ -248,6 +248,14 @@ Extreme Ownership means there are no bad teams, only bad leaders—and every sen
 - **Production Support**: Am I monitoring error budgets and proactively resolving warnings before they trigger Sev-1 pages?
 
 ### 2.3 Systems Stewardship vs "Throw It Over the Wall" Culture
+
+#### Ownership Is Not Unlimited Personal Availability
+
+Owning the outcome means making risks visible, coordinating the right people, and ensuring recovery and follow-through. It does not mean personally implementing every fix or silently compensating for missing staffing with permanent overtime.
+
+Make service ownership, escalation routes, on-call handoffs, and operational capacity explicit. When commitments exceed capacity, present the scope/date/risk trade-off early and ask the accountable decision-maker to choose. A sustainable improvement reduces dependence on you through runbooks, shared knowledge, automation, and delegated ownership.
+
+**Evidence of leadership:** Compare whether the team can ship and recover safely when you are absent before and after your intervention. Counting how many incidents you personally rescued can reward the very bottleneck you need to remove.
 In high-performing engineering organizations ("You Build It, You Run It"), code is not "done" when a pull request is merged or handed to QA. Code is only done when it is running in production, handling live customer traffic within its latency and error SLOs, observable via structured telemetry, and maintainable by the on-call team at 03:00 UTC.
 
 | Lifecycle Phase | Mid-Level "Ticket Closer" Mindset | Senior "Systems Steward" Mindset |
@@ -449,10 +457,25 @@ Effective senior engineers do not hoard critical tasks; they delegate to grow ju
 6. *Inquire*: "Make the decision and let me know the outcome." (Senior delegation)
 7. *Delegate*: Full autonomy.
 
+#### The Delegation Contract
+
+Calibrate autonomy to the task's risk and the engineer's relevant experience, not their title alone. Agree on:
+- **Outcome and acceptance criteria:** What must be true, and how will it be demonstrated?
+- **Decision rights:** Which choices can the engineer make independently, and which need consultation?
+- **Constraints:** Budget, compatibility, security, and customer-impact boundaries.
+- **Checkpoints and escalation triggers:** Review the risky assumption early, not only the finished implementation. Specify when to ask for help.
+- **Support and credit:** Provide access to experts and timely feedback; let the engineer present the result and receive recognition.
+
+Checkpoints should reduce uncertainty, not become daily permission gates. If progress stalls, first investigate unclear goals, missing access, competing work, or knowledge gaps. Adjust support based on observable evidence rather than taking the work back by default.
+
+**Feedback follow-through:** After an SBI conversation, ask for the other person's perspective, agree on a concrete next behavior, and revisit it at a defined time. A one-way critique without support or a follow-up is not a development plan. Persistent performance concerns belong with the person's manager, not informal peer disciplinary processes.
+
 ### 5.4 Coaching Engineers on Task Breakdown: Worked Cone of Uncertainty & 3-Point PERT Estimation Table
 One of the highest-leverage coaching moments for a Senior Engineer is teaching Mid-Level engineers how to break down and estimate a complex multi-sprint epic without falling into the single-point optimism trap ("I can build that in 3 days"). When coaching a mid-level lead through scoping a **5-Sprint Distributed Payment Migration**, guide them through **Steve McConnell's Cone of Uncertainty** (where initial concept estimates vary by 0.25× to 4.0×, narrowing to 0.8× to 1.25× only after architectural spike and interface lock-in) and compute a **3-Point Beta-PERT Portfolio Table**:
 
-$$E = \frac{O + 4M + P}{6}, \qquad \sigma = \frac{P - O}{6}, \qquad T_{90\%} = \sum E + 1.645 \times \sqrt{\sum \sigma^2}$$
+$$E = \frac{O + 4M + P}{6}, \qquad \sigma \approx \frac{P - O}{6}, \qquad T_{90\%} \approx \sum E + 1.282 \times \sqrt{\sum \sigma^2}$$
+
+The percentile calculation below assumes sequential task durations, independent uncertainty, and an approximately normal total duration. It is a planning approximation, not a calibrated promise. The standard PERT spread estimate is itself a heuristic; three estimates do not establish the true distribution.
 
 | Workstream / Sprint Milestone | Optimistic ($O$ Days) | Most Likely ($M$ Days) | Pessimistic ($P$ Days) | Expected ($E = \frac{O+4M+P}{6}$) | Std Dev ($\sigma = \frac{P-O}{6}$) | Variance ($\sigma^2$) | Primary Uncertainty Driver Coached in 1-on-1 |
 |---|---|---|---|---|---|---|---|
@@ -461,11 +484,11 @@ $$E = \frac{O + 4M + P}{6}, \qquad \sigma = \frac{P - O}{6}, \qquad T_{90\%} = \
 | **3. Dual-Write Shadow Verification** | 6.0 | 9.0 | 18.0 | **10.00 days** | 2.00 days | 4.00 | Reconciliation drift between legacy and new ledgers. |
 | **4. Consumer Cutover & DLQ Tooling** | 5.0 | 7.0 | 15.0 | **8.00 days** | 1.67 days | 2.78 | Downstream ERP out-of-order event handling. |
 | **5. Legacy Decommission & Load Test** | 4.0 | 5.0 | 12.0 | **6.00 days** | 1.33 days | 1.78 | Tail-latency spike under 5× Black Friday load test. |
-| **Portfolio Totals** | **24.0 days** | **35.0 days** | **76.0 days** | **$\sum E = 40.00\text{ days}$** | **$\sqrt{\sum \sigma^2} = 3.92\text{ days}$** | **$\sum \sigma^2 = 15.34$** | **90% Confidence Commitment: $T_{90\%} = 40.00 + 1.645(3.92) \approx 46.5\text{ days}$ (~9.5 weeks / 5 Sprints)** |
+| **Portfolio Totals** | **24.0 days** | **35.0 days** | **76.0 days** | **$\sum E = 40.00\text{ days}$** | **$\sqrt{\sum \sigma^2} \approx 3.92\text{ days}$** | **$\sum \sigma^2 \approx 15.33$** | **Illustrative P90 forecast: $T_{90\%} \approx 40.00 + 1.282(3.92) \approx 45.0\text{ working days}$; validate calendar and dependency assumptions.** |
 
-- **Why Variances Add ($\sqrt{\sum \sigma^2}$), Not Standard Deviations:** Because independent task risks do not all hit their worst-case $P$ simultaneously, the portfolio standard deviation is the square root of the sum of variances ($\sqrt{15.34} = 3.92\text{ days}$), not the raw sum of $\sigma_i$ (8.67 days).
+- **Why Variances Add ($\sqrt{\sum \sigma^2}$), Not Standard Deviations:** Under independence, the variance of the sum is the sum of variances, giving approximately $\sqrt{15.33}=3.92\text{ days}$ rather than the raw sum of standard deviations (8.67 days). Shared vendor or staffing risks require covariance or explicit shared-risk scenarios.
 - **Coaching Script for Communicating the Commitment Date:**
-  > *"Notice that if you quoted your 'Most Likely' sum of 35 days (7 weeks), you would have less than a 20% chance of hitting the date! Even the Expected mean $\sum E = 40\text{ days}$ (8 weeks) is only a 50/50 coin toss. By adding $\Delta T = 1.645 \times \sigma_{\text{total}}$ (6.45 days of statistical risk buffer), we can commit to **47 engineering days (5 two-week sprints)** with **90% confidence**, and we know our top two variance drivers (Tasks 2 and 3) require a 2-day prototype spike in Week 1 to narrow the Cone of Uncertainty."*
+  > *"Our model has a 40-working-day mean and an approximate P90 of 45 working days. That is conditional on sequential work and independent risks; it does not include every approval delay or interruption. Tasks 2 and 3 drive the most modeled variance, so we will time-box a discovery spike, include its cost, and update the forecast. We will agree on a delivery commitment only after reviewing scope, dependencies, and the working calendar."*
 
 ### Section 5 Review: Interview Questions & Practice Exercises
 
@@ -503,11 +526,19 @@ $$\sigma = \frac{P - O}{6}$$
 *Worked Example*: $O = 5\text{ days}$, $M = 10\text{ days}$, $P = 27\text{ days}$.
 - Expected value $\mu = \frac{5 + 4(10) + 27}{6} = \frac{72}{6} = 12\text{ days}$.
 - Standard deviation $\sigma = \frac{27 - 5}{6} = 3.67\text{ days}$.
-- **Senior Communication**: "We have a 68% probability of delivering within 8 to 16 days ($\mu \pm 1\sigma$), and a 95% probability of delivering within 5 to 20 days ($\mu \pm 2\sigma$)."
+- **Senior Communication**: "The PERT heuristic gives a mean of 12 days and an approximate spread of 3.67 days. We need distribution assumptions or historical calibration before calling an interval 68% or 95% probable; the familiar normal-distribution percentages do not automatically apply to a skewed task estimate."
 
 ### 6.3 Monte Carlo Forecasting from Empirical Throughput
 Ditch story point velocity estimation. Track historical completed work items per week (throughput). Run 10,000 statistical Monte Carlo trials using past throughput data to forecast completion dates:
 - "Based on our past 12 weeks of delivery data, there is an 85% probability that all 42 backlog items will be completed on or before November 20th."
+
+#### A Forecast Is Conditional on the Work System
+
+Historical throughput is useful only if item sizes, staffing, work-in-progress, and interruption patterns are sufficiently comparable. A backlog that keeps growing or a new external approval dependency breaks a simple fixed-scope forecast. Include blocked time and unfinished work rather than sampling only the easiest completed items.
+
+Distinguish effort from elapsed duration. Summing person-days does not produce a calendar completion date when work runs in parallel, shares specialists, or waits for another team. Model dependencies and capacity, then report a range, the assumptions, the largest risks, and the next forecast update.
+
+**Calibration:** Compare past forecast percentiles with actual outcomes. If work completes before the claimed P90 date only half the time, the forecast is overconfident regardless of how many simulation trials ran. Ten thousand simulations reduce sampling noise, not incorrect assumptions.
 
 ### 6.4 Worked Cone of Uncertainty & Multi-Sprint PERT Portfolio Aggregation
 As established in Steve McConnell's *Software Estimation*, an estimate's accuracy is bounded by the **Cone of Uncertainty**: at initial product conception, even the best engineers face a 4× upper uncertainty multiplier because hidden integration bottlenecks, legacy data anomalies, and compliance requirements have not yet been discovered.
@@ -525,14 +556,16 @@ Uncertainty Multiplier
   0.25x| *
 ```
 
-When aggregating a multi-sprint engineering roadmap (such as the 5-Sprint Distributed Payment Migration analyzed in Section 5.4), remember the three statistical laws of software estimation:
-1. **Expected Durations Sum Linearly:** $\mu_{\text{total}} = \sum_{i=1}^{n} E_i$.
+When aggregating a multi-sprint engineering roadmap (such as the migration analyzed in Section 5.4), make these modeling assumptions explicit:
+1. **Expected Durations Sum for Sequential Work:** $\mu_{\text{total}} = \sum_{i=1}^{n} E_i$. Parallel work requires a dependency and resource-capacity model; the sum is not automatically elapsed project duration.
 2. **Standard Deviations Do NOT Sum Linearly—Variances Sum:** For independent workstreams, $\sigma_{\text{total}} = \sqrt{\sum_{i=1}^{n} \sigma_i^2}$. (Caution: if tasks share a single common-mode risk, such as one external vendor API, their covariance is positive and risks must be modeled as a shared risk item!).
-3. **One-Sided Confidence Commitment ($Z$-Score):**
-   - **50% Confidence (Coin Toss):** $T_{50\%} = \sum E$
-   - **84% Confidence ($+1.0\sigma$):** $T_{84\%} = \sum E + 1.000 \times \sqrt{\sum \sigma^2}$
-   - **90% Confidence ($+1.645\sigma$ two-tailed / $+1.28\sigma$ one-tailed; enterprise conservative standard $+1.645\sigma$):** $T_{90\%} = \sum E + 1.645 \times \sqrt{\sum \sigma^2}$
-   - **95% Confidence ($+1.96\sigma$):** $T_{95\%} = \sum E + 1.960 \times \sqrt{\sum \sigma^2}$
+3. **One-Sided Completion Percentiles under a Normal Approximation:**
+   - **P50:** $T_{50\%} \approx \sum E$ (mean equals median only under the assumed symmetric model).
+   - **P84:** $T_{84\%} \approx \sum E + 1.000 \times \sqrt{\sum \sigma^2}$.
+   - **P90:** $T_{90\%} \approx \sum E + 1.282 \times \sqrt{\sum \sigma^2}$.
+   - **P95:** $T_{95\%} \approx \sum E + 1.645 \times \sqrt{\sum \sigma^2}$.
+
+The value 1.96 describes the upper endpoint of a central two-sided 95% normal interval (a one-sided P97.5), not a one-sided P95 delivery date. If a simulation models the actual dependency structure, use its empirical completion percentiles instead of imposing these normal approximations.
 
 ### Section 6 Review: Interview Questions & Practice Exercises
 
@@ -548,7 +581,7 @@ When aggregating a multi-sprint engineering roadmap (such as the 5-Sprint Distri
    - Workstream B (Token Exchange Middleware): $O=4\text{d}, M=6\text{d}, P=14\text{d}$
    - Workstream C (Silent Password Hash Migration): $O=5\text{d}, M=9\text{d}, P=19\text{d}$
    - Workstream D (Mobile Client Rollout & Cutover): $O=2\text{d}, M=4\text{d}, P=12\text{d}$
-   Calculate $E_i$, $\sigma_i$, and $\sigma_i^2$ for each workstream, then compute $\sum E$, $\sigma_{\text{total}} = \sqrt{\sum \sigma_i^2}$, and the 90% confidence commitment duration ($\sum E + 1.645\sqrt{\sum \sigma_i^2}$).
+   Calculate $E_i$, $\sigma_i$, and $\sigma_i^2$ for each workstream, then compute $\sum E$, $\sigma_{\text{total}} = \sqrt{\sum \sigma_i^2}$, and the approximate P90 duration ($\sum E + 1.282\sqrt{\sum \sigma_i^2}$). State the sequencing, independence, distribution, and calendar assumptions before using it as a forecast.
 2. **Reference Class De-biasing:** Your team estimates that integrating a new European open-banking payment provider (PSD2) will take 3 sprints. However, the last two payment integrations your company completed took 7 sprints and 9 sprints respectively. Write the agenda for a 30-minute estimation calibration workshop using **Reference Class Forecasting** (Daniel Kahneman) to reconcile the team's inside-view optimism with the outside-view historical baseline.
 
 ---
@@ -569,6 +602,12 @@ $$\text{Cost of Delay} = \text{User-Business Value} + \text{Time Criticality} + 
 A small feature with high Cost of Delay should always be prioritized over a massive architectural overhaul with low immediate urgency.
 
 ### 7.3 Saying "No" Diplomatically: The Trade-off Slider
+
+#### Scores Support Judgment; They Do Not Replace It
+
+RICE and WSJF expose assumptions, but precise arithmetic on uncertain inputs does not make a ranking objective. Avoid mixing customer counts, revenue, and arbitrary impact points without agreed units or relative scales. Mandatory legal/security work and hard dependencies may be constraints rather than items competing on a score.
+
+Perform a sensitivity check: if a plausible change in effort or confidence reverses the top two items, gather evidence or make a reversible small bet instead of arguing over decimal places. Include operational toil and coordination cost in effort. Record the decision owner and revisit trigger so a priority survives scrutiny without becoming permanent dogma.
 Never say a flat, emotional "No" to product managers or business executives. Frame your answer as an economic choice:
 > "We can definitely build the Real-Time Notification Service for this sprint. To fit it into our fixed capacity without risking our SLA on the Payment Integration milestone, which of these two existing roadmap features would you like to postpone to next quarter?"
 
@@ -615,6 +654,8 @@ Why do Senior Engineers need **both** RICE and WSJF?
 - **Informed**: Those impacted by the outcome who are notified once the decision is finalized.
 
 ### 8.3 The Pre-Mortem Exercise (Gary Klein)
+
+**Decision closure:** Set a decision deadline, record the alternatives and dissent, and name the person accountable for the outcome. Consensus means concerns were considered, not that every person must prefer the chosen option. "Disagree and commit" does not require concealing new evidence or ignoring a safety, legal, or ethical constraint; define how material new information reopens the decision.
 Before writing code on a major architectural initiative, assemble the team and state:
 > "Imagine it is 6 months from today, and this project has completely failed. The system crashed in production, customer data was corrupted, and we missed our launch deadline by 3 months. Take 10 minutes to write down the exact reasons why we failed."
 This psychological reframing bypasses groupthink and surfaces hidden risks that team members were hesitant to voice.
@@ -873,6 +914,14 @@ In the **Incident Command System (ICS)** (derived from firefighting and Google S
 - **Result**: Quantified business and technical outcome, lessons learned (20% of response).
 
 ### 13.2 Levelling: Mid-Level vs Senior vs Staff Answer
+
+#### Build an Evidence-Based Story Bank
+
+The model answers in this module are illustrative, not scripts to present as personal experience. Use real events, distinguish your decisions from the team's work, and credit collaborators. If a metric was estimated, say how; if no reliable number exists, describe a verifiable qualitative outcome rather than inventing precision.
+
+For each story, capture context, constraints, your specific action, alternatives rejected, outcome, and what you would change now. Prepare for follow-ups: "How was that measured?", "Who disagreed?", "What did you get wrong?", and "Did the improvement persist after you left?" Protect employer and customer confidentiality when choosing details.
+
+**Practice:** Take one successful project and one failure. Give a two-minute version of each, then a deeper technical version. Ask a reviewer to identify your actual contribution, the evidence for impact, and one uncertainty you acknowledged. A credible bounded story is stronger than an unsupported claim of organization-wide transformation.
 - **Prompt**: *"Tell me about a time you had a technical disagreement with a colleague."*
   - *Mid-Level*: "My peer wanted to use Dapper, but I proved EF Core is better by sending him Microsoft documentation. He finally agreed and we used EF Core." (Arrogant, lacks empathy, no trade-off nuance).
   - *Senior*: "A peer wanted to use raw ADO.NET for maximum performance, while I favored EF Core for maintainability. I acknowledged his latency concerns, so we set up a benchmark spike simulating 5,000 queries. We found EF Core compiled queries performed within 3% of raw SQL while saving an estimated 80 engineering hours of manual mapping. He agreed with the data, and we documented the decision in an ADR." (Data-driven, respectful, business-aligned).

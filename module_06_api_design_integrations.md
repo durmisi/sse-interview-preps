@@ -42,7 +42,7 @@ Every section in Part II provides comprehensive senior-level instruction:
 ## Section 2 — RESTful Resource Modeling & Richardson Maturity Model
 - 2.1 Richardson Maturity Model: Level 0 (The Swamp of POX / RPC), Level 1 (Individual Resources), Level 2 (HTTP Verbs), Level 3 (HATEOAS / Hypermedia).
 - 2.2 URI Design & Hierarchy: Nouns over verbs; plural collections (`/api/v1/orders/{id}/lines`); sub-resources vs top-level filters.
-- 2.3 Pagination Mechanics: Offset-based pagination (`page=2&limit=50`) and its performance degradation on large datasets; Keyset / Cursor-based pagination (`cursor=eyJpZCI6MTAxfQ==`) ensuring $O(1)$ database seeks and consistency during real-time writes.
+- 2.3 Pagination Mechanics: Offset-based pagination (`page=2&limit=50`) and its cost at deep offsets; Keyset / Cursor-based pagination with stable ordering, supporting indexes, and explicit consistency limits.
 - 2.4 Asynchronous Long-Running Operations: Handling operations that exceed gateway timeouts; returning `202 Accepted` with a `Location: /api/v1/operations/{id}` polling header.
 
 ## Section 3 — Standardized Error Handling & Problem Details (RFC 9457)
@@ -109,12 +109,12 @@ Understanding method semantics according to RFC 9110 is foundational for designi
 
 | HTTP Method | Safe? | Idempotent? | Cacheable? | RFC 9110 Semantic Meaning |
 |---|---|---|---|---|
-| **GET** | **Yes** | **Yes** | **Yes** | Transfer a current representation of the target resource. Must have zero observable side effects. |
+| **GET** | **Yes** | **Yes** | **Yes** | Retrieve a representation without requesting a business-state mutation; incidental logging is allowed. |
 | **HEAD** | **Yes** | **Yes** | **Yes** | Identical to GET, but server must not transfer the response body. Used to check metadata/ETag. |
 | **POST** | No | **No** | Conditional | Perform resource-specific processing (create child resource, submit form, execute command). |
 | **PUT** | No | **Yes** | No | Replace all current representations of the target resource with the request state. Calling $N$ times produces identical state. |
 | **PATCH** | No | **No** | Conditional | Apply partial modifications to a resource (JSON Patch / JSON Merge Patch). |
-| **DELETE** | No | **Yes** | No | Remove all current representations of the target resource. Deleting an already-deleted resource returns 200 or 204. |
+| **DELETE** | No | **Yes** | No | Remove the target resource's association with its current functionality. Repeated deletion may return a different status, such as 404, without violating idempotency. |
 | **OPTIONS**| **Yes** | **Yes** | No | Query communication capabilities available for the target URI (used heavily in CORS pre-flight). |
 
 #### HTTP Status Code Taxonomy (RFC 9110)
@@ -158,12 +158,18 @@ To prevent the **Lost Update Problem** in concurrent REST APIs without holding d
    ```
 3. If another user modified the order in the interim, its ETag changed to `"v5-bb123"`. The server detects the mismatch and rejects the update with **`412 Precondition Failed`**, completely preventing accidental data overwrites!
 
+**The comparison must be atomic with the update.** Reading a row, checking its version in application code, and then issuing an unconditional update leaves a race. Carry the expected version into the database update predicate (or EF concurrency token) and translate a concurrency failure into `412`. When this API requires a conditional write, a missing precondition can return `428 Precondition Required`. Distinguish this from `409`, which represents a broader conflict with resource state.
+
+Idempotency describes the intended server-side effect, not identical response bytes or status codes on every repetition. It also does not mean a timeout proves the first request failed. This distinction is central to deciding whether a client can safely retry.
+
 #### Cache-Control Directives & Strong vs Weak Validators
 - **`Cache-Control: private, max-age=60, must-revalidate`**: Only the end-user browser may cache; shared CDN/reverse-proxy caches (Cloudflare, YARP) must not store it.
 - **`Cache-Control: public, s-maxage=300, stale-while-revalidate=30`**: Shared CDN caches may serve the representation for 300s and asynchronously refresh stale content in the background for 30s without blocking client requests.
 - **`Cache-Control: no-store`**: Strictly forbids writing the response to any volatile or non-volatile cache (mandatory for sensitive PII/PCI responses).
 - **`Cache-Control: no-cache`**: Allows caching the representation, but forces the client/CDN to revalidate with the origin server via `If-None-Match` before serving it.
 - **Strong ETag (`"v4-a9f83b"`) vs Weak ETag (`W/"v4-a9f83b"`)**: A strong ETag guarantees byte-for-byte identity (including compression/encoding), required for byte-range requests and `If-Match` concurrency checks. A weak ETag indicates semantic equivalence only and **cannot** be used with `If-Match` according to RFC 9110.
+
+**Cache variants and isolation:** When a header changes a cacheable representation, include the appropriate `Vary` policy (for example, `Accept-Language`). A shared cache must not reuse one user's personalized response for another user simply because the URL matches. `Vary` is not an authorization check; choose private/no-store behavior for sensitive endpoints and verify gateway caching rules. A valid `ETag` also does not grant permission to read or update the resource.
 
 ---
 
@@ -229,7 +235,7 @@ In TLS 1.2, establishing a secure session required 2 full network round-trips af
 ### 2.1 Keyset / Cursor Pagination vs Offset Pagination
 
 #### The Offset Pagination Problem (`?page=1000&limit=50`):
-In SQL, `OFFSET 50000 ROWS FETCH NEXT 50 ROWS ONLY` forces the database engine to scan and discard 50,000 index rows before returning 50. As page numbers increase, latency degrades quadratically to dozens of seconds. Furthermore, if new records are inserted while a user navigates, records shift across pages, causing users to see duplicate items or miss rows entirely.
+In SQL, `OFFSET 50000 ROWS FETCH NEXT 50 ROWS ONLY` typically requires finding and discarding the preceding 50,000 qualifying rows before returning 50. Work grows with the offset; repeatedly traversing every page can accumulate quadratic work. Concurrent inserts or deletes can also shift offsets, causing duplicate or missed items.
 
 #### The Keyset / Cursor Pagination Solution:
 Instead of page numbers, the client passes an opaque cursor representing the unique sort key of the last item seen (`?cursor=2024-11-01T10:00:00Z_101`):
@@ -239,7 +245,17 @@ FROM Orders
 WHERE (CreatedAt < @CursorDate) OR (CreatedAt = @CursorDate AND OrderId < @CursorId)
 ORDER BY CreatedAt DESC, OrderId DESC;
 ```
-*Result:* Always executes an instantaneous $O(1)$ index seek regardless of whether the user is on row 50 or row 50,000,000!
+*Result:* With a suitable composite index and selective predicates, the engine can seek to the cursor and read the next page rather than rescan the offset. A useful B-tree cost model is $O(\log n + k)$ for $k$ returned rows, not an unconditional $O(1)$ guarantee. Verify the actual plan, particularly with additional filters.
+
+#### The Cursor Is a Contract
+
+- Include a unique tie-breaker such as `OrderId`; timestamps alone can repeat.
+- Bind the cursor to the sort direction, filters, and API version. Reject incompatible or malformed cursors rather than silently restarting at page one.
+- Base64 is encoding, not integrity protection. Sign a cursor if tampering matters, and always enforce tenant scope independently on the query.
+- Bound page size and response size. Returning `nextCursor` does not require an expensive exact total count.
+- Specify what happens when rows change. Keyset pagination avoids offset shifts, but updates to a sort key can still move an item across the cursor. A point-in-time export may require a snapshot or a fixed immutable watermark.
+
+**Practice:** Page through rows with duplicate timestamps while another client inserts, deletes, and changes sort keys. State which duplicates/misses your contract prevents and which require stronger snapshot semantics.
 
 ---
 
@@ -328,6 +344,14 @@ app.MapGet("/api/v1/operations/{opId}", async (
 ---
 
 ### Section 2 Review: Interview Questions & Practice Exercises
+
+#### Accepted Is Not Completed: Make the Operation Durable
+
+The `ChannelWriter` example demonstrates process-local scheduling only. A process restart can lose queued work after the API returned `202`. For durable acceptance, persist an operation and its dispatch intent atomically, then let a worker publish/process it with retries. Creating a database row and separately publishing to a broker has a crash gap; the transactional outbox in Module 07 closes that gap.
+
+Define operation states (`Pending`, `Running`, `Succeeded`, `Failed`, and cancellation states if supported), ownership checks on the status/result URLs, retry behavior, and retention/expiry. Repeating the original submission with the same idempotency key should locate the same operation. Canceling a request to poll status must not silently cancel the job itself.
+
+**Checkpoint:** Explain recovery when a worker finishes the export but crashes before marking it Succeeded. A stable output key and a resumable/idempotent worker prevent orphaned duplicate exports; a progress percentage alone does not.
 
 #### Interview Questions
 
@@ -503,6 +527,12 @@ public sealed class GlobalDomainExceptionHandler(
    - **Breaking (Requires New Major Version):** Removing or renaming a response property; changing a property type (`int` $\to$ `string` or `object`); adding a **required** request field or tightening validation constraints; changing HTTP status code semantics.
 
 ### 4.2 API Versioning Strategies & Sunset Lifecycle (RFC 8594)
+
+#### Compatibility Includes Meaning, Not Just JSON Shape
+
+An optional field is safe only if omitting it preserves the old behavior. Distinguish absent from explicit `null`, define monetary units and timestamp precision, and document defaults. Changing a field from milliseconds to seconds, sorting results differently, or tightening maximum page size can break clients without changing any schema type.
+
+Test old consumer fixtures against the new provider, including error bodies and unknown enum values. OpenAPI diffing catches structural changes but cannot prove semantic compatibility. Treat status codes and stable Problem Details `type`/extension codes as machine contracts; clients should not parse human-readable `detail` text.
 
 | Versioning Strategy | Example | Pros | Cons |
 |---|---|---|---|
@@ -807,9 +837,31 @@ Client                   API Gateway / Endpoint                  Redis / Databas
 
 ---
 
+#### Completing the Idempotency Protocol
+
+A Redis lock and cached response alone do not prove an operation executed only once. Model an idempotency record with a tenant/client scope, operation name, key, request fingerprint, processing state, and durable outcome:
+
+| Situation | Required decision |
+|---|---|
+| Same key and same request, completed | Return the recorded outcome under the documented replay policy |
+| Same key but different request | Reject key reuse; do not execute the new payload |
+| Same key still processing | Return a documented conflict or operation-status reference, rather than start another execution |
+| Worker crashes after the business commit | Recover from the durable operation record or downstream provider's idempotency contract |
+| Key expires | State the retention window and what prevents a delayed retry from duplicating a business operation |
+
+Claiming a key must be atomic, typically with a unique constraint. For local database mutations, persist the outcome with the mutation in one transaction. For an external charge, pass a stable provider idempotency key and reconcile ambiguous outcomes. A lock lease expiring does not roll back the charge and must not be treated as proof that a new worker can safely repeat it.
+
+**Practice:** Send concurrent identical requests, reuse a key with a changed amount, and simulate a lost response after commit. Expect one business effect, an explicit mismatch rejection, and recovery of the original outcome respectively.
+
+---
+
 ## Section 10 — Webhooks Architecture & Cryptographic Signature Verification
 
 ### 10.1 Verifying HMAC-SHA256 Signatures in Constant Time
+
+**Protocol boundary:** The compact helper below illustrates comparison, not a complete provider-specific verifier. Real integrations must follow the provider's exact signed-message format and operate on the original bounded request bytes. Parsing and reserializing JSON can change whitespace or property order and invalidate a valid signature. Validate the header encoding, decode it, and compare the expected digest bytes with the supplied digest bytes using constant-time comparison.
+
+Verify a signed timestamp against a documented tolerance, support key rotation, and deduplicate authenticated event IDs durably. A valid signature establishes authenticity, not freshness, uniqueness, ordering, or permission to apply the event twice. Acknowledge only after durable acceptance; perform slow processing asynchronously. If durable storage is unavailable, return the documented retryable failure instead of acknowledging and discarding the event.
 
 ```csharp
 public static bool VerifyWebhookSignature(string payload, string signatureHeader, string secret)

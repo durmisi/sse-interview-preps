@@ -305,6 +305,14 @@ Slow CI pipelines destroy developer productivity. If CI takes 45 minutes, develo
   2. *Parallel Test Execution*: `dotnet test --maxcpucount:0 --collect:"XPlat Code Coverage" --filter "Category!=Slow"`.
   3. *Test Slicing / Sharding*: GitHub Actions matrix strategies split 5,000 integration tests across 4 parallel runner nodes.
 
+#### 3. Reproducibility Has Inputs Beyond Source Code
+
+Pin the SDK, resolved dependency graph, build tools, and base-image digest where reproducibility is required. Deterministic compiler output does not make arbitrary package downloads, generated timestamps, or mutable container tags reproducible. Verify locked restore in a clean environment as well as with a warm cache.
+
+A cache is an optimization, not trusted release evidence. Cache keys should reflect inputs, and a cache miss must still produce a correct build. Keep release artifacts separate from caches, attach the source revision, test results, SBOM, and provenance to the exact artifact digest, and retain the prior production artifact for rollback.
+
+**Checkpoint:** Explain why a green build on an old PR revision, or a rebuild from the same branch after dependencies changed, does not verify the artifact being deployed now.
+
 ---
 
 ### Section 4: CI/CD Platforms & Secure Automation: GitHub Actions & Azure DevOps YAML, OIDC Workload Identity
@@ -373,6 +381,12 @@ jobs:
 
 ### Section 5: Continuous Delivery & Pipeline Architecture: Build Once Deploy Many, Env Config & DB Migration Gates
 
+#### Trust Boundaries in the Pipeline
+
+Untrusted pull-request code must not execute with production credentials or on a privileged persistent runner. Separate validation from protected deployment jobs, scope OIDC trust to the intended repository/ref or environment, and restrict the cloud role to the deployment resources it needs. Short-lived tokens reduce credential exposure; they do not make an overprivileged workflow safe.
+
+Verify artifact provenance and approval at promotion time rather than merely accepting an image name supplied by a previous job. Pinning third-party automation to reviewed revisions makes updates explicit, but still requires dependency maintenance. Do not print credentials or sensitive configuration while debugging pipeline failures.
+
 #### 1. Concept & Internal Mechanics
 - **The "Build Once, Deploy Many" Principle**:
   - A build artifact (Docker image, ZIP package, NuGet package) must be compiled and packaged **exactly once**.
@@ -385,6 +399,14 @@ jobs:
     1. Generate idempotent SQL migration script: `dotnet ef migrations script --idempotent --output migration.sql`.
     2. Execute migration script via an isolated pipeline task or Kubernetes `Job` using dedicated elevated credentials.
     3. Deploy the application code only after the database migration succeeds.
+
+#### Promotion Is a Versioned Release Record
+
+Promote the exact tested digest, not a mutable tag that could point at different bytes later. Record the configuration version, database compatibility range, feature-flag state, and deployment target with it. The same binary can behave differently under a changed timeout or connection string; configuration changes need validation and rollback too.
+
+Serialize conflicting deployments and migrations so two pipelines cannot race to promote incompatible versions. A successful migration command is not proof of backward compatibility: verify that the old application can still run during rollout and rollback. Contract/destructive migrations belong after old readers and writers have retired, not in the same step that introduces the new code.
+
+**Practice:** Define release evidence for an API build whose schema expands now and contracts two releases later. Name the earliest safe contraction point and the signal that would stop promotion.
 
 ---
 
@@ -400,7 +422,15 @@ jobs:
 | **Canary** | Route small percentage (e.g. 5%) of live traffic to v2; verify telemetry/error rates; progressively increase to 100%. | Controlled incremental (5% -> 25% -> 100%) | Zero | Low (+10-20% capacity) | Instant (Route 100% back to baseline) |
 | **Shadow / Dark Launch** | Production requests are duplicated; response from v2 is discarded. Compares latency and accuracy under real traffic. | Dual-routed read traffic | Zero | Medium (Requires shadow infrastructure) | Zero risk (Live users never see v2) |
 
-#### 2. Feature Flags with Azure App Configuration & .NET
+#### 2. Progressive Delivery Needs a Decision Rule
+
+Before rollout, define the eligible cohort, observation window, minimum useful sample, success/error/latency signals, and automatic stop conditions. Compare canary and baseline under similar traffic; a 1% canary with three requests is not meaningful evidence of a rare failure rate. Include a business invariant such as successful checkout completion, not just process health.
+
+Keep assignment stable for a user or tenant when switching behavior mid-workflow would be unsafe. Treat a flag as a temporary operational capability with an owner, expiry, removal task, and tested on/off behavior. Measure propagation delay: a cached flag with a 30-second refresh interval cannot guarantee an instantaneous global kill switch.
+
+Shadow traffic must be prevented from creating real side effects and must have a resource budget so it cannot overload the primary path. Blue-green routing rollback is also insufficient if green wrote data that blue cannot interpret. Deployment topology alone does not guarantee zero downtime or zero risk.
+
+#### 3. Feature Flags with Azure App Configuration & .NET
 ```csharp
 // Program.cs
 builder.Configuration.AddAzureAppConfiguration(options =>
@@ -483,6 +513,17 @@ Misconfiguring Kubernetes probes causes cascading outages during rolling updates
 - **Startup Probe**: Determines if the application has completed initialization (e.g., JIT warmup, EF Core metadata caching). While startup probe runs, liveness and readiness checks are disabled.
 - **Liveness Probe**: Determines if the container process is alive and responsive. If it fails, kubelet **kills the container and restarts it**. *Anti-pattern*: Checking database connectivity in a liveness probe! If the database has a momentary outage, Kubernetes kills all API pods simultaneously, causing a catastrophic self-inflicted cascade.
 - **Readiness Probe**: Determines if the pod is ready to accept incoming user network traffic. If it fails, Kubernetes **removes the pod's IP from the Service endpoints / load balancer**. Database checks belong here.
+
+**Readiness is a routing decision:** Include a dependency only when its failure makes this pod unable to serve its intended traffic. If every pod depends on the same unavailable optional cache, removing all pods may be worse than serving a degraded path. Use cheap bounded checks, appropriate thresholds, and an explicit dependency/degradation policy.
+
+#### Graceful Shutdown Is a Timed Protocol
+
+1. Stop accepting new work and allow readiness/routing changes to propagate; existing connections may still arrive briefly.
+2. Drain in-flight requests and stop taking new messages while observing the host's shutdown token.
+3. Complete and acknowledge only work whose durable effects are committed. Leave unfinished work recoverable for redelivery.
+4. Flush essential telemetry and dispose owned resources within the remaining termination budget.
+
+Coordinate ingress draining, any `preStop` hook, host shutdown timeout, and the platform termination grace period. Hook execution consumes that grace period; adding independent timeout values does not create more time. Test termination under load and a forced stop after the deadline. Idempotency and durable recovery are still necessary because shutdown can be abrupt.
 
 ```yaml
 apiVersion: apps/v1
@@ -650,7 +691,19 @@ requests
 Traditional threshold alerting ("alert if error rate > 2% over 5 minutes") creates endless false alarms. Google SRE best practice uses **Burn Rate Alerts** tied to your Service Level Objective (SLO):
 - If your SLO is 99.9% availability over 30 days, your error budget is 0.1%.
 - A burn rate of 14.4 consumes 2% of your 30-day error budget in 1 hour. This triggers a page (wake up on-call).
-- A burn rate of 6 consumes 5% of your error budget in 6 hours. This creates a ticket (next business day).
+- A burn rate of 6 consumes 5% of your error budget in 6 hours. Choose page versus ticket routing according to the sustained impact and response policy; this is often a paging condition.
+
+#### Deriving the Alert Instead of Memorizing Thresholds
+
+For a request-based SLO, burn rate is the observed bad-request fraction divided by the allowed bad-request fraction:
+
+$$B = \frac{\text{observed error fraction}}{1-\text{SLO}}$$
+
+At 99.9%, a 1.44% error fraction gives $B=14.4$. Under comparable traffic rates, a burn sustained for $t$ hours consumes approximately $B\times t/720$ of a 30-day budget. This explains the 2% in one hour calculation; changing traffic volume changes the relationship between time and a request-count budget.
+
+Pair a longer window (sustained budget consumption) with a shorter window (the failure is still happening), and require both conditions according to the alert policy. Define how zero/low traffic and missing telemetry behave. A quiet metric can mean no customers, no errors, or a broken collector; those are different states.
+
+Every page needs a user-impact description, an owner, and a runbook with a safe first action. Put request IDs and other unbounded identifiers in logs/traces rather than metric labels, and verify telemetry redaction and sampling policies. Observability that exhausts its own storage budget becomes another reliability risk.
 
 ---
 
@@ -667,7 +720,11 @@ Traditional threshold alerting ("alert if error rate > 2% over 5 minutes") creat
 - **Operations / Technical Lead**: Directs debugging, log analysis, and mitigation steps.
 
 #### 3. Principle: Mitigate First, Debug Later
-In a Sev-1 outage, your goal is **time to restore service**, not identifying the root cause. If a deployment caused the issue, **roll back immediately**. If memory is exhausted, restart or scale out immediately. Preserve memory dumps/logs to a secondary volume and restore customer traffic before conducting deep debugging.
+In a Sev-1 outage, prioritize **safe service restoration** over completing root-cause analysis. Choose the smallest reversible mitigation supported by evidence: stop a rollout, disable the affected feature, shed load, or revert to a compatible artifact. Check schema compatibility before rollback and downstream capacity before scaling. Restarting every instance can destroy useful evidence or worsen a shared-dependency outage.
+
+Keep a timestamped incident log of observations, hypotheses, actions, and outcomes. Assign one owner to each change so responders do not apply conflicting fixes. Separate confirmed facts from suspicions in updates and state when the next update will arrive. Preserve necessary diagnostic evidence securely when feasible without delaying urgent mitigation.
+
+Recovery is not merely "pods are green": verify the customer journey, reconcile pending or duplicated operations, drain backlogs safely, and monitor for recurrence before closing. A postmortem action should have an owner, due date, and verification criterion; "be more careful" does not change the system.
 
 #### 4. The Blameless Postmortem Structure
 Blame produces fear; fear produces concealment of mistakes. A blameless postmortem investigates system failure modes:

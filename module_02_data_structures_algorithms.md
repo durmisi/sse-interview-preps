@@ -90,7 +90,7 @@ Every section in Part II provides comprehensive senior-level instruction:
 - 7.7 Minimum Spanning Tree (MST): Kruskal's algorithm (greedy + DSU) vs Prim's algorithm.
 
 ## Section 8 — Searching & Binary Search on Answer Space
-- 8.1 Binary Search Mechanics: Exact match, lower bound (first occurrence), upper bound (last occurrence); avoiding integer overflow in midpoint calculation.
+- 8.1 Binary Search Mechanics: Exact match, lower bound (first value >= target), upper bound (first value > target); avoiding integer overflow in midpoint calculation.
 - 8.2 Rotated & Transformed Sorted Arrays: Binary search in rotated sorted array; search in 2D sorted matrix.
 - 8.3 Binary Search on Answer Space (Monotonic Predicates): Identifying monotonicity ($FFFFTTTT$); capacity allocation, shipping packages within D days, Koko eating bananas.
 
@@ -256,7 +256,22 @@ When inserting $n$ elements:
 
 ---
 
-### 1.6 Complexity vs Hardware Cache Reality
+### 1.6 Space Complexity and the Cost Model
+
+Always say what the input size measures and which operations you count. A dictionary lookup is expected $O(1)$ in the number of entries, but hashing a previously unhashed string of length $m$ takes $O(m)$ work. Comparing two strings can also inspect $O(m)$ characters. An adjacency-list graph traversal is $O(V+E)$, not simply $O(n)$ without defining $n$.
+
+Distinguish three memory quantities:
+- **Input storage:** The caller's existing array or graph.
+- **Auxiliary space:** Extra live memory needed by the algorithm, including recursion frames, queues, lookup tables, and temporary buffers.
+- **Output storage:** Memory needed to represent the answer. State whether your reported space includes it; returning all subsets necessarily produces exponentially large output.
+
+A recursive tree traversal uses $O(h)$ stack space, where $h$ is tree height. That is $O(\log n)$ for a balanced tree but $O(n)$ for a chain. An iterative version avoids call-stack exhaustion but still needs an explicit stack. "No recursion" does not mean "constant space."
+
+**Allocation versus retention:** A streaming iterator may retain only one result at a time while allocating an object for every result over its lifetime. Conversely, a tiny `ReadOnlyMemory<T>` slice can retain a large backing array. Report peak live memory separately from total allocation when discussing GC pressure.
+
+**Checkpoint:** For a pipeline that sorts all inputs and then yields the first ten, explain why returning `IEnumerable<T>` does not make the sort streaming or its memory cost $O(10)$.
+
+### 1.7 Complexity vs Hardware Cache Reality
 
 Two algorithms with identical $O(n)$ asymptotic complexity can exhibit vastly different runtimes due to CPU hardware architecture:
 1. **Cache Lines (64 bytes):** When the CPU reads an address from RAM, it loads a contiguous 64-byte line into L1 cache.
@@ -470,13 +485,19 @@ public static int RemoveDuplicates(Span<int> nums)
 
 ### 3.2 Sliding Window Technique
 
-#### Variable-Length Window: Longest Substring Without Repeating Characters ($O(n)$ Time, $O(k)$ Space)
+#### Why the Window Can Move Only Forward
+
+A window algorithm needs an invariant that justifies discarding every position it passes. In the unique-substring problem, a repeated character at index $j$ forces the left boundary past its previous occurrence only if that occurrence is still inside the current window. Each boundary advances at most $n$ times, so an inner shrinking loop does not automatically make the algorithm quadratic.
+
+For sum constraints, check the input domain first. With non-negative values, extending a window cannot decrease its sum. Negative values break that argument: for `[4, -2, 1]` and an upper limit of `3`, discarding `4` immediately misses the valid full window. Prefix sums, a map, or a monotonic deque may be needed instead, depending on the question.
+
+#### Variable-Length Window: Longest Substring Without Repeating UTF-16 Code Units ($O(n)$ Expected Time, $O(k)$ Space)
 ```csharp
 public static int LengthOfLongestSubstring(string s)
 {
+    ArgumentNullException.ThrowIfNull(s);
     ReadOnlySpan<char> span = s.AsSpan();
-    Span<int> lastIndex = stackalloc int[256];
-    lastIndex.Fill(-1);
+    var lastIndex = new Dictionary<char, int>();
 
     int maxLength = 0;
     int windowStart = 0;
@@ -484,18 +505,22 @@ public static int LengthOfLongestSubstring(string s)
     for (int windowEnd = 0; windowEnd < span.Length; windowEnd++)
     {
         char c = span[windowEnd];
-        if (c < 256 && lastIndex[c] >= windowStart)
+        if (lastIndex.TryGetValue(c, out int previousIndex) && previousIndex >= windowStart)
         {
-            windowStart = lastIndex[c] + 1;
+            windowStart = previousIndex + 1;
         }
 
-        if (c < 256) lastIndex[c] = windowEnd;
+        lastIndex[c] = windowEnd;
         maxLength = Math.Max(maxLength, windowEnd - windowStart + 1);
     }
 
     return maxLength;
 }
 ```
+
+Here $k$ is the number of distinct code units encountered. This supports the full `char` range, but it does not count grapheme clusters or Unicode scalar values. Define the problem's unit before choosing `char`, `Rune`, or text elements (Section 3.5).
+
+**Trace checks:** Empty input returns `0`; `"abba"` returns `2` without moving the left boundary backward; `"\u0100\u0100"` returns `1`, exposing the bug in implementations that silently ignore characters outside a 256-entry table.
 
 ---
 
@@ -1137,6 +1162,20 @@ public sealed class SkipList<TKey, TValue> where TKey : IComparable<TKey>
 
 ## Section 7 — Graphs, Traversals & Shortest Paths
 
+#### Before the Algorithms: Representation and Visited-State Invariants
+
+An adjacency list uses $O(V+E)$ storage and scans each vertex's actual neighbors. A matrix uses $O(V^2)$ storage, offers constant-time edge checks, and requires scanning a whole row to enumerate neighbors. State whether edges are directed and whether duplicates, self-loops, or disconnected vertices are allowed.
+
+| Traversal | What the frontier means | Correctness trap |
+|---|---|---|
+| BFS with a FIFO queue | Vertices discovered in nondecreasing unweighted distance | Mark visited when enqueuing, not only when dequeuing, to prevent repeated enqueues |
+| DFS with recursion or an explicit stack | The current exploration path and deferred branches | One traversal from a start vertex does not visit disconnected components |
+| Directed cycle detection | White = unseen, gray = active, black = fully explored | An edge to gray proves a cycle; an edge to black does not |
+
+Store predecessor links when discovering vertices if the required output is an actual path rather than reachability or distance. Reconstruct only after finding the target; copying the whole path at each expansion changes the cost model.
+
+**Practice:** Trace a diamond-shaped DAG and a disconnected graph. Explain why two paths reaching the same completed vertex do not imply a directed cycle, and why ordinary BFS cannot minimize arbitrary weighted path cost.
+
 ### 7.1 Topological Sort with Kahn's Algorithm & Cycle Detection
 
 Topological sorting produces a linear ordering of vertices in a Directed Acyclic Graph (DAG) such that for every directed edge $U \to V$, $U$ comes before $V$.
@@ -1341,9 +1380,20 @@ public static int LowerBound(ReadOnlySpan<int> array, int target)
             low = mid + 1; // Search right half
     }
 
-    return low; // First index where array[index] >= target
+    return low; // First index with value >= target, or array.Length if none
 }
 ```
+
+#### Proving the Boundary Contract
+
+Assume the array is sorted ascending. Maintain these facts at every iteration:
+1. Every index before `low` contains a value less than the target.
+2. Every index at or after `high` contains a value greater than or equal to the target.
+3. The undecided interval is `[low, high)` and strictly shrinks.
+
+When `low == high`, no undecided elements remain. The returned insertion position may equal `array.Length`; check that bound before testing equality. Empty input returns `0` without indexing the array.
+
+**Lower versus upper bound:** Lower bound finds the first value `>= target`; upper bound finds the first value `> target`, not the last occurrence itself. For `[1, 2, 2, 4]` and target `2`, the bounds are `1` and `3`, so the equal range is `[1, 3)` and the occurrence count is `2`. Change the comparison, not the interval convention, when deriving upper bound.
 
 ---
 
@@ -1637,6 +1687,20 @@ private static void Backtrack(int startIndex, int[] nums, List<int> currentPath,
 ---
 
 ### 10.2 Dynamic Programming Archetypes
+
+#### Derive the State Before Writing the Table
+
+Start with a sentence: "After considering the first $i$ items, $dp[i,w]$ is the best value achievable with capacity at most $w$." This supplies the recurrence, base cases, and dependency order rather than leaving them as memorized syntax.
+
+1. **State:** Include exactly the information needed to make future decisions. If prior choices affect which moves remain legal, leaving them out creates an invalid recurrence.
+2. **Transition:** Enumerate the last decision (take or skip an item) and connect it to smaller states.
+3. **Base and impossible states:** For "at most capacity," choosing nothing has value zero. For "exactly capacity," an unreachable state is not zero; represent it separately or use a carefully guarded sentinel.
+4. **Evaluation order:** Compute dependencies first. Memoization and tabulation are two execution strategies for the same state graph.
+5. **Output:** A best score is not the selected items. Keep predecessors or reconstruct from the full table when the actual choices are required.
+
+The one-row knapsack optimization below works because descending capacity reads the previous item's state. Ascending capacity would reuse the current item and implement an unbounded variant. Also, $O(nW)$ is **pseudo-polynomial**: it depends on the numeric capacity, not just the number of bits used to encode it.
+
+**Checkpoint:** Trace one item of weight `2`, value `3`, and capacity `4`. Descending updates must return `3`; ascending updates return `6`. Explain the difference before attempting space compression on another DP problem.
 
 #### Archetype 1: 0/1 Knapsack (Bounded Resource Optimization)
 Given item weights and values, find maximum value fitting capacity $W$:

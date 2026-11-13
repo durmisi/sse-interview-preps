@@ -77,6 +77,8 @@ Every section in Part II provides comprehensive senior-level instruction:
 - 6.4 `ConfigureAwait(false)`: Purpose, when to use it (libraries) vs when not needed (modern ASP.NET Core lacks a `SynchronizationContext`).
 - 6.5 `Task` vs `ValueTask`: Allocation overhead of `Task<T>`; when `ValueTask<T>` eliminates allocations on synchronous paths; `IValueTaskSource`.
 - 6.6 Async Anti-Patterns: Sync-over-async (`.Result`, `.Wait()`, `.GetAwaiter().GetResult()`) causing ThreadPool starvation; `async void` exceptions crashing processes.
+- 6.7 Cancellation, Timeouts & Deadlines: Cooperative cancellation, linked tokens, canceled waits versus canceled work, and the point of no cancellation.
+- 6.8 Task Composition & Bounded Concurrency: `WhenAll`, `WhenAny`, failure observation, backpressure, and owned background work.
 
 ## Section 7 — Threading, Concurrency, Synchronization & Memory Model
 - 7.1 Operating System Threads vs ThreadPool: Thread stack size (1MB default on Windows), context switching cost; ThreadPool worker threads and I/O completion threads.
@@ -726,6 +728,14 @@ public static void ComputeHmac(ReadOnlySpan<byte> secretKey, ReadOnlySpan<byte> 
 3. **Use-After-Return Corruption:** Keeping a reference to `rentedBuffer` after calling `Return` causes two concurrent threads to mutate the exact same array simultaneously—one of the hardest concurrency bugs to diagnose in production.
 4. **Pool Starvation:** Failing to return buffers on exception paths exhausts the pool buckets, forcing `ArrayPool` to fall back to allocating brand-new arrays on the GC heap on every request.
 
+#### Ownership Across an Async Boundary
+
+`Memory<T>` permits a buffer reference to survive an `await`; it does not grant ownership or extend a rental's valid lifetime. If an asynchronous write still uses a rented array, the owner must await that write before returning the array. Passing `ReadOnlyMemory<T>` prevents mutation through that view, not through another reference to the same storage.
+
+Write down an ownership rule for each buffer: who rents it, who may read or mutate it, and which completion event permits its return. If work is transferred to a queue, either copy the needed bytes or transfer an explicit owner (for example, `IMemoryOwner<T>`) whose consumer disposes it. Never let both producer and consumer believe they own disposal.
+
+**Trade-off:** Pooling reduces allocation churn but may increase retained memory. A pool miss can allocate, and a rent/return cycle is not inherently zero-allocation under every workload. Benchmark steady-state and burst behavior, including the cost of clearing sensitive buffers.
+
 ---
 
 ### Section 3 Review: Interview Questions & Practice Exercises
@@ -1073,6 +1083,8 @@ When awaiting a task (`await task.ConfigureAwait(false)`), the flag instructs th
 - **Shared NuGet Libraries / SDKs:** Always use `ConfigureAwait(false)` in reusable libraries! You do not know if a consumer will call your library from a WPF desktop app, a legacy ASP.NET host, or an xUnit test runner with a custom concurrency-limiting `SynchronizationContext`.
 - **.NET 8+ `ConfigureAwaitOptions`:** Modern .NET allows `await task.ConfigureAwait(ConfigureAwaitOptions.SuppressThrowing | ConfigureAwaitOptions.ContinueOnCapturedContext)`.
 
+**Two independent concepts:** `ConfigureAwait(false)` changes continuation scheduling; it does not suppress `ExecutionContext`, erase `AsyncLocal<T>` state, or guarantee a different thread. An already-completed awaitable can continue synchronously. Avoid using it as a fix for shared-state races or as a promise that UI-bound code is safe afterward.
+
 ```csharp
 // ANTI-PATTERN 1: Eliding async/await inside a using block!
 public Task<string> ReadFileBrokenAsync(string path)
@@ -1090,6 +1102,37 @@ public async Task<string> ReadFileSafeAsync(string path)
     return await reader.ReadToEndAsync().ConfigureAwait(false);
 }
 ```
+
+---
+
+### 6.7 Cancellation, Timeouts & Deadlines
+
+A `CancellationToken` is a cooperative signal, not a mechanism for terminating a thread. Passing a token only helps if the callee observes it. CPU loops need explicit checkpoints; asynchronous I/O should receive the token through supported APIs. Dispose a linked `CancellationTokenSource` after the operation to release its registrations.
+
+| Mechanism | What it changes | What it does not establish |
+|---|---|---|
+| Caller cancellation | Requests that unnecessary work stop | That no side effect already occurred |
+| `CancelAfter` on an operation's token source | Schedules a cancellation request | That the operation obeys the token or stops immediately |
+| `task.WaitAsync(timeout)` | Limits how long this caller awaits the task | That the original task is canceled or its resources can be disposed |
+| End-to-end deadline | Bounds the total budget, including queueing and retries | That every dependency honors the budget automatically |
+
+**The point of no cancellation:** Before committing a database change, cancellation can prevent unnecessary work. After a durable side effect, do not report "nothing happened" merely because the client disconnected. Finish essential bookkeeping using an explicitly owned, bounded lifetime, or recover from durable state. This is not permission to ignore cancellation everywhere; it is a reason to define the operation's commit boundary.
+
+Classify `OperationCanceledException` using the operation's token and timeout policy. Expected caller cancellation is different from a dependency timeout or a programming failure. Do not translate all three into an empty result or a generic success response.
+
+**Interview check:** A caller times out waiting for an upload and returns its pooled buffer. Explain why the upload can still be reading that buffer, and how to coordinate cancellation, completion observation, and disposal.
+
+### 6.8 Task Composition & Bounded Concurrency
+
+`Task.WhenAll` joins tasks; it neither limits how many operations were started nor automatically cancels siblings after a fault. It completes after all supplied tasks finish. If several fail, the combined task records their exceptions; `await` propagates one exception, so inspect the combined task's `Exception` when all failures are needed for diagnosis. Faults take precedence over cancellation in the combined outcome.
+
+`Task.WhenAny` identifies the first completed task, even if that task faulted or was canceled. Await the winning task to observe its outcome. Losing operations continue unless you cancel them cooperatively and observe their completion. A timeout implemented with `WhenAny` alone can therefore leave expensive work running.
+
+**Avoid unbounded fan-out:** Creating one task per item for a million-item input can exhaust memory, sockets, or database connections. A semaphore can limit active I/O, but materializing a million tasks waiting on it still retains a million tasks. Use bounded channels with a fixed worker count, or `Parallel.ForEachAsync` with an explicit degree of parallelism appropriate to the downstream resource. CPU count is not automatically the correct I/O concurrency limit.
+
+**Background work needs an owner:** An ASP.NET Core request must not discard a task that captures its scoped services. Short-lived process-owned work can use a bounded hosted-service queue with fresh scopes, exception reporting, and a shutdown policy. Work that must survive process failure needs durable storage or messaging; a hosted service alone provides no durability.
+
+**Practice:** Design a 10,000-item importer with at most eight active writes and a bounded pending queue. Explain how it reports failures, stops accepting work on shutdown, and ensures a request-scoped `DbContext` is never shared across concurrent writes.
 
 ---
 
@@ -1286,7 +1329,7 @@ dotnet-counters monitor -p <PID> --counters System.Runtime,Microsoft.AspNetCore.
 - `cpu-usage`: Percentage of CPU cores utilized.
 - `allocation-rate`: Bytes allocated per second (ephemeral churn indicator).
 - `gen-2-gc-count`: High frequency indicates memory retention or LOH pressure.
-- `threadpool-queue-length`: Non-zero values indicate ThreadPool starvation!
+- `threadpool-queue-length`: Sustained growth alongside delayed work can indicate ThreadPool starvation; a brief non-zero queue is normal under load.
 
 #### 2. `dotnet-trace` (CPU Profiling & Flame Graphs)
 ```bash
@@ -1314,6 +1357,22 @@ dotnet-dump analyze core_<PID>
 ---
 
 ### 9.2 Benchmarking Methodology with BenchmarkDotNet
+
+#### Diagnose Before Tuning
+
+Treat counters as evidence for competing hypotheses, not diagnoses by themselves:
+
+| Observation | Next evidence to collect | Premature conclusion to avoid |
+|---|---|---|
+| Latency and queued work rise while CPU is modest | Blocked worker stacks, thread-count trend, downstream waits | "Add more CPUs" |
+| CPU is saturated and throughput flattens | CPU samples, hot loops, contention, container throttling | "Every slow request is an async bug" |
+| Allocation rate is high but post-GC live size is stable | Allocation stacks and GC pause time | "The application leaks memory" |
+| Comparable post-GC heap snapshots keep growing | Retaining paths to roots and cache cardinality | "Force a GC on every request" |
+| Process memory grows while managed live memory does not | Native allocations, stacks, mappings, and pooled buffers | "The managed heap accounts for all memory" |
+
+Record runtime version, GC mode, input distribution, concurrency, and container limits with a measurement. Run release builds without an attached debugger, allow warm-up, and consume benchmark results so work cannot be optimized away. A faster microbenchmark is not proof of better end-to-end p99 latency; repeat the production-like workload and check correctness as well as throughput.
+
+**Operational caution:** Dumps and traces can contain credentials and personal data and can impose collection overhead. Use approved collection/storage procedures, restrict access, and choose the least intrusive evidence that answers the question.
 
 ```csharp
 [MemoryDiagnoser] // Measures managed allocations

@@ -52,7 +52,7 @@ Every section in Part II provides comprehensive senior-level instruction:
 
 ## Section 4 — Replication Mechanics, Quorums & Consensus Protocols
 - 4.1 Replication Topologies: Single-Leader (Active-Passive), Multi-Leader (Active-Active), Leaderless (Dynamo-style).
-- 4.2 Quorum Math: Given $N$ replicas, read quorum $R$, and write quorum $W$: if $R + W > N$, the read quorum overlaps with the write quorum, guaranteeing at least one node returns the latest value.
+- 4.2 Quorum Math: Given $N$ replicas, read quorum $R$, and write quorum $W$: $R + W > N$ guarantees set overlap under a fixed replica set, not linearizability by itself.
 - 4.3 Conflict Resolution: Last-Write-Wins (LWW) and silent data loss; Conflict-Free Replicated Data Types (CRDTs: G-Counter, PN-Counter, OR-Set).
 - 4.4 Consensus Fundamentals: Paxos and Raft overview; Leader Election, Log Replication, Split-Brain prevention via majority quorums ($\lfloor N/2 \rfloor + 1$).
 - 4.5 Distributed Locking & Fencing Tokens: Why Redis Redlock is controversial; Martin Kleppmann's critique; using Fencing Tokens to prevent split-brain zombies.
@@ -63,7 +63,7 @@ Every section in Part II provides comprehensive senior-level instruction:
 
 ## Section 6 — Messaging Architectures: Queues, Topics & Event Streams
 - 6.1 Brokers vs Event Streams: Message Queues (RabbitMQ, Azure Service Bus) vs Partitioned Log Streams (Apache Kafka, Azure Event Hubs).
-- 6.2 Azure Service Bus Deep Dive: Queues vs Topics/Subscriptions; Message Sessions (FIFO ordering guarantees across sessions); Peek-Lock vs Receive-and-Delete; Duplicate Detection window; Scheduled messages.
+- 6.2 Azure Service Bus Deep Dive: Queues vs Topics/Subscriptions; Message Sessions (ordering within a session, not across sessions); Peek-Lock vs Receive-and-Delete; Duplicate Detection window; Scheduled messages.
 - 6.3 Apache Kafka / Event Hubs Deep Dive: Partitions as the unit of parallelism; Consumer Groups; Offset management (commit after processing); Log Compaction.
 - 6.4 Message Semantics: Commands (intent to act, one receiver) vs Events (facts that occurred, zero-to-many subscribers).
 
@@ -117,6 +117,14 @@ In a distributed system, **Partial Failure** is the baseline condition:
   3. Node B is still running slowly and will finish 10 seconds later.
 
 *Senior Engineering Rule:* **In a distributed system, an unanswered request is neither success nor failure—it is unknown.** Systems must be designed assuming timeouts will happen constantly.
+
+#### Safety and Liveness Are Different Promises
+
+**Safety** means something invalid never happens: one seat is not confirmed for two buyers, or a committed ledger entry is not silently overwritten. **Liveness** means progress eventually happens under stated assumptions: an accepted job eventually completes when dependencies recover.
+
+A system that refuses every booking preserves the no-double-booking invariant but has no useful liveness. A system that accepts bookings during every partition may be available while violating that invariant. In an interview, name both the invariant and the conditions needed for progress; "highly available and consistent" is not precise enough.
+
+A timeout is a failure-detector suspicion, not proof that a process is dead. Treat a paused worker as capable of returning later. Leases, fencing, idempotency, and reconciliation exist because different nodes cannot reliably distinguish a failed peer from a delayed one.
 
 ---
 
@@ -433,10 +441,12 @@ Given $N$ replicas:
 
 #### The Strict Quorum Rule:
 $$R + W > N$$
-If this inequality holds, the Pigeonhole Principle guarantees that **at least one node in the Read Quorum participated in the most recent Write Quorum**, ensuring the client observes the latest version (when resolved via version vectors).
+If read and write responses come from the same fixed set of $N$ replicas, this inequality guarantees their sets intersect. Intersecting a completed write's quorum is useful, but the read protocol must still identify and return an appropriate version. Concurrent writes, incomplete writes, replica replacement, and conflict resolution prevent the inequality alone from proving linearizability.
 
-*Example:* $N = 3, W = 2, R = 2 \implies 2 + 2 = 4 > 3$ (Strong Consistency).
+*Example:* $N = 3, W = 2, R = 2 \implies 2 + 2 = 4 > 3$: every two-node read set overlaps every two-node write set. This is an overlap guarantee, not a complete strong-consistency protocol.
 If you configure $W = 1, R = 1 \implies 1 + 1 = 2 < 3$ (Eventual Consistency, low latency, high availability).
+
+**Worked failure question:** A write reaches replica A but times out before reaching its required second replica. A later read may observe that value even though the writer received no success acknowledgement. Does your contract allow this, and how are conflicting versions resolved? Counting responses does not answer either question. Sloppy quorums using substitute replicas can also remove the intended overlap; eventual convergence still requires repair and a defined conflict policy.
 
 ---
 
@@ -913,6 +923,10 @@ public sealed class IdempotentPaymentConsumer(
 
 ### 7.3 Poison Messages, Dead-Letter Queues (DLQ) & Automated Replay Pipelines
 
+**Inbox boundary check:** The preceding consumer must distinguish a violation of its specific inbox uniqueness rule from other unique-constraint failures. SQL error codes alone cannot prove that an invoice or business-key conflict is a harmless duplicate. Roll back, verify the committed inbox marker using fresh state, and only then acknowledge a duplicate; otherwise surface the failure. Scope the key by consumer so independent subscribers can each process the same event.
+
+Deduplication retention must cover the actual redelivery and replay horizon, including disaster recovery and manual DLQ replay, not just the broker's duplicate-detection window. If old messages can be replayed indefinitely, durable business-operation keys may need to outlive short-lived inbox rows.
+
 A **Poison Message** is a message that can never be processed successfully regardless of how many times it is retried (e.g., malformed JSON schema, `NullReferenceException` due to missing lookup reference, or a violated business invariant).
 
 If a consumer blindly abandons poison messages forever, they loop infinitely at the head of the queue, consuming CPU/DB resources and blocking valid messages behind them!
@@ -925,6 +939,12 @@ If a consumer blindly abandons poison messages forever, they loop infinitely at 
    - A Dead-Letter Queue is **not** a trash can; it is a hospital triage ward.
    - Configure Azure Monitor alerts whenever `DeadLetterMessageCount > 0`.
    - Build a controlled **DLQ Replay Tool / Admin Endpoint** that reads messages from `queueName/$DeadLetterQueue`, inspects the `DeadLetterReason`, allows engineers to deploy a bug fix, and re-publishes the messages back to the main queue while preserving the original `MessageId` and `CorrelationId`.
+
+#### Ordering Is Scoped, and Replay Is a New Workload
+
+Kafka ordering is per partition; Service Bus session ordering is within a session, not across sessions. Parallel processing or retries can still change the order in which side effects finish. Choose an aggregate/session key, define sequence or version checks, and decide whether a gap causes buffering, retry, or reconciliation. Independent entities rarely need one global order.
+
+Replay slowly after fixing the root cause. Preserve business identity, record the replay attempt separately, and monitor failure rate, backlog age, and downstream load. A broker's duplicate-detection window can suppress a republished transport message with the same ID; plan transport replay identity without defeating business-level deduplication. Replaying a million messages at once can recreate the original outage.
 
 ---
 
@@ -945,6 +965,14 @@ If a consumer blindly abandons poison messages forever, they loop infinitely at 
 ## Section 8 — Distributed Reliability Patterns (Polly v8, Circuit Breakers)
 
 ### 8.1 Transient vs Non-Transient Failures & Exponential Backoff with Full Jitter
+
+#### One Retry Budget Across the Call Chain
+
+If three nested layers each make up to three attempts, one logical request can produce up to $3^3=27$ deepest-dependency attempts. Jitter spreads those attempts over time but does not reduce the total work. Choose which layer owns retries, cap attempts and elapsed time, and avoid retrying after the caller's useful deadline has passed.
+
+Reserve time for queueing, connection acquisition, response handling, and cleanup. Retry only when the operation is safe to repeat and the failure is plausibly transient; respect server retry guidance within the remaining budget. Hedging creates additional concurrent attempts and therefore needs an even stricter safety and load budget.
+
+**Checkpoint:** A two-second request budget calls a dependency with a one-second attempt timeout. Explain why three attempts plus backoff cannot fit, and which work should be rejected or stopped instead of queued.
 
 When a downstream microservice returns `HTTP 503 Service Unavailable` or `HTTP 429 Too Many Requests` during a brief CPU spike or leader election, retrying is essential. However, **naive retries are one of the leading causes of total cloud outages (Retry Storms / Self-Inflicted DDoS)**.
 
@@ -1097,7 +1125,7 @@ public async Task PlaceOrderAsync(Order order)
 
 ### 9.2 The Transactional Outbox Pattern
 
-The Transactional Outbox pattern guarantees **Atomicity between Database Mutations and Message Dispatch**:
+The Transactional Outbox pattern guarantees **atomicity between database mutations and the durable intent to publish**, not atomic completion of the later broker send:
 1. When saving the `Order`, write the outgoing event as a row into an `OutboxMessages` table in the **exact same ACID SQL transaction**.
 2. A background worker (or CDC stream) polls the `OutboxMessages` table, publishes the message to Azure Service Bus, and marks the row as processed.
 
@@ -1127,11 +1155,30 @@ public sealed class OrderService(AppDbContext dbContext)
 
 ---
 
+#### Outbox Crash Windows to Explain Before Designing a Saga
+
+| Crash point | Durable state | Required recovery |
+|---|---|---|
+| Before the database transaction commits | Neither business mutation nor outbox intent committed | Retry the command according to its idempotency contract |
+| After commit, before publish | Mutation and pending outbox row exist | Dispatcher resumes publishing |
+| After broker accepts, before row is marked sent | Message may already be delivered; row still pending | Publish again with stable identity; consumer deduplicates |
+| After marking sent | Dispatcher considers publication complete | Rely on the broker's documented durability and recovery guarantees |
+
+Never mark a row sent before broker acknowledgement. Multiple dispatchers need a safe claim/lease strategy, but leases cannot eliminate duplicate publication after a crash. Monitor the oldest unpublished row as well as count: a stable count can hide one permanently stuck business operation.
+
 ### 9.3 The Saga Pattern: Orchestration with MassTransit State Machines
 
 When a business transaction spans multiple microservices (e.g. Order $\to$ Payment $\to$ Inventory $\to$ Shipping), we cannot use distributed database locks. We implement a **Saga**:
 - **Choreography:** Services listen to events and publish new events independently. Suitable for simple 2-3 step workflows.
 - **Orchestration:** A central State Machine oversees the workflow, sends explicit commands to participants, tracks responses, and triggers **Compensating Transactions** (e.g., refunding payment if inventory reservation fails) upon error.
+
+#### Compensation Is Not Database Rollback
+
+Other services can observe intermediate saga states. A refund is a new business action that may incur fees or fail; it does not erase the original charge. Persist each step, timeout, and compensation decision so recovery does not depend on a worker's memory.
+
+Define how late success interacts with a timeout: payment may succeed after the orchestrator has started cancellation. Correlate the response to the specific operation/attempt, recheck persisted saga state, and converge through an explicit refund or reconciliation path. Make compensation idempotent and provide a visible manual-resolution state for outcomes that cannot be automated safely.
+
+**Practice:** Trace reserve, charge, timeout, late charge-success, and failed refund. Identify which durable state and message cause the next action at each step. "The saga rolls everything back" is not an adequate answer.
 
 ---
 
@@ -1421,6 +1468,14 @@ If a user submits a command (`POST /orders`) and the UI immediately redirects to
 
 ### 10.3 Event Schema Evolution & Upcasting
 
+#### Rebuild Projections Without Repeating Business Effects
+
+A projection replay must not resend emails, recreate payments, or apply today's business rules to yesterday's accepted facts. Keep deterministic event application separate from live side-effect handlers. Persist projection state and its checkpoint atomically where possible; otherwise make replay after a checkpoint failure idempotent.
+
+For a blue-green rebuild, record a source position, replay historical events into the new projection, then catch up with live events before switching readers. Compare business totals and sampled entities, not just row counts. A per-stream version is meaningful only with its stream identity; version 42 of one order says nothing about another order's progress.
+
+Retain old payload fixtures and test upcasters against them. An upcaster can reshape known information but cannot reliably infer data that was never recorded, such as splitting every historical full name into given and family names. Preserve the old value or use an explicit unknown/manual-enrichment policy rather than inventing historical facts.
+
 Events in an Event Store are **immutable**, yet business requirements evolve constantly (e.g., `OrderCreated_V1` had a single `string Address`, while `OrderCreated_V2` splits it into `Street`, `City`, `PostalCode`).
 - **Rule 1 (Additive Weak Schema):** Prefer nullable/defaulted properties so a single C# record can deserialize both old and new JSON payloads.
 - **Rule 2 (Event Upcasters):** When a structural breaking change occurs, register an **Upcaster** pipeline during deserialization that transforms raw `OrderCreated_V1` JSON (`JsonNode`) into `OrderCreated_V2` in memory on the fly, so domain aggregate code only ever deals with the latest event version!
@@ -1449,7 +1504,7 @@ Events in an Event Store are **immutable**, yet business requirements evolve con
 ### 11.1 Retry Storms & Exponential Backoff with Full Jitter
 
 When a downstream microservice or database experiences a transient CPU spike or brief network blip and returns `HTTP 503 Service Unavailable`, naive clients that retry immediately (or retry at fixed $1\text{-second}$ intervals) synchronize into a **Thundering Herd / Retry Storm**:
-- If 1,000 clients fail at $t = 0\text{s}$ and retry at $t = 1\text{s}, 2\text{s}, 4\text{s}$ without randomization, all 1,000 retries hit the recovering server in lockstep waves,加上 new incoming traffic, guaranteeing the downstream service never recovers!
+- If 1,000 clients fail at $t = 0\text{s}$ and retry at $t = 1\text{s}, 2\text{s}, 4\text{s}$ without randomization, all 1,000 retries hit the recovering server in lockstep waves on top of new incoming traffic, guaranteeing the downstream service never recovers!
 - **Exponential Backoff with Full Jitter (AWS Architecture Formula):** Randomizes the wait duration uniformly across the exponential window to spread retry load flat across time:
 
 $$T_{\text{sleep}} = \text{Random}\!\left(0,\; \min\!\left(T_{\max},\; T_{\text{base}} \times 2^{\text{attempt}}\right)\right)$$

@@ -126,7 +126,7 @@ Every section in Part II provides comprehensive senior-level instruction:
 
 ### 1.1 Key Design: Surrogate Keys, Natural Keys, and UUIDv7
 
-A primary key uniquely identifies a row in a table. In SQL Server and Postgres, the primary key defaults to the **Clustered Index**, meaning the table's physical row order on disk matches the primary key order.
+A primary key uniquely identifies a row in a table. In SQL Server, a primary key normally creates a clustered index if no clustered index already exists and no alternative is specified. Its leaf level contains the data rows in logical key order; this does not guarantee contiguous physical storage or query result ordering. PostgreSQL normally creates a unique B-tree index for a primary key while storing rows separately in a heap. PostgreSQL `CLUSTER` performs a physical reordering that later writes do not automatically maintain.
 
 #### The UUIDv4 Disaster in Clustered Indexes
 Using random GUIDs (`Guid.NewGuid()`, UUIDv4) as clustered primary keys causes catastrophic physical fragmentation:
@@ -137,18 +137,22 @@ Using random GUIDs (`Guid.NewGuid()`, UUIDv4) as clustered primary keys causes c
 #### The Modern Solution: Sequential UUIDv7 (.NET 9+)
 .NET 9 introduces `Guid.CreateVersion7()`, which embeds a 48-bit millisecond timestamp in the leading bits:
 ```csharp
-// .NET 9 UUIDv7: Monotonically increasing, perfectly indexable!
+// .NET 9 UUIDv7: timestamp-prefixed; verify the database's comparison order.
 Guid id = Guid.CreateVersion7();
 ```
-*Result:* Always appends to the last page of the B+Tree, eliminating page splits while retaining the global uniqueness of a GUID.
+*Result:* UUIDv7 improves insertion locality when the database's UUID ordering follows the timestamp prefix. It does not guarantee strict monotonicity for IDs generated in the same millisecond, across machines, or after clock adjustments. SQL Server `uniqueidentifier` comparison order differs from canonical UUID byte order, so do not assume `Guid.CreateVersion7()` behaves like `NEWSEQUENTIALID()` there. Benchmark the actual column type, provider, and workload.
 
 | Key Strategy | Storage Size | Clustered Index Fragmentation | Distributed Generation | Best Use Case |
 |---|---|---|---|---|
-| **`INT` / `BIGINT` `IDENTITY`** | 4 / 8 bytes | 0% (strictly sequential) | Poor (requires DB round-trip or `HiLo`) | Single-node relational tables, high-density join keys |
+| **`INT` / `BIGINT` `IDENTITY`** | 4 / 8 bytes | Usually good insertion locality; last-page contention is possible | Poor (requires DB allocation or `HiLo`) | Compact relational keys and high-density joins |
 | **Natural Key (e.g., `Email`, `ISBN`)** | Variable (20–255 bytes) | High (random alphabetical inserts) | Good | Lookup tables (ISO country codes); poor for clustered keys due to wide nonclustered index pointers |
-| **Random GUID (`Guid.NewGuid()` / UUIDv4)** | 16 bytes | Catastrophic ($>90\%$ page splits) | Excellent | Non-indexed external correlation tokens only |
+| **Random GUID (`Guid.NewGuid()` / UUIDv4)** | 16 bytes | Random inserts can increase splits and reduce locality | Excellent | Distributed identifiers when measured index costs are acceptable |
 | **SQL `NEWSEQUENTIALID()`** | 16 bytes | Low (sequential per OS boot) | DB-generated only | Legacy SQL Server GUID primary keys |
-| **UUIDv7 (`Guid.CreateVersion7()`)** | 16 bytes | Near 0% (time-ordered prefix) | Excellent (client-side) | Modern .NET 9 microservices, DDD aggregates, sharded DBs |
+| **UUIDv7 (`Guid.CreateVersion7()`)** | 16 bytes | Improved locality with compatible ordering; not a zero-fragmentation guarantee | Excellent (client-side) | Distributed IDs with engine-specific index validation |
+
+**Identity is not a business uniqueness constraint:** A surrogate primary key does not stop two rows representing the same invoice number or tenant-scoped username. Add a unique constraint on the actual business key. An application-level "does it exist?" query races under concurrent inserts; the database constraint is the final arbiter.
+
+**Type decisions are correctness decisions:** Define decimal precision and rounding for money, a time-zone policy for instants versus business dates, and explicit nullability. SQL `NULL` means unknown: `value = NULL` is not a true predicate; use `IS NULL`. A nullable value can also cause a `CHECK` predicate to evaluate to unknown, so pair checks with `NOT NULL` where absence is invalid. Unique-null semantics and timestamp types differ between engines; verify them rather than translating DDL mechanically.
 
 ### 1.2 Normalization (1NF, 2NF, 3NF, BCNF) vs Pragmatic Denormalization
 
@@ -208,7 +212,7 @@ ON dbo.vw_CustomerOrderMetrics (TenantId, CustomerId);
 
 #### Interview Questions
 1. **Q: Why does using `Guid.NewGuid()` (UUIDv4) as a clustered primary key degrade write and read performance, and how does .NET 9 solve this?**
-   - **Model Answer:** In SQL Server, the clustered index dictates the physical sort order of rows across 8KB data pages. UUIDv4 generates cryptographically random 128-bit values. Inserting a row forces SQL Server to locate the target page in the middle of the B+Tree; if that page is full, the engine executes a **page split**—allocating a new 8KB page, migrating half the rows, updating intermediate B+Tree pointers, and writing heavy log records to the WAL. This causes severe external fragmentation, wastes Buffer Pool RAM with half-empty pages, and turns sequential scans into random I/O. .NET 9 introduces `Guid.CreateVersion7()`, which places a 48-bit Unix millisecond timestamp in the most significant bits, ensuring monotonically increasing values that append cleanly to the tail of the B+Tree. (Note: In SQL Server `UNIQUEIDENTIFIER`, byte ordering is mixed-endian in the first 3 groups; for strict SQL Server binary sort order, either store UUIDv7 as `BINARY(16)` or order bytes to match SQL Server's `Data4` comparison rules).
+   - **Model Answer:** Random UUIDv4 inserts can target full pages throughout a clustered B-tree, causing splits, additional log work, and reduced page density. The magnitude depends on fill factor, workload, and maintenance; it is not a fixed fragmentation percentage. UUIDv7 puts a timestamp in its leading bits and can improve locality with compatible ordering, but it is not strictly monotonic and SQL Server `uniqueidentifier` does not compare in canonical UUID byte order. Evaluate `NEWSEQUENTIALID()`, a separate compact clustered key, or an explicitly defined canonical binary representation against the actual access pattern. Changing the column to `BINARY(16)` without specifying serialization order is not sufficient.
 2. **Q: Suppose an `OrderLines` table stores `UnitPrice`. Doesn't storing `UnitPrice` on both `Products` and `OrderLines` violate 2NF/3NF?**
    - **Model Answer:** No—this is a classic interview trap. `Products.CurrentPrice` represents the *current catalog price* and depends solely on `ProductId`. `OrderLines.UnitPriceAtPurchase` represents the *contractual historical price* at the exact time the order was placed, which functionally depends on the composite key `(OrderId, ProductId)`. If you normalized it away and joined to `Products.CurrentPrice`, changing a product's price today would retroactively corrupt historical financial invoices!
 
@@ -576,16 +580,26 @@ LSN Timeline:   ... [Last Checkpoint] --------> [Crash Point!]
 |---|---|---|---|---|
 | **Read Uncommitted** | Possible | Possible | Possible | Read with no locks (`NOLOCK`) |
 | **Read Committed (Default)** | Prevented | Possible | Possible | Short-term Shared locks released immediately after read |
-| **Read Committed Snapshot (RCSI)** | Prevented | Possible | Possible | **MVCC:** Readers read committed row versions from `tempdb` (Zero reader-writer blocking!) |
+| **Read Committed Snapshot (RCSI)** | Prevented | Possible | Possible | **MVCC:** Statement-level committed snapshot; reduces ordinary reader-writer blocking |
 | **Repeatable Read** | Prevented | Prevented | Possible | Shared locks held until transaction completes |
 | **Serializable** | Prevented | Prevented | Prevented | Key-Range locks preventing concurrent inserts into range |
 | **Snapshot Isolation** | Prevented | Prevented | Prevented | **MVCC:** Point-in-time transaction snapshot; throws update conflict on concurrent writes |
 
-#### Why Every Enterprise .NET System on SQL Server Should Enable RCSI:
+#### Evaluating RCSI in SQL Server:
 ```sql
 ALTER DATABASE CurrentDb SET READ_COMMITTED_SNAPSHOT ON;
 ```
-Enabling RCSI eliminates reader-writer deadlocks. Queries reading data do not acquire shared locks and do not block writers. Writers do not block readers. Readers simply read the latest committed row version from the `tempdb` version store.
+RCSI reduces ordinary reader-writer blocking by using a committed snapshot for each statement instead of shared data locks for those reads. It does not remove writer-writer conflicts, schema locks, or every deadlock. Evaluate version-store capacity and long-running transactions before enabling it. Row versions use `tempdb` or the persistent version store when applicable with Accelerated Database Recovery.
+
+#### Read the Isolation Contract, Not Just Its Name
+
+- **Statement snapshot:** Under RCSI, two statements in one transaction can observe different committed states. "Inside a transaction" does not automatically mean "one consistent snapshot."
+- **Transaction snapshot:** Snapshot isolation gives a consistent read view across statements, but disjoint-row writes can still violate a cross-row invariant (write skew).
+- **Serializable execution:** The outcome must be equivalent to some serial ordering. SQL Server commonly enforces this with locking; PostgreSQL Serializable uses Serializable Snapshot Isolation and may abort a transaction when it detects a dangerous dependency pattern.
+
+**Map the invariant to a mechanism:** A unique invoice number belongs in a unique constraint. Non-negative stock can use a guarded atomic decrement and an affected-row check. "At least one doctor remains on call" needs coordination across the relevant rows, not a row-version token on each doctor alone.
+
+Retry a deadlock victim or serialization failure by restarting the whole transactional decision with fresh reads and a bounded retry policy. Do not retry only the final SQL statement against assumptions computed before the rollback. Database concurrency retries and end-user command idempotency solve different problems.
 
 ### 6.2 Lock Modes (`S`, `X`, `U`, `IS`, `IX`), Lock Escalation & Concurrency in EF Core
 
@@ -693,6 +707,12 @@ await context.Orders
 
 ### 7.2 `DbContext` Pooling, Compiled Queries & Execution Strategy Retries
 
+#### Three Different Lifetimes
+
+`DbContext` pooling reuses EF objects; connection pooling reuses physical database connections; a transaction holds a consistency boundary and resources until completion. None makes one context safe for concurrent operations. A small context pool also does not impose a safe cap on all database traffic: use deliberate request/worker concurrency limits and observe connection wait time.
+
+Set-based updates execute immediately, bypass tracked entity state, and do not automatically add concurrency-token predicates. Include guards in the `WHERE` clause and verify the affected-row count when enforcing an invariant. If two bulk updates must succeed together, wrap them in a transaction and roll back when either precondition fails.
+
 1. **`AddDbContextPool<TContext>`:** Resets and reuses `DbContext` instances across HTTP requests instead of instantiating internal service graphs and change-tracker dictionaries on every request. (Warning: pooled `DbContext` constructors cannot inject request-scoped services directly; use an interceptor or scoped state factory.)
 2. **Compiled Queries (`EF.CompileAsyncQuery`):** Eliminates the CPU and allocation cost of walking and hashing the C# `Expression` tree on ultra-hot query paths:
 3. **Resilient Execution Strategies & Explicit Transactions:** When `EnableRetryOnFailure()` is configured on SQL Server/PostgreSQL, EF Core buffers uncommitted operations to retry transient network blips. Consequently, calling `BeginTransactionAsync()` directly throws an `InvalidOperationException` unless wrapped inside `CreateExecutionStrategy().ExecuteAsync(...)`:
@@ -734,6 +754,14 @@ public sealed class HighThroughputOrderRepository(AppDbContext dbContext)
 }
 ```
 
+#### Retry Safety and an Unknown Commit Outcome
+
+The transfer example illustrates transaction composition, not a complete financial ledger. A production transfer also validates a positive amount, distinct valid accounts, currency compatibility, sufficient funds, and both affected-row counts. If the connection drops during `CommitAsync`, the database may have committed even though the caller did not receive confirmation. Replaying a debit without a stable operation identifier can charge twice.
+
+Persist a unique transfer/operation ID with the state change and verify that operation's recorded outcome when commit status is ambiguous. Do not include a non-idempotent external payment call in a database execution-strategy delegate. A retry policy improves availability only when the retried unit is safe to repeat.
+
+**Practice:** Inject a failure before commit, then a lost acknowledgement after commit. For the first, expect no transfer; for the second, recover the existing transfer result rather than creating another. Include missing-account and insufficient-funds cases so "SQL executed" cannot be mistaken for "business operation succeeded."
+
 ### Section 7 Review: Interview Questions & Practice Exercises
 
 #### Interview Questions
@@ -756,6 +784,18 @@ Never rename or drop a column in a single migration in a live system. Use the 4-
 2. **Dual-Write:** Deploy application version $N+1$. Application writes to both `FirstName/LastName` and `FullName`, but reads from `FirstName/LastName`.
 3. **Backfill:** Run an asynchronous background batch job updating all historical rows: `UPDATE Users SET FullName = FirstName + ' ' + LastName WHERE FullName IS NULL`.
 4. **Contract:** Deploy application version $N+2$ reading solely from `FullName`. Drop legacy columns in a subsequent non-breaking database migration.
+
+#### The Compatibility Window and Backfill Race
+
+During a rolling deployment, old and new application versions coexist. An old writer can update legacy fields after a backfill has copied them, leaving the new representation stale. A backfill completion counter is therefore not proof that switching reads is safe.
+
+1. Identify every writer, including scheduled jobs, imports, and rollback versions.
+2. Establish how changes during the migration reach both representations: compatible writers, a temporary database mechanism, or a replayable change stream.
+3. Backfill in bounded, restartable batches with a stable cursor and conditional updates so old snapshots do not overwrite newer values.
+4. Compare old and new reads, including rows changed during backfill; reconcile mismatches.
+5. Retire old writers and confirm the rollback window before removing old columns or stopping synchronization.
+
+Define progress, mismatch, lock-wait, and replication-lag metrics plus a stop condition. "Online DDL" can still require short locks, consume substantial I/O, or be unavailable for a particular operation/edition. Rehearse on representative data and budget for cancellation and recovery rather than promising zero impact.
 
 ### 8.2 CI/CD Migration Pipelines & Online DDL Operations
 
@@ -789,7 +829,7 @@ In Cosmos DB, data is distributed across physical partitions based on the hash o
 - **Hot Partition Anti-Pattern:** Using a low-cardinality partition key like `Country` or `Status`. All traffic routes to the single partition holding "USA", exhausting RUs and triggering HTTP 429 (Too Many Requests), while other partitions sit idle!
 - **Optimal Partition Key:** High cardinality, evenly distributed access patterns (e.g., `TenantId` in B2B SaaS, or `UserId` in consumer applications).
 
-### 9.2 Cosmos DB Consistency Levels, Hierachical Partition Keys & Document Modeling
+### 9.2 Cosmos DB Consistency Levels, Hierarchical Partition Keys & Document Modeling
 
 1. **Overcoming the 20 GB Logical Partition Limit with Hierarchical Partition Keys:**
    - In multi-tenant B2B SaaS, partitioning solely by `/tenantId` fails if a single enterprise tenant grows beyond **20 GB** of data or **10,000 RU/s** (the physical partition ceiling).
@@ -901,6 +941,17 @@ public sealed class CatalogService(HybridCache cache, AppDbContext dbContext)
 
 ### Section 11 Review: Interview Questions & Practice Exercises
 
+#### The Stale-Fill Race: Why Invalidation Alone Is Not Consistency
+
+Deleting a cache entry after commit avoids some write-ordering races, but not every race:
+1. Reader A misses the cache and reads database version 1.
+2. Writer B commits version 2 and deletes the cache entry.
+3. Reader A finally populates the cache with version 1.
+
+The deletion succeeded, yet the cache is stale. Choose a policy based on the permitted staleness: short TTLs for tolerant data, version-aware population/invalidation with an atomic ordering rule, or an authoritative database read for correctness-critical decisions. Do not claim that a TTL creates immediate consistency or that process-local single-flight coordinates all application instances.
+
+**Failure-mode check:** If Redis becomes unavailable, can the database handle cache-miss traffic? Use bounded fallback concurrency, timeouts, and an explicit degradation policy. An unlimited "fall back to SQL" path can turn a cache outage into a database outage.
+
 #### Interview Questions
 1. **Q: Why is executing `KEYS product:*` in production Redis a career-limiting mistake, and what should you use instead?**
    - **Model Answer:** Redis executes commands on a **single main event-loop thread**. `KEYS` performs an $O(N)$ linear scan across the entire keyspace (e.g., 20 million keys) without yielding, blocking *every other client request* for hundreds of milliseconds or seconds and triggering cluster failover timeouts! Instead, use **`SCAN`** (which iterates incrementally in small non-blocking cursor batches) or **Tag-Based Invalidation** (`HybridCache.RemoveByTagAsync("catalog")`).
@@ -926,7 +977,7 @@ public sealed class CatalogService(HybridCache cache, AppDbContext dbContext)
 
 ### 12.2 Change Data Capture (CDC) & Streaming Pipelines
 
-Polling OLTP tables with `SELECT * FROM Orders WHERE UpdatedAt > @LastRun` misses hard deletes, hammers OLTP indexes, and acoplates analytics to operational schemas.
+Polling OLTP tables with `SELECT * FROM Orders WHERE UpdatedAt > @LastRun` misses hard deletes, hammers OLTP indexes, and couples analytics to operational schemas.
 **Log-Based Change Data Capture (SQL Server CDC / Debezium / PostgreSQL Logical Replication)** reads committed mutations directly from the **Transaction Log (WAL)** with near-zero OLTP CPU impact and streams `{ before, after, op: 'c'|'u'|'d', lsn }` events into **Apache Kafka / Azure Event Hubs**.
 
 ### Section 12 Review: Interview Questions & Practice Exercises
@@ -1008,7 +1059,7 @@ public sealed class TenantSessionContextInterceptor(ITenantProvider tenantProvid
 #### Interview Questions
 1. **Q: If a customer requires searching for users by exact `NationalIdNumber` (equality lookup) while guaranteeing that even a database administrator with `sysadmin` rights cannot view plaintext `NationalIdNumber` values, which SQL Server feature do you choose?**
    - **Model Answer:** **Always Encrypted with Deterministic Encryption** (or **Always Encrypted with Secure Enclaves** if `LIKE` / range queries are also required). The ADO.NET driver on the .NET application server fetches the Column Encryption Key (CEK) from Azure Key Vault, encrypts the parameter deterministically in client memory, and sends only ciphertext over the wire. Because deterministic encryption always produces the same ciphertext for the same plaintext, SQL Server can maintain a B+Tree index and execute `WHERE NationalIdNumber = @CipherParam` without ever possessing the decryption key.
-2. **Q: Why must `sp_set_session_context` be beachten with ADO.NET Connection Pooling when `@read_only = 1` is used?**
+2. **Q: How does `sp_set_session_context` with `@read_only = 1` interact with ADO.NET Connection Pooling, and why doesn't tenant context leak between requests?**
    - **Model Answer:** When an ADO.NET `SqlConnection` is closed (`Dispose()`), the underlying physical TCP socket is returned to the **Connection Pool** and reused by the next HTTP request! Fortunately, the TDS protocol sends a **`sp_reset_connection`** packet when reusing a pooled connection, which clears `SESSION_CONTEXT` (even keys marked `@read_only = 1` during the prior logical connection)—and `ConnectionOpenedAsync` fires on every logical `OpenAsync()`, guaranteeing fresh tenant context binding per request.
 
 #### Practice Exercise
@@ -1075,7 +1126,7 @@ A multi-tenant `GetTenantOrders(@TenantId UNIQUEIDENTIFIER)` stored procedure no
 ## 2. Rapid-Fire Revision Sheet (50 Senior-Level Truths)
 
 1. Database rows are stored physically on disk in 8KB data pages; eight contiguous pages form an 64KB extent.
-2. Clustered indexes dictate the physical sorted order of table rows on disk; a table can have exactly one clustered index.
+2. In SQL Server, a clustered index stores data rows at its leaf level in logical key order; a table can have only one. Query result order still requires `ORDER BY`.
 3. Using random GUIDs (UUIDv4) as clustered primary keys causes catastrophic page splits, index fragmentation, and write amplification.
 4. .NET 9 introduces `Guid.CreateVersion7()`, embedding a 48-bit millisecond timestamp to guarantee sequential B+Tree inserts.
 5. In a nonclustered index, leaf pages store the index key plus a pointer to the clustered key (or RID in a heap table).
@@ -1086,7 +1137,7 @@ A multi-tenant `GetTenantOrders(@TenantId UNIQUEIDENTIFIER)` stored procedure no
 10. The three core join algorithms in relational engines are Nested Loops Join (small sets), Hash Match Join (large unsorted sets), and Merge Join (sorted inputs).
 11. Write-Ahead Logging (WAL) guarantees that log records are flushed to disk before dirty data pages in memory can be written to disk.
 12. A transaction commit is durable the microsecond its log records are flushed to disk; dirty data pages are flushed later during Checkpoints.
-13. Read Committed Snapshot Isolation (RCSI) enables MVCC in SQL Server, storing row versions in `tempdb` to eliminate reader-writer blocking.
+13. SQL Server RCSI provides statement-level versioned reads, reducing ordinary reader-writer blocking without eliminating writer conflicts or schema locks.
 14. Under Snapshot Isolation, writers do not block readers, but concurrent writes to the same row trigger an update conflict exception.
 15. Deadlocks occur when two transactions hold locks and each requests a lock held by the other, forming a cyclic dependency graph.
 16. Deadlocks are prevented by enforcing consistent lock acquisition ordering across all application transactions and keeping transactions short.

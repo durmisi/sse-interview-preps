@@ -122,8 +122,8 @@ Every section in Part II provides comprehensive senior-level instruction:
 - 8.1 Technical Debt Taxonomy: Deliberate vs inadvertent debt; prudent vs reckless debt (Martin Fowler's debt quadrant); interest vs principal.
 - 8.2 Code Smell Catalog: Bloaters, Object-Orientation Abusers, Change Preventers, Dispensables, Couplers; automated static analysis (.NET analyzers, SonarQube).
 - 8.3 Safe Refactoring Strategies: Working with legacy code (Michael Feathers); characterization tests, seams, sprout/wrap method, Mikado method.
-- 8.4 Backwards Compatibility & Versioning: Semantic versioning; binary, source, and behavioral compatibility in C# libraries; deprecation strategies.
-- 8.5 Extensibility Without Over-Engineering: Designing extension points (events, middleware, plugins, strategy pattern) only at proven variation points.
+- 8.4 Extensibility Without Over-Engineering: Designing extension points (events, middleware, plugins, strategy pattern) only at proven variation points.
+- 8.5 Backwards Compatibility & Versioning: Semantic versioning; binary, source, and behavioral compatibility in C# libraries; deprecation strategies.
 **Senior-level bar:** Formulate a prioritized technical debt remediation plan that quantifies business risk, cost of delay, and implementation safety using automated characterization testing.
 
 ---
@@ -374,6 +374,78 @@ public record OrderLine(ProductId ProductId, int Quantity, Money UnitPrice)
     public Money Subtotal => new(UnitPrice.Amount * Quantity, UnitPrice.Currency);
 }
 ```
+
+> **Senior review note — find the hidden invariant leak:** `Total` seeds the aggregation with `new Money(0, "USD")`. If an order's lines are priced in EUR, `Money.Add` throws (or worse, silently mixes currencies if `Add` doesn't check). The real invariant is *"an order has exactly one currency"*, and nothing in this class owns it. The fix is to make currency part of the aggregate's state (`Order(OrderId id, CustomerId customerId, Currency currency)`) and reject any `AddLine` whose `unitPrice.Currency` differs. Interviewers love this kind of question: the code *looks* encapsulated, but an invariant was never actually given an owner.
+
+#### Defeating Primitive Obsession: Value Objects & Strongly-Typed IDs
+
+**Primitive Obsession** is when domain concepts are represented with raw primitives: `string email`, `decimal amount`, `Guid customerId`. It's the most common way encapsulation fails *between* objects rather than inside them:
+
+1. **Validation gets scattered.** Every method that takes `string email` has to re-check the format, or trust that someone upstream did. In practice, someone eventually forgets.
+2. **Arguments get swapped silently.** `Transfer(Guid fromAccountId, Guid toAccountId, Guid initiatedByUserId)` compiles just fine with the arguments in any order. The bug shows up in production as money moving the wrong way.
+3. **Meaning gets lost.** `decimal 19.99` doesn't say whether it's EUR or USD, gross or net, or rounded to cents.
+
+A **Value Object** fixes this by making the concept a type that **can only be constructed in a valid state**. Once a value of type `EmailAddress` exists, the rest of the system never needs to validate it again. This is often summarized as ***"parse, don't validate"***: check the raw input once at the boundary and turn it into a type that carries the proof.
+
+```csharp
+// 1. Strongly-typed IDs: zero-cost wrappers (readonly record struct = no heap allocation)
+public readonly record struct OrderId(Guid Value)
+{
+    public static OrderId New() => new(Guid.CreateVersion7());
+    public override string ToString() => Value.ToString();
+}
+
+public readonly record struct AccountId(Guid Value);
+public readonly record struct UserId(Guid Value);
+
+// Swapped arguments are now a COMPILE error, not a production incident:
+public interface ITransferService
+{
+    Task TransferAsync(AccountId from, AccountId to, UserId initiatedBy, Money amount, CancellationToken ct);
+}
+
+// 2. Validated Value Object: impossible to construct an invalid instance
+public sealed record EmailAddress
+{
+    public string Value { get; }
+
+    private EmailAddress(string value) => Value = value;
+
+    // "Parse, don't validate": the only way in is through this factory
+    public static Result<EmailAddress> Create(string? raw)
+    {
+        if (string.IsNullOrWhiteSpace(raw))
+            return Result<EmailAddress>.Failure(new Error("email.empty", "Email is required."));
+
+        var normalized = raw.Trim().ToLowerInvariant();
+        if (normalized.Length > 254 || !MailAddress.TryCreate(normalized, out _))
+            return Result<EmailAddress>.Failure(new Error("email.invalid", "Email format is invalid."));
+
+        return Result<EmailAddress>.Success(new EmailAddress(normalized));
+    }
+
+    public override string ToString() => Value;
+}
+
+// 3. EF Core persistence without leaking the primitive into the domain
+public sealed class CustomerConfiguration : IEntityTypeConfiguration<Customer>
+{
+    public void Configure(EntityTypeBuilder<Customer> builder)
+    {
+        builder.Property(c => c.Id)
+               .HasConversion(id => id.Value, value => new CustomerId(value));
+
+        builder.Property(c => c.Email)
+               .HasConversion(e => e.Value, raw => EmailAddress.Create(raw).Value) // DB data is trusted
+               .HasMaxLength(254);
+    }
+}
+```
+
+**Trade-offs a senior engineer should name:**
+- **Serialization & binding friction:** `System.Text.Json` and Minimal API binding need a `JsonConverter` or `TryParse`/`IParsable<T>` on each wrapper. Libraries such as *StronglyTypedId* or *Vogen* generate this boilerplate with source generators.
+- **Where to stop:** Wrap concepts that carry **rules or meaning** (money, email, IDs that are easy to mix up, quantities with units). Don't wrap every `string Notes` field; that's ceremony without payoff.
+- **`record struct` default value trap:** `default(OrderId)` is `Guid.Empty`. Struct wrappers can't stop `default` from existing, so validate at boundaries, or use a `sealed record` class when "unset" must be impossible.
 
 ---
 
@@ -856,6 +928,22 @@ public interface IOrderReportingService
 }
 ```
 
+#### Role Interfaces vs Header Interfaces
+- A **header interface** mirrors every public method of one implementation class (`IOrderService` mirrors `OrderService`, method for method). It's shaped by the *implementer*.
+- A **role interface** describes exactly what one *client* needs (`IOrderReader`, `IClock`, `IEmailSender`). It's shaped by the *consumer*.
+
+ISP is really a rule about **who designs the interface**: the client does. One implementation class can implement several role interfaces (`sealed class OrderService : IOrderCreationService, IOrderReportingService`), so splitting interfaces doesn't force you to split implementations.
+
+#### ISP in the .NET BCL: Good and Bad Examples
+- **Good:** `IReadOnlyList<T>` and `IReadOnlyDictionary<TKey, TValue>` let a method declare "I only read". A caller can pass a `List<T>`, an array, or an `ImmutableArray<T>`.
+- **Good:** `IAsyncDisposable` is a separate role interface, not extra members bolted onto `IDisposable`.
+- **Counter-example:** `System.IO.Stream` is a fat abstraction. Every stream has `Seek`, `Write`, and `Read`, guarded by `CanSeek` / `CanWrite` / `CanRead` flags. A `NetworkStream` throws `NotSupportedException` from `Seek`. That's a runtime capability check standing in for a compile-time contract, which is exactly what ISP is meant to prevent. The framework kept it for historical reasons. Don't copy that design into new APIs.
+
+#### Why ISP Pays Off in Practice
+1. **Smaller test doubles:** A handler that depends on `IOrderReader` (2 methods) needs a 2-method fake, not a 25-method mock where 23 members throw.
+2. **Smaller blast radius:** Adding `RecalculateLedgerAsync()` to a fat interface forces every implementer and every test fake to change, even the ones that never call it.
+3. **Clearer intent:** A constructor signature listing `IOrderReader, IClock` tells a reviewer what the class touches without reading its body.
+
 ---
 
 ### 2.5 Dependency Inversion Principle (DIP)
@@ -872,11 +960,55 @@ In clean architecture, the Core Domain (high-level policy) defines the interface
    OrderService --------> IOrderRepository <|--- SqlOrderRepository (EF Core)
 ```
 
+#### The Part Most Engineers Miss: Interface Ownership
+The "inversion" is not about having an interface. It's about **which assembly owns it**.
+
+- **Not inverted (common mistake):** `IOrderRepository` lives in `Company.Infrastructure.Data`, next to `SqlOrderRepository`. The Application project references Infrastructure to get the interface, so business logic still has a compile-time dependency on the data-access assembly. You've added an interface and kept the coupling.
+- **Inverted:** `IOrderRepository` lives in `Company.Application` (the consumer). It's written in domain language (`Task<Order?> GetByIdAsync(OrderId id, ...)`, not `Task<OrderRow> SelectAsync(string sql)`). Infrastructure references Application and implements the port.
+
+A quick test: **if you deleted the Infrastructure project, would the Application project still compile?** If not, DIP isn't applied.
+
+#### The Composition Root
+Something still has to connect abstractions to implementations. That place is the **Composition Root**: the one location (in ASP.NET Core, `Program.cs` or extension methods it calls) that references *every* project and builds the object graph:
+
+```csharp
+// Program.cs — the ONLY place that knows both the port and the adapter
+builder.Services.AddScoped<IOrderRepository, SqlOrderRepository>();
+builder.Services.AddSingleton(TimeProvider.System);          // the clock is a volatile dependency too
+builder.Services.AddHttpClient<IPaymentGateway, StripePaymentGateway>();
+```
+
+Business classes must never call `serviceProvider.GetService<T>()` themselves. That's the **Service Locator** anti-pattern: it hides dependencies from the constructor signature and turns missing registrations into runtime failures.
+
+#### Which Dependencies Deserve Inversion?
+Mark Seemann's distinction between **stable** and **volatile** dependencies keeps DIP from turning into "an interface for everything":
+
+| Volatile (invert these) | Stable (depend on them directly) |
+|---|---|
+| Databases, file systems, message brokers | `string`, `List<T>`, LINQ, `System.Text.Json` |
+| External HTTP APIs and SDKs (Stripe, SendGrid) | Your own pure domain types (`Money`, `Order`) |
+| Non-determinism: clock (`TimeProvider`), randomness, GUID generation | Deterministic helper logic with no I/O |
+| Anything still being designed, or that you may swap | Mature BCL types with stable contracts |
+
 ---
 
 ### 2.6 SOLID Anti-Patterns and Over-Engineering
 - **Interface Soup:** Creating an interface for every single class (`IOrder`, `ICustomer`, `IUser`) even when there is only one implementation and no polymorphic variance. This adds indirection without architectural value.
 - **Dependency Injection Explosion:** Constructors accepting 15 dependencies indicate an SRP violation, not good DI practices.
+
+#### SOLID Principles Pull Against Each Other
+Applying each principle to its maximum doesn't give the best design, because they conflict:
+- **SRP vs cohesion:** Splitting a class by every conceivable "reason to change" produces dozens of 10-line classes that must always change *together*. That's low cohesion in disguise, and it's now spread over 12 files. SRP should group code by **actor** (who requests changes), not by verb.
+- **OCP vs YAGNI:** Making every module open for extension means guessing future variation points. Wrong guesses become dead abstractions that still have to be maintained. Apply OCP **after** the second or third variation shows up, not before.
+- **DIP vs readability:** Every inverted dependency adds a hop when someone reads the code. Inverting a pure, deterministic calculator gains nothing and costs navigation.
+
+#### When Does an Abstraction Earn Its Place?
+Introduce an interface when at least one of these is true:
+1. **There's a real second implementation**, either now or explicitly on the roadmap.
+2. **It sits on an I/O or non-determinism boundary** that unit tests need to replace (database, HTTP, clock, queue).
+3. **It's a published contract** consumed by another team or package, so it needs to be stable regardless of the implementation.
+
+If none apply, a `sealed` concrete class is the better choice. It's simpler to read, the JIT can devirtualize it, and adding an interface later is a mechanical refactoring that IDEs automate.
 
 ---
 
@@ -901,7 +1033,18 @@ In clean architecture, the Core Domain (high-level policy) defines the interface
 ### 3.1 Cognitive Load and Readability
 Code is read far more often than it is written. Clean code minimizes **extraneous cognitive load**—the mental overhead required to parse convoluted syntax, cryptic naming, and deep nesting that is unrelated to the actual business problem.
 
-### 3.2 Method Design & Single Level of Abstraction Principle (SLAP)
+### 3.2 Naming as Architecture
+
+A useful name communicates a domain concept, its units, and its observable contract. `Process()` hides the business action; `ReserveInventory()` tells the reader what must become true. `timeoutMilliseconds` prevents a unit mistake that `timeout` invites. Prefer the vocabulary used by domain experts over interchangeable suffixes such as `Helper`, `Manager`, and `Processor`.
+
+Names also expose missing decisions:
+- `GetCustomerAsync` versus `FindCustomerAsync`: document whether absence throws, returns `null`, or produces a typed not-found result. Naming alone is not enforcement.
+- `AuthorizePaymentAsync` versus `CapturePaymentAsync`: these are different business operations, not synonyms for `PayAsync`.
+- `createdAtUtc` versus `businessDate`: an instant and a calendar date require different semantics; a clearer name often reveals the need for a different type.
+
+**Review technique:** Read the public signatures without their implementations. Can a caller predict side effects, units, failure cases, and ownership? If not, improve the contract rather than merely making the name longer.
+
+### 3.3 Method Design & Single Level of Abstraction Principle (SLAP)
 A method should do one conceptual thing at one consistent level of abstraction. A high-level orchestration method should not mix high-level business workflow steps with raw byte manipulation, string splitting, or low-level SQL connection handling.
 
 ```csharp
@@ -927,12 +1070,20 @@ public async Task CheckoutAsync(CartId cartId, CancellationToken ct)
 }
 ```
 
-### 3.3 Command-Query Separation (CQS)
+#### Command-Query Separation (CQS)
 Methods should either:
 - **Execute a Command:** Mutate state, returning `void` (or `Task`).
 - **Execute a Query:** Return data without observable side effects.
 
 Invoking a getter or query method should never alter database state or increment transaction balances.
+
+**Where the heuristic bends:** A command may reasonably return the identifier it created, an outcome, or the item atomically removed from a queue. Splitting `TryDequeue` into `Peek` followed by `Remove` would introduce a race. The important property is that callers can predict mutation, not that every mutating method returns `void`. CQS is a method-design heuristic; CQRS is the larger architectural separation covered in Module 04.
+
+#### Functional Core, Imperative Shell
+
+Keep deterministic decisions separate from orchestration when it makes the rule easier to understand and test. For example, a pricing function can accept an immutable order snapshot, a tax policy, and an explicit effective date, then return a price breakdown. The application handler loads that snapshot, supplies the clock value, and persists the result.
+
+This does not require replacing the whole domain model with functions. An aggregate can protect its state while delegating a calculation to a pure function. The payoff is being able to test rounding and policy boundaries without a database, clock, or mock framework. The shell still needs integration tests: a correct calculation can be persisted twice or applied to stale state.
 
 ### 3.4 Control Flow: Guard Clauses over Arrow Anti-Patterns
 Avoid nested `if/else` ladders (the "Arrow Anti-pattern") by checking failure conditions early and returning immediately:
@@ -1178,19 +1329,24 @@ var zipCode = order.GetDestinationPostalCode();
 ### 4.5 Fail-Fast & Defensive Programming
 
 #### Fundamentals & Internal Mechanics
-- **Fail-Fast:** A system should validate assumptions immediately at its boundaries and crash or abort processing the microsecond an illegal state is detected.
+- **Fail-Fast:** Detect and report an invalid assumption near its source; reject the affected operation before it causes further damage. Invalid client input should not terminate an otherwise healthy service.
 - **Defensive Programming:** Anticipating edge cases, network blips, and untrusted inputs by providing robust fallbacks and defensive assertions.
 
 **The Golden Rule:** Be strict and fail-fast at system ingestion boundaries (API endpoints, message queue deserialization). Inside trusted domain models, rely on strict type constructors and invariants rather than cluttering internal business methods with hundreds of redundant `if (x is null)` checks.
 
 ---
 
-### 4.6 Principle of Least Astonishment (POLA) & Rule of Three
+### 4.6 Principle of Least Astonishment (POLA)
 
 - **Principle of Least Astonishment:** A component, method, or API must behave in a manner that will not surprise a developer using it.
   - Property getters must never trigger expensive database queries or mutate internal state.
   - A method named `FindCustomer()` should not modify the customer's last-active timestamp.
-- **Rule of Three:** Do not create an abstraction the first time you see similar code. Do not create it the second time. Only when you encounter the third distinct concrete occurrence should you refactor into a shared abstraction.
+
+### 4.7 Rule of Three
+
+Wait for enough concrete examples to understand the shared rule before extracting an abstraction. Three is a reminder to gather evidence, not a mandatory threshold. Centralize a critical rounding policy immediately if two copies must always agree; keep three similar workflows separate if they change for unrelated reasons.
+
+**Decision exercise:** Two teams both validate a ten-character reference today. One is a regulated invoice reference; the other is a marketing campaign code. Explain why identical code does not yet establish a shared domain rule, and what evidence would justify extraction later.
 
 ---
 
@@ -1229,6 +1385,8 @@ $$\text{Distance from the Main Sequence } (D) = |A + I - 1|$$
 - $D\approx 0$: The module balances stability and abstractness perfectly (The Main Sequence).
 - The **Zone of Pain** ($A\approx 0, I\approx 0$): Highly concrete, highly stable. Changing this module creates massive change propagation (e.g., a massive concrete utility library used everywhere).
 - The **Zone of Uselessness** ($A\approx 1, I\approx 1$): Highly abstract, but nobody depends on it. Pure overhead.
+
+**Interpretation, not a target:** A package with $C_a=8$ and $C_e=2$ has $I=0.2$: many consumers make changes expensive. This says nothing about its runtime reliability or actual change frequency. With no incoming or outgoing dependencies, the ratio is undefined; tools may use a convention. An immutable, widely reused `Money` type can sensibly be concrete and stable. Do not create interfaces solely to improve a metric; inspect change history and dependency direction first.
 
 ---
 
@@ -1294,6 +1452,23 @@ Circular dependencies:
 
 ---
 
+### 5.5 Techniques for Decoupling: Choose the Dependency You Remove
+
+Decoupling does not mean eliminating all dependencies. It means keeping necessary dependencies explicit while removing knowledge that makes unrelated changes propagate.
+
+| Technique | Dependency reduced | Cost that remains or is introduced |
+|---|---|---|
+| Consumer-owned port plus adapter | Business code knowing a vendor SDK or persistence implementation | Mapping, contract tests, and adapter maintenance |
+| In-process notification | Publisher knowing each reaction directly | Handler ordering, failure propagation, and transaction policy still need decisions |
+| Durable asynchronous message | Producer requiring the consumer to be available now | Eventual consistency, duplicate delivery, schema evolution, and operational recovery |
+| Smaller input/output contract | Caller and callee sharing a large internal object graph | Translation and explicit versioning at the boundary |
+
+Replacing a method call with an event is not automatically an improvement. If checkout must receive a reservation decision before confirming an order, an explicit call can be easier to reason about. If analytics may lag, a notification can remove an unnecessary availability dependency. Follow messaging reliability details in Module 07 rather than treating an event bus as a correctness mechanism.
+
+**Checkpoint:** Name the compile-time, runtime, and temporal dependencies before and after your proposed change. If you can only say "it uses interfaces now," the analysis is incomplete.
+
+---
+
 ### Section 5 Review: Interview Questions & Practice Exercises
 
 #### Realistic Interview Questions & Strong Model Answers
@@ -1356,6 +1531,23 @@ public sealed class VatCalculator
 
 - **Common Closure Principle (CCP):** Classes that change together for the same business reasons should be packaged together. If an accounting regulation changes, the updates should touch only one project/assembly, not ripple across ten projects.
 - **Common Reuse Principle (CRP):** Classes that are not reused together should not be packaged together. If a consumer only needs your domain math, they should not be forced to take a dependency on your EF Core database provider or Azure SDK.
+
+---
+
+### 6.4 Identifying Misplaced Responsibilities
+
+**Feature envy** appears when a method repeatedly extracts another object's fields to make decisions that belong to that object. A refund handler checking invoice status, paid balance, and every earlier refund is a candidate for an `Invoice.RequestRefund` operation. Move the rule with the state it protects; keep HTTP calls and persistence orchestration outside the invoice.
+
+**Inappropriate intimacy** is broader: two classes rely on each other's private representation or lifecycle. Bidirectional navigation alone is not proof, but a small representation change requiring coordinated edits in both classes is evidence.
+
+Use three questions before moving behavior:
+1. Who owns the invariant and has the information to enforce it?
+2. Which business change causes this behavior and state to change together?
+3. Would moving it introduce I/O or a dependency cycle into an otherwise cohesive type?
+
+**Critical boundary:** Encapsulation protects one in-memory instance, not all concurrent instances of an entity. Two `InventoryItem` objects can each approve the last unit. A database constraint, conditional update, concurrency token, or appropriate lock must enforce the shared-state invariant. Private setters are not transaction isolation; see Module 05 for persistence enforcement.
+
+**When a simple model is enough:** Read-only reporting DTOs and straightforward CRUD screens do not need rich aggregates merely to satisfy an OOP rule. Introduce behavioral models where meaningful invariants or state transitions need an owner.
 
 ---
 
@@ -1896,7 +2088,7 @@ public class InvoiceService
 
 ---
 
-### 10.3 Defending Architectural Trade-Offs & Staged Legacy Migration (Strangler Fig)
+### 10.3 Defending Architectural Trade-Offs
 
 #### Structuring Senior Interview Responses: Context $\to$ Forces $\to$ Decision $\to$ Trade-offs
 In senior and staff interviews, there are no universally "correct" architectures—only trade-offs aligned with specific business constraints. When defending a design decision, structure your answer around four pillars:
@@ -1905,7 +2097,7 @@ In senior and staff interviews, there are no universally "correct" architectures
 3. **The Chosen Architecture & Why Alternatives Were Rejected:** Explain why a Modular Monolith with an transactional Outbox beat a premature 12-microservice mesh for a 6-person team.
 4. **Accepted Downsides & Mitigation:** Acknowledge what your design sacrifices and how you monitor or bound that risk.
 
-#### Staged Legacy Migration: The Strangler Fig Pattern & Branch by Abstraction
+### 10.4 Refactoring Legacy Systems: Strangler Fig & Branch by Abstraction
 Never propose a "Big Bang" 12-month freeze-and-rewrite of a revenue-generating production system. Instead, migrate incrementally in production using the **Strangler Fig Pattern**:
 
 1. **Introduce an Abstraction Seam (Proxy / Router / `IFulfillmentEngine`):** Place an interception point in front of the legacy subsystem.
@@ -1919,7 +2111,7 @@ Never propose a "Big Bang" 12-month freeze-and-rewrite of a revenue-generating p
 
 ---
 
-### 10.4 Capstone Scenario
+### 10.5 Comprehensive Assessment & Capstone
 
 You are asked in an interview:
 > *"We have an enterprise e-commerce platform processing 10,000 orders an hour. During flash sales, the inventory service frequently allows products to oversell. The legacy codebase uses a monolithic `OrderService` that updates stock balances directly in a SQL transaction with no optimistic locking. Walk us through how you would diagnose the failure, redesign the domain model, and refactor the architecture safely."*

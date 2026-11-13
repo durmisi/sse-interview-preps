@@ -707,6 +707,19 @@ The Chain of Responsibility passes a request along a pipeline of handlers. Each 
 
 The State pattern allows an object to alter its behavior when its internal state changes. Instead of massive `switch (status)` statements scattered across methods, state transitions are encapsulated in dedicated state objects.
 
+#### Start with a Transition Table, Not a Class Hierarchy
+
+| Current state | Command | Guard | Next state |
+|---|---|---|---|
+| Draft | Submit | At least one valid line | Submitted |
+| Submitted | Ship | Payment and reservation confirmed | Shipped |
+| Draft or Submitted | Cancel | Fulfillment has not started | Cancelled |
+| Shipped | Cancel | Not allowed; use a separate returns workflow | Unchanged |
+
+The table forces decisions about forbidden transitions and repeated commands before implementation. A small enum plus one cohesive transition function may be clearer than a class per state. State objects earn their cost when behavior varies substantially across states, not merely because a `Status` property exists.
+
+The pattern also does not resolve concurrent transitions. Two callers can load the same Submitted order and separately approve Ship and Cancel. Persist the transition with a concurrency check, then reload and reevaluate a conflicting command. Decide explicitly whether a repeated Submit is a harmless no-op, a returned prior result, or an error.
+
 ```csharp
 public interface IOrderState
 {
@@ -1250,6 +1263,10 @@ In-Process CQRS splits operations into two distinct mental models:
 1. **Commands:** Mutate state. Return `void`, `Result`, or created IDs. Never return complex query DTOs.
 2. **Queries:** Read data without side effects. Return read-only DTOs optimized for the UI. Can bypass domain aggregates and query SQL directly via Dapper for maximum throughput.
 
+**Separate the decisions:** CQRS does not require a mediator, separate processes, separate databases, or event sourcing. These are independent choices. A query handler can project DTOs with EF Core; switching to Dapper is a measured implementation choice, not part of the definition. Similarly, command responses can include useful outcome data without turning the command into a general-purpose query API.
+
+Read-after-write behavior depends on the actual data path. Reading the primary after a committed write avoids asynchronous projection lag; reading a cache or replica can still return stale data even if every handler lives in one process. Promise consistency based on storage and routing, not folder names.
+
 #### MediatR Pipeline Behavior for Validation
 ```csharp
 public sealed class ValidationBehavior<TRequest, TResponse>(IEnumerable<IValidator<TRequest>> validators)
@@ -1271,12 +1288,30 @@ public sealed class ValidationBehavior<TRequest, TResponse>(IEnumerable<IValidat
 }
 ```
 
+**Validation concurrency caveat:** Parallel validation is safe only when validators and their dependencies support concurrent use. Two validators using the same scoped EF Core `DbContext` must not execute database operations concurrently. Run them sequentially or give independent work separate correctly owned contexts; a DI scope does not make its services thread-safe.
+
 #### The Critique of MediatR (Senior Staff Judgment)
 While MediatR is ubiquitous, senior engineers recognize its drawbacks:
 - It turns explicit code into untraceable "magic" by hiding call sites from static code analysis ("Find Usages" in IDEs fails).
 - It introduces heap allocations for request records and handlers on high-throughput paths.
 - It can encourage God-handlers where developers dump orchestration logic instead of modeling domain aggregates.
 - In modern C# with Minimal APIs and direct service injection, MediatR is often an unnecessary layer of indirection.
+
+### 7.2 Pipeline Ordering Is Part of Correctness
+
+Behaviors execute like nested function calls: outer behaviors see the request first and the response last. Specify intended ordering and test it with observable effects rather than assuming registration order is obvious.
+
+| Concern | Decision to make | Failure if left implicit |
+|---|---|---|
+| Authorization and cache | Authorize access before returning protected cached data; scope keys appropriately | A cache hit bypasses access checks |
+| Validation and transaction | Keep pure input validation outside the transaction; enforce race-sensitive rules in storage | Long transactions or check-then-act races |
+| Retry and transaction | Retry a safe unit with a fresh transaction and a deliberate state-reset strategy | Reusing failed state or repeating an external charge |
+| Metrics and retry | Record logical requests separately from physical attempts | Retries distort success rates and request volume |
+| Result and commit | Define which typed outcomes allow commit | A failure result returns normally and accidentally commits staged mutations |
+
+A database rollback cannot undo an email or an HTTP charge. A generic retry behavior must not wrap arbitrary handlers with external side effects and assume transactions make retries safe. See Module 07 for durable messaging and idempotency boundaries.
+
+**Failure-path exercise:** Have a handler stage an entity change and return a business failure without throwing. Verify that your transaction behavior follows the declared commit policy. Also test validation short-circuiting, cancellation, and a retry that must not duplicate an external effect.
 
 ---
 
@@ -1547,6 +1582,8 @@ public static class PlaceOrder
 A **Modular Monolith** organizes a single deployment unit into strictly decoupled modules (e.g., `Billing`, `Catalog`, `Identity`).
 Modules communicate exclusively through public interfaces and asynchronous domain events; they never share database tables or reference each other's internal classes.
 
+**Boundary policy versus universal rule:** The strict isolation used here is a deliberate design option, particularly useful when teams or modules need independent evolution. A modular monolith can also use explicit synchronous contracts. Sharing a database server is not the same as sharing ownership of every table. If reporting uses approved cross-schema views, document that exception instead of pretending the dependency does not exist.
+
 #### Automated Architecture Rules with NetArchTest:
 ```csharp
 [Fact]
@@ -1655,6 +1692,16 @@ internal sealed class OrderPlacedBillingConsumer(BillingDbContext billingDb)
     }
 }
 ```
+
+**Concurrency requirement for the inbox example:** `AnyAsync` is only a fast duplicate check, not a lock. Concurrent deliveries can both see no existing marker. Make the event identifier unique in the inbox and commit the marker with the invoice in one transaction. Handle the specific duplicate-key outcome as a duplicate only after confirming the earlier processing committed; do not classify every `DbUpdateException` as success. Add a unique business key such as OrderId if the domain permits only one invoice per order, independently of event IDs.
+
+#### What Architecture Tests Cannot Prove
+
+Static dependency tests can reject a forbidden assembly reference, but they cannot reliably identify table names embedded in SQL strings, reflection-based calls, an HTTP call back into the same application, or an event schema that leaks another module's internals. A green architecture test is evidence about the rule it checks, not proof of independence.
+
+Combine compiler visibility and dependency tests with contract review, database permissions where appropriate, and integration tests of real use cases. A useful change test is: "Can Billing alter its private storage model without rebuilding Catalog's business assumptions?" A shared `Common` library containing every module's entities usually defeats that goal even when project references look tidy.
+
+**Completion check:** For one proposed boundary, identify its public contract, state owner, failure semantics, and enforcement mechanism. Explain one restriction that the compiler catches and one that requires a runtime test or operational control.
 
 ---
 

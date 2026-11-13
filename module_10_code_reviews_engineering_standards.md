@@ -163,6 +163,12 @@ A dysfunctional code review culture uses human reviewers as expensive, inconsist
 
 ### 2.1 The Small PR Imperative & Stacked Pull Requests (Branch Stacking Workflow)
 
+#### Optimize for a Reviewable Decision, Not a Line Quota
+
+Line-count thresholds are useful prompts, not universal cognitive limits. A generated schema diff can be large but mechanical; a five-line authorization or transaction change can require deep analysis. Split by independently understandable behavior and risk, and separate generated/mechanical changes from handwritten logic where practical.
+
+Each stacked PR should state its dependency and whether it is safe to deploy independently. "The next PR fixes this" is not a safe intermediate state if the current PR can reach production. Keep incomplete behavior unreachable behind a deliberate compatibility boundary or feature flag, and test the disabled path too.
+
 How do you ship a large, multi-day enterprise feature (e.g., adding Stripe webhook reconciliation across database migrations, domain entities, background workers, and API endpoints) while keeping every individual PR under **250 lines of code**? The answer is **Stacked Pull Requests (Branch Stacking)** combined with **Feature Flags**.
 
 ```text
@@ -255,6 +261,19 @@ When reviewing a pull request, follow a top-down cognitive hierarchy. Never star
 ```
 
 ### 3.2 Review Turnaround SLAs & Synchronous Pairing vs Asynchronous Review
+
+#### An Evidence-First Review Pass
+
+Before leaving comments, reconstruct the change's contract:
+1. Read the requirement, relevant callers, and affected tests; the diff alone may omit the assumption that makes a line safe or unsafe.
+2. Trace one happy path and one failure path through persistence, external effects, and cleanup.
+3. Identify the invariant, ownership, and commit boundary. For shared state, write a two-request interleaving rather than merely searching for `lock`.
+4. Check that the regression test would fail against the previous behavior. A green test that never reaches the changed branch is not evidence.
+5. Record important limitations: what was executed, what was only inspected, and which environment-dependent claims remain unverified.
+
+**Calibrate severity separately from review order:** The hierarchy above is an attention order, not a rule that every architecture concern is P0. Rank an actual finding by impact, likelihood, reachability, and recovery cost using the team's severity definitions. A preference for a different repository pattern is not equivalent to a reproducible duplicate debit.
+
+A useful blocking comment contains **location + triggering condition + consequence + requested resolution**. For example: "If two workers both pass this existence check, both can debit before either marker is committed. Please enforce the inbox uniqueness rule in the same transaction and add a coordinated concurrent-delivery test." When evidence is incomplete, ask a focused question instead of presenting a hypothetical bug as certain.
 
 #### Why Slow Review Turnaround Destroys Engineering Throughput
 According to Little's Law ($L = \lambda W$), increasing the Wait Time ($W$) of Pull Requests sitting idle in the review queue linearly explodes Work-In-Progress ($L$). When a PR waits 3 days for review:
@@ -355,6 +374,17 @@ Always verify the Dependency Injection lifetime of the class being modified:
 ---
 
 ### 4.2 Auditing `async`/`await`, `CancellationToken`, Nullability (`!`), Financial `decimal` & `TimeProvider`
+
+#### Trace Lifetimes Through Every Exit
+
+For each acquired resource, identify the owner and examine success, exception, cancellation, and early return. In particular:
+- Does a returned task still use a stream that the method has already disposed?
+- Can a background callback outlive its request-scoped `DbContext` or `HttpContext`?
+- Does cancellation stop the operation or only the caller's wait?
+- Can two independent requests reach an apparently protected read-modify-write sequence?
+- If a commit succeeds but its acknowledgement is lost, does retry repeat an external effect?
+
+Do not prescribe `using` merely because a type is disposable: container-owned dependencies are normally disposed by their owning scope. Conversely, injecting a factory does not automatically transfer ownership of every object it creates. Review the specific ownership contract.
 
 Use this high-signal checklist when auditing C# method bodies:
 
@@ -712,6 +742,14 @@ public async Task<IReadOnlyList<CustomerSummaryDto>> GetVipCustomersAsync(
 
 ### 8.1 Reviewing Test Suites: Catching Weak Assertions, Over-Mocking & Non-Deterministic Flakiness
 
+#### Review the Failure the Test Can Detect
+
+Ask the author to describe one plausible incorrect implementation that makes each new test fail. This reveals tests that only execute a branch, assert a constant, or duplicate the production calculation. Prefer a few meaningful cases over large fixture setups asserting every internal method call.
+
+For a behavioral fix, look for the original failing input plus a nearby boundary and an unchanged valid case. For a concurrency fix, require controlled overlap and an assertion on durable state. For an API/schema change, include compatibility with an existing consumer or deployment version, not only the newest client.
+
+**Evidence limits:** A mocked repository cannot prove transaction isolation; an in-memory database cannot prove provider-specific SQL behavior; a unit test cannot establish p99 latency. State the gap and choose the smallest higher-fidelity check that addresses it rather than demanding an unrelated full E2E suite.
+
 Test code is first-class production infrastructure. If a reviewer scrutinizes the C# application code for 20 minutes and rubber-stamps the `Tests.cs` file in 10 seconds, broken or useless tests will enter the repository and rot the CI pipeline.
 
 ```csharp
@@ -814,6 +852,14 @@ format: <label> [decorations]: <subject>
   *Example:* `praise: This benchmark comparing the Span parsing against Regex is fantastic. Clear, verifiable data!`
 
 ### 9.2 Psychological Safety & Eliminating Bikeshedding
+
+#### Separate a Defect, a Question, and a Preference
+
+- **Defect:** Explain a reachable scenario and the violated requirement. Provide a reproduction or a test when feasible.
+- **Question:** State the missing context and what decision depends on the answer. Do not disguise a mandatory change as a vague question.
+- **Preference:** Mark it non-blocking unless it follows an agreed standard or materially affects maintainability.
+
+Offer the smallest adequate fix without forcing the author to implement your entire preferred design. If a nearby issue predates the change and is not made worse by it, record a separate follow-up rather than expanding the PR indefinitely. Summarize agreed decisions after a live discussion so absent teammates can follow the reasoning.
 
 #### Critique the Code, Never the Person ("You" vs "The Code / We")
 Neuroscience research on workplace threat response shows that phrasing comments with second-person accusations (*"You didn't dispose the stream here"*, *"Why did you write an N+1 loop?"*) triggers defensiveness. Senior reviewers frame feedback objectively around **system properties, failure modes, and shared ownership**:
@@ -1002,6 +1048,22 @@ Directory.Packages.props                    @org/staff-engineers
 ## Section 12 — Documentation Standards & RFC Design Reviews
 
 ### 12.1 Living Documentation & How to Review an Architectural RFC Before Code Is Written
+
+#### Review the Release, Not Only the Final Code State
+
+| Change | Question that must be answered before release |
+|---|---|
+| Database/schema migration | Can old and new application versions coexist, and what prevents a backfill from overwriting newer data? |
+| Public API or event contract | Which deployed consumers can still read/write the contract, including error and enum cases? |
+| Feature flag | Are both states tested, who owns rollout/removal, and what happens to data written while enabled? |
+| New background job | Is work bounded, restartable, observable, and safe under duplicate execution? |
+| Package/configuration change | Are runtime versions, permissions, deployment artifacts, and operational defaults compatible? |
+
+Reverting a commit cannot undo a sent email, external payment, or destructive migration. A credible rollback plan names the data recovery or forward-fix path as well as the deployment switch.
+
+**Closing the review:** Recheck substantive follow-up edits, confirm required checks ran on the current revision, and distinguish resolved comments from verified fixes. Summarize remaining accepted risks and their owners. Approval means the change meets the agreed bar with stated evidence; it does not certify the absence of every possible defect.
+
+**Practice:** Review a feature-flagged currency migration. Write one blocking correctness comment, one clarification question, and one non-blocking suggestion, then describe the old/new-version test and rollback evidence required for approval.
 
 #### 1. Why Reviewing a 2-Page RFC Saves 2 Weeks of PR Rewrites
 The most expensive time to discover that a feature was designed with the wrong architectural pattern is **after the engineer has already spent 8 days writing 1,200 lines of code and tests**.

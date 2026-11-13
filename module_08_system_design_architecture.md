@@ -125,6 +125,19 @@ Every section in Part II provides comprehensive senior-level instruction:
 
 A 45-to-60-minute system design interview tests your ability to navigate ambiguity, drive technical consensus, make explicit trade-offs, and design scalable architectures under time pressure.
 
+#### Turn Adjectives into Testable Requirements
+
+"Fast," "scalable," and "highly available" cannot select an architecture. Convert each into a scenario with an actor, workload, failure condition, and measurable response:
+
+| Vague requirement | Useful clarification |
+|---|---|
+| Fast checkout | p99 under 500 ms at 2,000 requests/s, including downstream authorization |
+| No data loss | An acknowledged payment must remain recoverable after losing one region |
+| Handles growth | Sustain ten times today's writes, including the largest tenant's burst, within a stated cost budget |
+| Highly available search | Return a clearly labeled stale result during index outages, but never bypass access controls |
+
+Separate hard invariants from negotiable quality targets. A confirmed reservation must not oversell; analytics may lag by minutes. Then identify the critical path and the system of record for each fact before choosing products. Record unanswered assumptions and revisit the design when an assumption changes.
+
 ```text
 [ 00:00 - 05:00 ]  STAGE 1: Clarify Requirements & Scope (Functional & Non-Functional)
 [ 05:00 - 10:00 ]  STAGE 2: Back-of-the-Envelope Estimation (QPS, Storage, Bandwidth, Memory)
@@ -162,11 +175,19 @@ $$\text{Peak QPS} = \text{Average QPS} \times 2 \text{ (or } 3\times \text{ to }
   - Total 5-Year Storage:
     $$\text{Storage} = 6 \times 10^9 \times 550 \text{ bytes}\approx 3.3 \text{ Terabytes (TB)}$$
     *(Senior Insight: 3.3 TB is small enough to fit on a single modern high-capacity SSD or small relational/NoSQL cluster! We do NOT need massive sharding for storage volume alone.)*
-- **Memory Cache Sizing (Pareto 80/20 Rule):**
-  - Cache the top 20% most popular URLs requested daily:
-  - Daily read requests: $\frac{10^9}{30}\approx 33.3 \text{ Million reads/day}$.
-  - Memory required to cache 20% of daily reads:
-    $$\text{Cache Memory} = 33.3 \times 10^6 \times 0.20 \times 550 \text{ bytes}\approx 3.66 \text{ GB of RAM}$$
+- **Memory Cache Sizing (Working Set, Not Request Count):**
+  - Daily read requests are about 33.3 million, but many can target the same URL. Requests do not determine distinct cached-key count.
+  - If measurement suggests a hot set of 6.66 million distinct URLs, raw value storage is approximately:
+    $$\text{Cache Payload} = 6.66 \times 10^6 \times 550 \text{ bytes}\approx 3.66 \text{ GB}$$
+  - Add key, entry, allocator, replication, and eviction headroom. Treat the 80/20 distribution as a hypothesis to verify from access traces, not a law.
+
+#### Estimate the Failure Case as Well as the Happy Path
+
+The 3.3 TB above counts logical row payload only. Indexes, replicas, logs, backups, and temporary rebuild space can multiply the capacity requirement. Likewise, a service with a 95% cache hit rate can send twenty times its normal read traffic to the database when the cache is cold.
+
+Keep an assumption ledger: average and peak request rates, read/write ratio, payload percentiles, hot-key distribution, retention, replication factor, and cost per operation. Show a plausible range when a number is unknown. A peak multiplier of three is not sufficient evidence for a flash-sale workload; ask for burst duration and concentration.
+
+**Checkpoint:** Two regions each operate at 60% of their local capacity under an equal traffic split. Losing one requires the survivor to handle 120% of its capacity before autoscaling. Explain the required spare capacity, admission control, or degraded feature set rather than counting replicas alone.
     *(Senior Insight: A single modest 16 GB Redis cluster can easily cache 20% of daily traffic with plenty of headroom!)*
 
 ### Section 1 Review: Interview Questions & Practice Exercises
@@ -214,6 +235,12 @@ $$A_{\text{total}} = A_1 \times A_2 = 0.999 \times 0.999 = 0.998001\approx \math
 #### 2. Parallel Redundancy (Resilient Fallback):
 If Service A has a primary instance and an active-active secondary replica, both with $99.9\%$ availability:
 $$A_{\text{total}} = 1 - (1 - A_1) \times (1 - A_2) = 1 - (0.001 \times 0.001) = 1 - 0.000001 = \mathbf{99.9999\%}$$
+
+**Assumptions matter:** These products assume independent component availability and a request model matching the dependency graph. Shared identity, DNS, database, deployment, or control-plane failures violate that independence. Parallel replicas only help if routing detects failures, surviving capacity is sufficient, and required state is accessible. Measure the user journey instead of multiplying provider SLAs and calling the result a guarantee.
+
+Define SLI denominators explicitly. A request-based success SLO counts eligible good requests divided by eligible total requests; its budget is failed requests, not automatically minutes of downtime. A time-based availability SLO uses time intervals. Low traffic, partial failures, and tenant-specific outages make these measurements differ.
+
+**Tail latency:** A fan-out request waits for its slowest required branch. More parallel dependencies increase the chance of encountering a slow branch, even when average latency looks healthy. Use a deadline, bounded fan-out, and an explicit policy for optional results; do not add percentile values as though they were means.
 
 ---
 
@@ -1049,6 +1076,20 @@ By placing a durable broker (**Azure Service Bus / Kafka**) between the ingestio
 
 ### 8.2 Backpressure, Bounded Channels & Priority Load Shedding in C#
 
+#### A Queue Buys Time, Not Throughput
+
+Little's Law describes averages in a stable system with consistent boundaries; it is not a formula for deriving a safe hard limit from a p99 latency. If arrivals exceed sustainable completions, a backlog grows rather than reaching steady state.
+
+Suppose arrivals are 2,000 jobs/s and workers complete 1,500 jobs/s for ten minutes:
+
+$$B = (2{,}000-1{,}500) \times 600 = 300{,}000\text{ queued jobs}$$
+
+If arrivals then fall to 1,000 jobs/s, spare processing capacity is 500 jobs/s, so draining that backlog takes another 600 seconds, assuming unchanged job cost. Scaling workers will not improve this if the database is already the bottleneck.
+
+Set limits using the acceptable age of work, downstream throughput, per-item memory/storage cost, and recovery capacity. Monitor oldest-message age as well as queue depth. Define what happens when the limit is reached: reject new work, defer it durably, reduce optional work, or shed a documented low-priority class. An unbounded queue merely converts overload into timeouts and delayed failure.
+
+**Practice:** Recalculate the drain time when retries add 20% more processing work. Identify which admission limit must change to meet a fifteen-minute job-completion target.
+
 #### Never Use `Channel.CreateUnbounded<T>()` in Production
 An unbounded in-memory queue (`Channel.CreateUnbounded<T>()` or `ConcurrentQueue<T>`) is an **Out-Of-Memory (`OutOfMemoryException`) time bomb**. If producers enqueue at $10,000\text{ items/sec}$ while the consumer slows to $1,000\text{ items/sec}$, the process accumulates $9,000\text{ objects/sec}$ in Gen 2 heap until the container is OOM-killed by Kubernetes—losing all in-memory work!
 
@@ -1336,12 +1377,14 @@ flowchart TD
 
 #### 1. Multi-Region Topologies & RPO/RTO Matrix
 
+The figures below are illustrative planning ranges, not service guarantees. Actual recovery depends on replication mode, detection, decision-making, routing, warm capacity, and tested procedures.
+
 | Topology | Mechanism | RTO (Downtime) | RPO (Data Loss) | Cost & Complexity |
 |---|---|---|---|---|
 | **Backup & Restore (Cold DR)** | Nightly geo-redundant backups (`GRS`) restored into a new region on disaster. | $4\text{–}24\text{ hours}$ | $1\text{–}24\text{ hours}$ | $1.1\times$ base cost; lowest complexity. |
 | **Pilot Light (Warm Standby)** | Database replicates continuously to Region B; compute is scaled to 0/minimal until failover. | $10\text{–}30\text{ minutes}$ | $5\text{–}60\text{ seconds}$ | $1.3\times$ base cost; moderate complexity. |
 | **Hot Standby (Active-Passive)** | Full compute & DB replica running in Region B; only Region A takes write traffic. | $30\text{ seconds}\text{–}2\text{ mins}$ | $< 5\text{ seconds}$ | $2.0\times$ base cost; requires automated failover testing. |
-| **Multi-Region Active-Active** | Both regions accept reads and writes simultaneously near the user. | $\approx \mathbf{0\text{ seconds}}$ | $\approx 0\text{ (or conflict resolution)}$ | $2.2\times+$ base cost; requires CRDTs / LWW conflict resolution or Geo-Homed user sharding. |
+| **Multi-Region Active-Active** | Both regions serve traffic; write ownership and replication are explicitly defined. | Low only with working routing and sufficient surviving capacity | Depends on replication and acknowledgement policy; asynchronous replication can lose acknowledged writes | Higher cost; requires a deliberate conflict or write-ownership model |
 
 #### 2. Composite Multi-Region Availability Math
 Suppose a single Azure region stack (AKS + Database + Load Balancer) achieves **$99.99\%$ availability** ($52.6\text{ minutes}$ downtime/year).
@@ -1356,6 +1399,14 @@ $$A_{\text{multi-region}} = 1 - (1 - A_{\text{region}})^2 = 1 - (1 - 0.9999)^2 =
 #### 4. Split-Brain Prevention During Failover
 If the network link between Region A (Primary DB) and Region B (Standby DB) severs, Region B might promote itself to Primary while Region A is still accepting writes from US clients (**Split-Brain**—two primaries accepting conflicting financial writes!).
 - **Prevention:** Use **Consensus Quorum (3 regions / witness zone)** and **Fencing Tokens (STONITH / Lease Epoch Numbers)**. When Region B acquires the new primary lease (`Epoch = 42`), storage nodes immediately reject any in-flight writes carrying Region A's stale `Epoch = 41`.
+
+#### Recovery Includes Failback and Derived State
+
+Replication is not a backup: it can replicate accidental deletion or corrupt business writes immediately. Rehearse restoration into an isolated environment and measure recovery until the user journey works, not only until the database process starts.
+
+Inventory the authoritative data, object storage, encryption keys, identity configuration, message offsets, and derived indexes needed for recovery. A restored database can be older than an external payment provider or a delivered message; reconciliation must detect those discrepancies before normal processing resumes.
+
+Plan failback as carefully as failover: fence the old writer, reconcile divergence, restore redundancy, then move traffic progressively. An RPO target describes tolerated loss; it does not by itself establish which acknowledged operations actually survived.
 
 ---
 
@@ -1697,7 +1748,15 @@ flowchart LR
 #### Key Architecture Trade-Offs in RAG:
 1. **Chunking Strategy:** Fixed-size chunking (e.g., 500 tokens with 50-token overlap) vs Semantic chunking (chunking by paragraph/section).
 2. **Hybrid Search:** Combining **Vector Similarity Search (Dense)** with **BM25 Keyword Search (Sparse)** and a Reranker produces vastly superior retrieval accuracy than pure vector search alone.
-3. **Semantic Caching:** Caching user query embeddings in Redis. If a new prompt has a cosine similarity $> 0.98$ to a cached query, return the cached answer immediately, saving LLM cost and 1-3 seconds of latency!
+3. **Semantic Caching:** Similar queries may reuse answers when authorization scope, source versions, freshness requirements, and evaluation results permit it. A cosine threshold such as 0.98 is a tuning parameter, not proof that two questions have the same answer.
+
+#### Retrieval Quality and Access Boundaries Are Architectural Requirements
+
+Filter retrieval by the caller's authorized tenant/document scope before passing context to the model. Include that scope and source/version information in cache identity. Source deletion or a permission change must propagate to chunks, indexes, and cached answers; deleting the original file alone is insufficient.
+
+Treat retrieved text as untrusted data, not instructions authorizing tools or changing application policy. Tool permissions and consequential actions belong to explicit application controls. Avoid sending confidential source material to an unapproved model service merely because retrieval found it.
+
+Evaluate retrieval and generation separately on representative questions: did retrieval find the relevant evidence, did the answer follow it, and were citations accurate? Include no-answer cases and conflicting/outdated documents. Define a grounded refusal or escalation when evidence is insufficient, and track latency and cost alongside quality. A plausible demo answer is not a production acceptance criterion.
 
 ---
 

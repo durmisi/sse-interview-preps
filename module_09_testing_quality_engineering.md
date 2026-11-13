@@ -152,6 +152,24 @@ Cost to Remediate Defect (Logarithmic Scale)
 
 ### 1.2 Strategy Shapes: Test Pyramid vs Testing Trophy vs Microservices Honeycomb
 
+#### Start with Risk and an Oracle
+
+A **test oracle** is the independent reason you know an outcome is correct: a business rule, a reviewed example, a conservation invariant, or a simpler reference implementation. Copying the production formula into the expected-value calculation can reproduce the same bug on both sides of the assertion.
+
+Choose the smallest test boundary that can expose the actual risk:
+
+| Risk | Useful evidence | Insufficient substitute |
+|---|---|---|
+| Incorrect discount boundary | Unit cases immediately below, at, and above the threshold | "Method was called" |
+| SQL translation or uniqueness error | Integration test against the production database engine | Mocked `DbSet` or EF InMemory |
+| Breaking external response | Consumer/provider contract verification plus compatibility fixtures | Provider compilation alone |
+| Duplicate charge after retry | Stateful integration test of durable idempotency and failure windows | A happy-path HTTP 200 assertion |
+| Broken user journey | A small number of realistic E2E flows | Many isolated component snapshots |
+
+Test shapes are heuristics for balancing feedback cost and fidelity, not required percentages. A thin CRUD service may gain more from database-backed integration tests than hundreds of mocked handler tests. Pure pricing logic benefits from fast, exhaustive boundary cases and property tests.
+
+**Completion check:** For each critical invariant, name a test that would fail if it were violated and a remaining risk that test cannot detect.
+
 Different system architectures require fundamentally different test distributions. Selecting the wrong test shape wastes engineering budget and creates brittle CI pipelines.
 
 ```text
@@ -691,6 +709,14 @@ public sealed class IntegrationTestBase : IAsyncLifetime
 
 ### 5.2 Fast Database State Reset with Respawn & Why EF Core InMemory Is an Anti-Pattern
 
+#### Isolation Must Include Background Work
+
+Resetting a shared database while another test or background consumer is still using it creates races, even if individual tests have unique IDs. Either give parallel workers independent databases/schemas or serialize all tests sharing a reset boundary. Stop and await background work before cleaning its resources.
+
+Transaction rollback is not universal cleanup: the HTTP server may open separate connections, commit its own transactions, or publish messages outside the test transaction. Migrations should run against the same engine family used in production, and representative tests should cover schema upgrade paths as well as creation from an empty database.
+
+**Testing a race deliberately:** For an optimistic-concurrency update, load the same row into two independent contexts, coordinate both reads before permitting writes, then assert that only the allowed outcome commits. Do not rely on two `Task.Run` calls happening to overlap. For duplicate-message handling, use separate transactions and verify one durable business effect, not merely one mock invocation.
+
 Starting a new Docker container and running EF Core migrations for every single test method takes $3\text{--}8\text{ seconds}$ per test—unacceptable for a 300-test suite. Conversely, sharing a single container across 300 tests without cleaning up rows causes **shared state pollution** and flaky failures.
 
 Jimmy Bogard's **Respawn** library solves this by inspecting the database's foreign key metadata graph once and generating a topological `DELETE` / `TRUNCATE` script that resets all modified tables in **under 5–10 milliseconds** while preserving the `__EFMigrationsHistory` table!
@@ -801,6 +827,12 @@ STEP 2: PROVIDER CI PIPELINE (InventoryService)                  +--------------
 ---
 
 ### 6.2 PactNet Implementation in C#: Consumer Contract Generation & Provider Verification
+
+#### What Contract Tests Do Not Prove
+
+A verified contract establishes compatibility for the interactions and matchers it contains. It does not prove production authorization configuration, latency, transaction isolation, or the correctness of an unasserted business field. An overly broad matcher can accept a structurally valid but meaningless response.
+
+Use deterministic provider-state setup, verify the provider against the consumer versions actually deployed or planned for deployment, and retain a few cross-service journey tests for orchestration. Schema validation complements consumer contracts; neither replaces business-rule tests. Add a semantic fixture when meaning changes without a JSON shape change, such as monetary units or default filtering.
 
 #### Side 1: Consumer Test (`OrderService.ContractTests`)
 The consumer defines the minimal JSON fields it actually needs (Postel's Law / Tolerant Reader pattern) and runs against Pact's local mock server:
@@ -1127,6 +1159,14 @@ Stryker issues a Mutation Score of **0%**, exposing that the test suite provides
 
 ### 9.2 Property-Based Testing with FsCheck / CsCheck & Snapshot Testing with Verify
 
+#### Design Generators and Properties Together
+
+Random generation is not automatic domain coverage. Constrain valid inputs deliberately and generate invalid inputs in separate tests. Include zero, minimum/maximum supported values, duplicates, and Unicode where relevant; excessive filtering can discard most generated cases and leave important regions untested.
+
+Retain the seed and smallest counterexample when a property fails, then add a named regression example if it represents an important business boundary. A round-trip property alone is weak when encoder and decoder share the same mistaken assumption; combine it with known external-format fixtures or an independent model.
+
+**Mutation scores need interpretation:** Surviving mutants can reveal missing assertions, but equivalent mutants and unimportant implementation changes exist. Prioritize mutants that violate critical observable behavior rather than writing tests against private details to reach a numeric target. Snapshot updates also require review: accepting a new snapshot is a specification decision, not a mechanical way to make CI green.
+
 Example-based unit tests (`[Fact]` and `[InlineData]`) only verify the specific inputs a developer thought to write down. **Property-Based Testing** (pioneered by QuickCheck in Haskell and implemented in .NET via **FsCheck** and **CsCheck**) flips the paradigm:
 1. You define universal **mathematical invariants (properties)** that must hold true for *any* valid input (e.g., conservation of money across split payments, round-trip serialization symmetry, idempotency).
 2. The framework generates **hundreds or thousands of adversarial random inputs** (including `0`, `decimal.MaxValue`, negative boundaries, NaN, Unicode edge cases).
@@ -1220,6 +1260,14 @@ public sealed class InvoiceSnapshotTests
 
 ### 10.1 Load, Stress, Soak & Spike Testing with NBomber in C# and k6
 
+#### Define the Workload and Pass Criteria First
+
+Specify arrival rate, concurrency limits, payload distribution, read/write mix, tenant skew, warm/cold caches, and dependency behavior. Use isolated test tenants and non-production payment/message endpoints; load tests must not accidentally create real charges or customer notifications.
+
+Report offered load, completed throughput, rejected/failed requests, timeout counts, and latency together. A p99 computed only from successful fast requests can look excellent while most traffic times out. Also verify that the load generator is not CPU/network-limited and that scheduled requests were actually issued; an arrival-rate configuration alone does not guarantee valid measurements.
+
+Separate a short CI performance smoke test from a controlled capacity experiment. Shared runners are noisy, so use repeatable baselines, representative hardware, and statistically meaningful samples for regression claims. Never average per-instance p99 values into a supposed global p99; aggregate the latency distribution instead.
+
 Functional tests verify that an endpoint works for **1 user**; non-functional load tests verify that it survives **10,000 concurrent users** without ThreadPool starvation, connection pool exhaustion, or tail-latency collapse.
 
 #### The Four Load Profile Archetypes
@@ -1298,6 +1346,14 @@ public sealed class CheckoutLoadTests
 ## Section 11 — Test Reliability, Flakiness & Suite Speed Optimization
 
 ### 11.1 Diagnosing and Eliminating Flaky Tests (Async Races, Shared State, Determinism)
+
+#### Coordinate the Event, Not an Assumed Delay
+
+For asynchronous tests, establish the observation hook before triggering work, then await a specific completion signal with a bounded timeout. The timeout prevents a hung suite; it is not the synchronization mechanism. Propagate worker exceptions to the test rather than letting the test time out without the cause.
+
+Fake time controls timer deadlines, not arbitrary task scheduling. Ensure a worker has registered its timer before advancing time, then await its resulting work. Advancing a fake clock by one hour does not prove every continuation or I/O operation has completed.
+
+**Failure triage:** Preserve the first failure's logs, random seed, trace, and environment. A passing rerun is evidence of nondeterminism, not a fix. If quarantine is needed to unblock delivery, give it an owner, expiry, tracked risk, and a replacement check for critical behavior. Track first-run failure rate so retries do not hide declining suite reliability.
 
 A **flaky test** is a test that exhibits both passing and failing outcomes against the exact same Git commit. Google's engineering productivity research revealed that unchecked flakiness is corrosive: once a CI pipeline fails randomly $5\text{--}10\%$ of the time, engineers lose trust in the suite, click "Re-run Failed Jobs" reflexively, and eventually merge real production bugs.
 
