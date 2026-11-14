@@ -30,6 +30,21 @@ Every section in Part II provides comprehensive senior-level instruction:
   - Distributed transactions, Sagas, Outbox pattern, and messaging semantics → Module 07
   - System-level scalability, Domain-Driven Design (strategic contexts), and microservices → Module 08
 
+## Progress tracker
+
+| Section | Topic | Status | Confidence (1-5) | Notes / Review Date |
+|---|---|---|---|---|
+| 1 | Object-Oriented Programming (OOP) Deep Dive | [ ] Not Started | | |
+| 2 | SOLID Principles in Practice | [ ] Not Started | | |
+| 3 | Clean Code, Readability & Expressiveness at Scale | [ ] Not Started | | |
+| 4 | Core Software Design Principles & Heuristics | [ ] Not Started | | |
+| 5 | Coupling: Mechanics, Metrics & Minimization | [ ] Not Started | | |
+| 6 | Cohesion: Class, Module & Architectural Boundaries | [ ] Not Started | | |
+| 7 | Abstraction & Encapsulation in Depth | [ ] Not Started | | |
+| 8 | Maintainability, Technical Debt & Evolution | [ ] Not Started | | |
+| 9 | Applying Fundamentals to Enterprise .NET Architecture | [ ] Not Started | | |
+| 10 | Senior-Level Design Reviews & Interview Scenarios | [ ] Not Started | | |
+
 ---
 
 # Part I — Complete Curriculum
@@ -162,9 +177,11 @@ Object-Oriented Programming models software as collaborating units termed **obje
 2. **Behavior:** The operations, transformations, and business actions the object can perform upon its state or in coordination with other objects.
 3. **Identity:** The unique existence of the object that distinguishes it from all other objects, even if their state is byte-for-byte identical.
 
-In C#/.NET:
-- A **Class** is the metadata and executable blueprint defined in IL (Intermediate Language) and loaded into the CLR's internal `MethodTable`.
-- An **Object** is a concrete instance allocated on the GC Heap, consisting of an Object Header (sync block index), a MethodTable Pointer (`TypeHandle`), and memory fields.
+In Domain-Driven Design (Eric Evans, *Domain-Driven Design*, 2003; [Martin Fowler, *ValueObject*](https://martinfowler.com/bliki/ValueObject.html)), **Entities** are defined by continuity and identity across state mutations, whereas **Value Objects** have no conceptual identity and are interchangeable whenever their attributes match.
+
+In the .NET Common Language Runtime (CLR), per the [*.NET Book of the Runtime (BOTR): Type System & Object Layout*](https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/type-system.md), the [ECMA-335 CLI Specification](https://ecma-international.org/publications-and-standards/standards/ecma-335/), and Konrad Kokosa (*Pro .NET Memory Management*, 2018):
+- A **Class** is the metadata and executable blueprint defined in Intermediate Language (IL) and loaded into the CLR's internal `MethodTable` (type descriptor).
+- An **Object** is a concrete instance allocated on the managed GC Heap. Every reference type reference (`Object*`) points directly to the 8-byte `MethodTable*` (`TypeHandle`) on 64-bit runtimes; immediately *preceding* that pointer at offset `-8` sits an 8-byte header block (4 bytes of zero/alignment padding plus the 4-byte `ObjHeader` / SyncBlockIndex storing thin locks, GC mark bits, and cached hash codes). Instance fields follow the `MethodTable*`, and the minimum size of any heap-allocated reference object on 64-bit .NET is **24 bytes** (8-byte header block + 8-byte `MethodTable*` + at least 8 bytes of payload/padding).
 
 #### C#/.NET Implementation
 ```csharp
@@ -181,6 +198,8 @@ public sealed class BankAccount
         Id = id ?? throw new ArgumentNullException(nameof(id));
         Number = number ?? throw new ArgumentNullException(nameof(number));
         ArgumentNullException.ThrowIfNull(initialDeposit);
+        if (initialDeposit.Amount < 0)
+            throw new ArgumentOutOfRangeException(nameof(initialDeposit), "Initial deposit cannot be negative.");
 
         Balance = initialDeposit;
         _transactions.Add(new Transaction(Guid.CreateVersion7(), initialDeposit, TransactionType.Credit, DateTimeOffset.UtcNow));
@@ -192,7 +211,7 @@ public sealed class BankAccount
         if (amount.Amount <= 0)
             throw new ArgumentOutOfRangeException(nameof(amount), "Deposit amount must be positive.");
 
-        Balance = Balance.Add(amount);
+        Balance = Balance.Add(amount); // Enforces currency match inside Money
         _transactions.Add(new Transaction(Guid.CreateVersion7(), amount, TransactionType.Credit, DateTimeOffset.UtcNow));
     }
 
@@ -201,9 +220,11 @@ public sealed class BankAccount
         ArgumentNullException.ThrowIfNull(amount);
         if (amount.Amount <= 0)
             throw new ArgumentOutOfRangeException(nameof(amount), "Withdrawal amount must be positive.");
+        if (!string.Equals(Balance.Currency, amount.Currency, StringComparison.Ordinal))
+            throw new InvalidOperationException($"Currency mismatch: {Balance.Currency} vs {amount.Currency}");
 
         if (Balance.Amount < amount.Amount)
-            throw new InvalidOperationException($"Insufficient funds. Current balance: {Balance.Amount}, requested: {amount.Amount}");
+            throw new InvalidOperationException($"Insufficient funds. Current balance: {Balance.Amount} {Balance.Currency}, requested: {amount.Amount} {amount.Currency}");
 
         Balance = Balance.Subtract(amount);
         _transactions.Add(new Transaction(Guid.CreateVersion7(), amount, TransactionType.Debit, DateTimeOffset.UtcNow));
@@ -253,35 +274,73 @@ The CLR type system divides all types into two semantic categories:
 | **Heap Boxing Risk** | Never | When cast to `object` or `interface` | Never | When cast to `object` or `interface` |
 
 #### Memory Layout and Allocation Mechanics
-Every heap object in the 64-bit CLR has an overhead of 16 bytes:
-1. **Object Header (8 bytes):** Stores synchronization block index, hash codes, and GC pinning flags.
-2. **MethodTable Pointer (8 bytes):** Points to the type's runtime descriptor and virtual method dispatch table.
+Every heap object in the 64-bit CLR carries **16 bytes of fixed runtime overhead** (plus any alignment padding so reference fields align on 8-byte boundaries):
+1. **Object Header Block (8 bytes at `Object* - 8`):** 4 bytes of alignment padding followed by the 4-byte `ObjHeader` storing the synchronization block index (thin locks / `Monitor`), cached identity hash codes, and GC header flags.
+2. **MethodTable Pointer (8 bytes at `Object* + 0`):** Points to the type's runtime descriptor and virtual method dispatch table.
 
-A `struct` has **zero object header overhead** when stored unboxed. However, casting a struct to an interface (e.g., `IComparable`) triggers **boxing**: the CLR allocates a box object on the heap, copies the struct value into it, and returns the reference.
+A `struct` has **zero object header overhead** when stored unboxed on the stack, inline inside an array (`T[]`), or embedded as a field within a reference type. However, casting a struct to `object` or an implemented interface (e.g., `IComparable`) triggers **boxing**: the CLR allocates a 24+ byte box object on the heap, copies the struct's bits into it, and returns the heap reference ([ECMA-335](https://ecma-international.org/publications-and-standards/standards/ecma-335/) / [Microsoft Learn: Value Types](https://learn.microsoft.com/dotnet/csharp/language-reference/builtin-types/struct)).
+
+#### Defensive Copying on Non-`readonly` Structs
+When a mutable `struct` is stored in a `readonly` field, passed via an `in` parameter (`in LargeStruct`), or accessed through a `ref readonly` local, the C# compiler cannot prove whether invoking an instance method or property getter will mutate the struct's fields. To preserve `readonly` guarantees without breaking compilation, **the compiler silently emits a defensive stack copy (`ldobj` into a temporary local)** before every non-`readonly` member call (flagging `CS8656` if analyzers are enabled). On hot paths with large structs (64+ bytes), hidden defensive copies destroy CPU cache efficiency and introduce subtle bugs where mutations happen on the discarded copy rather than the stored field ([Microsoft Learn: Write safe and efficient C# — `readonly` structs](https://learn.microsoft.com/dotnet/csharp/write-safe-efficient-code#use-readonly-structs-to-avoid-defensive-copies); Sergey Teplyakov, [*The 'in'-modifier and the readonly structs in C#*](https://devblogs.microsoft.com/premier-developer/the-in-modifier-and-the-readonly-structs-in-c/)).
 
 #### C#/.NET Implementation
 ```csharp
 // Record Class: Reference semantics with value equality and init-only immutability
-public record Money(decimal Amount, string Currency)
+public sealed record Money(decimal Amount, string Currency)
 {
     public Money Add(Money other)
     {
-        if (Currency != other.Currency)
-            throw new InvalidOperationException($"Currency mismatch: {Currency} vs {other.Currency}");
+        EnsureSameCurrency(other);
         return this with { Amount = Amount + other.Amount };
+    }
+
+    public Money Subtract(Money other)
+    {
+        EnsureSameCurrency(other);
+        return this with { Amount = Amount - other.Amount };
+    }
+
+    private void EnsureSameCurrency(Money other)
+    {
+        ArgumentNullException.ThrowIfNull(other);
+        if (!string.Equals(Currency, other.Currency, StringComparison.Ordinal))
+            throw new InvalidOperationException($"Currency mismatch: {Currency} vs {other.Currency}");
     }
 }
 
-// Readonly Record Struct: Value semantics, stack-friendly, no boxing, generated == operator
-public readonly record struct GeoCoordinate(double Latitude, double Longitude)
+// Readonly Record Struct: Value semantics, zero defensive copies, generated == operator
+// Always check double.IsFinite() first: IEEE 754 NaN makes `< -90 or > 90` evaluate to false!
+public readonly record struct GeoCoordinate
 {
-    public GeoCoordinate
+    public double Latitude { get; }
+    public double Longitude { get; }
+
+    public GeoCoordinate(double latitude, double longitude)
     {
-        if (Latitude is < -90 or > 90)
-            throw new ArgumentOutOfRangeException(nameof(Latitude), "Latitude must be between -90 and 90.");
-        if (Longitude is < -180 or > 180)
-            throw new ArgumentOutOfRangeException(nameof(Longitude), "Longitude must be between -180 and 180.");
+        if (!double.IsFinite(latitude) || latitude is < -90 or > 90)
+            throw new ArgumentOutOfRangeException(nameof(latitude), "Latitude must be finite and between -90 and 90.");
+        if (!double.IsFinite(longitude) || longitude is < -180 or > 180)
+            throw new ArgumentOutOfRangeException(nameof(longitude), "Longitude must be finite and between -180 and 180.");
+
+        Latitude = latitude;
+        Longitude = longitude;
     }
+}
+
+// Defensive copy trap vs readonly struct fix:
+public struct MutableEnvelope // Missing `readonly`
+{
+    public long PayloadA, PayloadB, PayloadC, PayloadD; // 32 bytes
+    public long Checksum() => PayloadA ^ PayloadB ^ PayloadC ^ PayloadD;
+}
+
+public sealed class EnvelopeProcessor
+{
+    private readonly MutableEnvelope _cached = new();
+
+    // Every call to _cached.Checksum() silently copies all 32 bytes onto the stack!
+    // Fix: declare `public readonly struct ImmutableEnvelope` or mark `public readonly long Checksum()`
+    public long Compute() => _cached.Checksum();
 }
 ```
 
@@ -291,9 +350,9 @@ public readonly record struct GeoCoordinate(double Latitude, double Longitude)
 
 #### Fundamentals & Internal Mechanics
 Encapsulation is commonly misunderstood as simply putting private backing fields behind public properties with getters and setters. That is **data hiding**, which is merely a syntactic mechanism.
-**Encapsulation** is the strict bundling of data with the business rules that manipulate it, such that the object hides its internal representation and guarantees that its **invariants** (rules that must always hold true) are never violated.
+**Encapsulation** is the strict bundling of data with the business rules that manipulate it, such that the object hides its internal representation and guarantees that its **invariants** (rules that must always hold true) are never violated (Vladimir Khorikov, *Unit Testing Principles, Practices, and Patterns*, 2020).
 
-An **Anemic Domain Model** (where entities have public getters and setters and all logic lives in external `Service` classes) completely destroys encapsulation.
+An **Anemic Domain Model** ([Martin Fowler, *"AnemicDomainModel"* (2003)](https://martinfowler.com/bliki/AnemicDomainModel.html))—where entities expose public getters and setters while all validation and state transitions live in external `Service` classes—destroys encapsulation, scatters invariant checks across dozens of handlers, and makes illegal business states constructible anywhere in the codebase (Eric Evans, *Domain-Driven Design*, 2003).
 
 #### Enterprise Refactoring: Anemic Order vs Encapsulated Domain Model
 
@@ -385,7 +444,7 @@ public record OrderLine(ProductId ProductId, int Quantity, Money UnitPrice)
 2. **Arguments get swapped silently.** `Transfer(Guid fromAccountId, Guid toAccountId, Guid initiatedByUserId)` compiles just fine with the arguments in any order. The bug shows up in production as money moving the wrong way.
 3. **Meaning gets lost.** `decimal 19.99` doesn't say whether it's EUR or USD, gross or net, or rounded to cents.
 
-A **Value Object** fixes this by making the concept a type that **can only be constructed in a valid state**. Once a value of type `EmailAddress` exists, the rest of the system never needs to validate it again. This is often summarized as ***"parse, don't validate"***: check the raw input once at the boundary and turn it into a type that carries the proof.
+A **Value Object** fixes this by making the concept a type that **can only be constructed in a valid state**. Once a value of type `EmailAddress` exists, the rest of the system never needs to validate it again. [Alexis King (*"Parse, don't validate"*, 2019)](https://lexi-lambda.github.io/blog/2019/11/05/parse-dont-validate/) captures this principle succinctly: check raw untrusted input once at the system boundary and parse it into a domain type whose very existence carries the proof of validity.
 
 ```csharp
 // 1. Strongly-typed IDs: zero-cost wrappers (readonly record struct = no heap allocation)
@@ -453,15 +512,17 @@ public sealed class CustomerConfiguration : IEntityTypeConfiguration<Customer>
 
 #### Fundamentals & Internal Mechanics
 Polymorphism allows objects of different concrete types to be manipulated through a unified interface or base class pointer.
-The CLR implements polymorphic method execution through two distinct dispatch mechanisms:
+The CLR implements polymorphic method execution through two distinct dispatch mechanisms ([*.NET Book of the Runtime: Virtual Stub Dispatch*](https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/virtual-stub-dispatch.md)):
 
 1. **Virtual Method Dispatch (Vtable / MethodTable):**
    - Every class has a `MethodTable` structure created by the runtime at load time.
    - Non-virtual methods are bound at compile time directly to the native code address (static call `call`).
-   - Virtual methods are invoked via indirect call (`callvirt`). The CPU looks up the object's `MethodTable`, indexes into the virtual method slot table, and branches to the overridden address.
-2. **Interface Dispatch (Stub Dispatch):**
+   - Virtual methods are invoked via indirect call (`callvirt`). The CPU reads the object's `MethodTable*`, indexes into the fixed virtual method slot table, and branches to the overridden address.
+2. **Interface Dispatch (Virtual Stub Dispatch — VSD):**
    - Because a class can implement dozens of interfaces in any order, interface methods cannot occupy fixed slot indexes in the class's primary method table.
-   - The CLR uses **Virtual Stub Dispatch (VSD)** consisting of a cache hierarchy (monomorphic inline cache, polymorphic cache, and megamorphic hash table lookup) to resolve interface method addresses efficiently.
+   - The CLR uses **Virtual Stub Dispatch (VSD)** consisting of a cache hierarchy: a fast **lookup/monomorphic dispatch stub** for single-implementer call sites, a **polymorphic inline cache (PIC)** checking a short list of observed `MethodTable*` entries, and a **megamorphic hash table fallback (`ResolveWorker`)** when polymorphism exceeds cache capacity.
+3. **Guarded Devirtualization (GDV) & Dynamic PGO (.NET 8/9):**
+   - Even when a class is *not* sealed, modern RyuJIT uses [**Dynamic Profile-Guided Optimization (Dynamic PGO)**](https://learn.microsoft.com/dotnet/core/whats-new/dotnet-8#dynamic-profile-guided-optimization-pgo) to profile runtime call sites during Tier-0 execution. If 99% of calls on an interface or virtual method target a single concrete type (`SqlOrderRepository`), Tier-1 JIT emits **Guarded Devirtualization**: a cheap pointer comparison (`if (obj.MethodTable == typeof(SqlOrderRepository).MethodTable)`) followed by a **directly inlined** fast path, falling back to VSD/Vtable only if a rare type appears.
 
 #### Shadowing (`new`) vs Overriding (`override`)
 - `override`: Replaces the virtual slot in the object's `MethodTable`. Regardless of whether the variable is typed as the base class or derived class, the derived implementation executes.
@@ -496,12 +557,13 @@ Sealing classes (`public sealed class X`) is a best practice in modern .NET:
 ### 1.5 Composition over Inheritance
 
 #### Fundamentals & Internal Mechanics
-Inheritance is the strongest coupling relationship in object-oriented design. The **Fragile Base Class Problem** occurs when modifications to internal implementation details of a base class inadvertently break the invariants and behavior of derived classes.
+*"Favor object composition over class inheritance"* (Gamma, Helm, Johnson, & Vlissides, *Design Patterns: Elements of Reusable Object-Oriented Software*, 1994). Inheritance is **white-box reuse** and creates the strongest compile-time and behavioral coupling in object-oriented design. The **Fragile Base Class Problem** (Clemens Szyperski, *Component Software*, 1998; Joshua Bloch, *Effective Java*, 3rd ed., Item 18) occurs when safe-looking modifications to internal self-calls inside a base class break invariants in derived classes—or when non-virtual base methods silently bypass subclass shadowing (`new`).
 
-#### The Problem: Inheritance Breakage
+#### The Problem: Two Inheritance Failure Modes
 ```csharp
-// Base class provided by a framework or shared library
-public class ObservableList<T> : List<T>
+// FAILURE MODE 1: List<T>.Add / AddRange are NON-VIRTUAL in .NET!
+// `new void Add` only shadows the method; callers holding List<T> or IList<T> bypass AddCount completely!
+public class ShadowedObservableList<T> : List<T>
 {
     public int AddCount { get; private set; }
 
@@ -510,13 +572,19 @@ public class ObservableList<T> : List<T>
         AddCount++;
         base.Add(item);
     }
+}
 
-    public new void AddRange(IEnumerable<T> collection)
+// FAILURE MODE 2: Fragile Base Class with virtual hooks (e.g., Collection<T> / custom base)
+public class TrackingCollection<T> : System.Collections.ObjectModel.Collection<T>
+{
+    public int InsertCount { get; private set; }
+
+    // If a future base framework implementation changes AddRange() to call InsertItem() directly
+    // or stops delegating via Add(), subclass counters silently double-count or miss items!
+    protected override void InsertItem(int index, T item)
     {
-        foreach (var item in collection)
-        {
-            Add(item); // If base.AddRange internally calls Add(), AddCount gets double-counted!
-        }
+        InsertCount++;
+        base.InsertItem(index, item);
     }
 }
 ```
@@ -555,18 +623,21 @@ public sealed class CountingBuffer<T> : IReadOnlyCollection<T>
 
 ### 1.6 Interfaces vs Abstract Classes
 
+*(Design guideline reference: [Microsoft Learn: Choosing Between Class and Interface](https://learn.microsoft.com/dotnet/standard/design-guidelines/choosing-between-class-and-interface); Krzysztof Cwalina & Brad Abrams, Framework Design Guidelines, 3rd ed., 2020, §4.3.)*
+
 #### Comparison Matrix
 | Dimension | `interface` | `abstract class` |
 |---|---|---|
 | **Multiple Implementation** | Yes (a class can implement multiple interfaces) | No (single base class inheritance only) |
 | **State Storage** | Cannot store instance fields | Can declare instance fields, state, and constructors |
 | **Evolution** | Adding members breaks implementers (unless Default Interface Methods are used) | Can add concrete virtual methods without breaking subclasses |
-| **Speed** | Dispatched via Virtual Stub Dispatch | Dispatched via fixed MethodTable Vtable slot |
+| **Speed** | Dispatched via Virtual Stub Dispatch (or devirtualized via GDV / constrained `call` for `static abstract`) | Dispatched via fixed MethodTable Vtable slot |
 | **Purpose** | Defines a behavioral contract ("Can-Do") | Defines an incomplete template and shared identity ("Is-A") |
 
-#### Default Interface Methods (DIM) in .NET
-Introduced in C# 8, interfaces can provide default method implementations.
-**Critical Rule:** DIM is intended for library authors evolving API contracts for backward compatibility. Default interface implementations are **not inherited by the implementing class directly**; they can only be invoked through an interface reference:
+#### Default Interface Methods (DIM) & Static Abstract Interface Members
+1. **Default Interface Methods (C# 8+):** Intended primarily for library authors evolving published contracts without breaking binary/source compatibility ([Default interface methods](https://learn.microsoft.com/dotnet/csharp/language-reference/proposals/csharp-8.0/default-interface-methods)). Default interface implementations are **not inherited onto the concrete class's public API**; they can only be invoked through an interface reference. If a class implements two interfaces that both define default implementations for the same signature (the **diamond ambiguity**), the class *must* explicitly override the method to resolve ambiguity.
+2. **Static Abstract & Static Virtual Interface Members (C# 11+ / .NET 7+):** Allow contracts to require static factories (`IParsable<TSelf>.Parse`) or operators (`IAdditionOperators<TSelf, TOther, TResult>`) across generic type parameters—enabling **Generic Math** (`INumber<T>`) and zero-allocation polymorphic parsing resolved at compile time via constrained IL calls (`constrained. call`), with no heap allocation or VSD lookup ([Microsoft Learn: Static abstract members in interfaces](https://learn.microsoft.com/dotnet/csharp/whats-new/tutorials/static-virtual-interface-members)).
+
 ```csharp
 public interface IAuditLogger
 {
@@ -579,10 +650,21 @@ public class ConsoleLogger : IAuditLogger
     public void Log(string message) => Console.WriteLine(message);
 }
 
-// Invocation:
+// Invocation of DIM:
 var logger = new ConsoleLogger();
 // logger.LogError("Crash"); // COMPILE ERROR! Not accessible directly on concrete class!
 ((IAuditLogger)logger).LogError("Crash"); // OK: Dispatched via interface reference
+
+// C# 11+ Static Abstract Interface Member (zero-boxing static polymorphism):
+public interface IEntityId<TSelf> where TSelf : struct, IEntityId<TSelf>
+{
+    static abstract TSelf CreateNew();
+}
+
+public readonly record struct InvoiceId(Guid Value) : IEntityId<InvoiceId>
+{
+    public static InvoiceId CreateNew() => new(Guid.CreateVersion7());
+}
 ```
 
 ---
@@ -590,47 +672,58 @@ var logger = new ConsoleLogger();
 ### 1.7 Object Lifecycle and Immutability
 
 #### Fundamentals & Internal Mechanics
-Garbage Collection handles managed memory reclamation, but **it does not manage external unmanaged resources** (operating system handles, database connections, sockets, locks).
+Garbage Collection handles managed memory reclamation, but **it does not manage external unmanaged resources** (operating system handles, database connections, sockets, locks). For synchronous resources, implement [`IDisposable`](https://learn.microsoft.com/dotnet/standard/garbage-collection/implementing-dispose); for resources that perform asynchronous flush or network teardown (such as `DbContext`, `Stream`, or gRPC channels), implement [**`IAsyncDisposable` (`await using`)**](https://learn.microsoft.com/dotnet/standard/garbage-collection/implementing-disposeasync) so teardown does not block thread-pool threads via `.GetAwaiter().GetResult()`.
 
-#### `IDisposable` and the Standard Dispose Pattern
+#### Construction Invariants: Constructors vs `init` vs `required`
+- **`init`-only properties** allow object-initializer ergonomics while freezing fields after construction finishes.
+- **C# 11 `required` members** force callers using `new T { ... }` to supply a property at compile time. **Senior caveat:** `required` validates *syntactic assignment*, not *business invariants* (a caller can still pass `""` or invalid cross-field combinations unless guarded in a constructor or static factory, and reflection/some serializers bypass `required` unless `[SetsRequiredMembers]` and constructors are used carefully). For domain entities and validated value objects, prefer **private constructors + static factories (`Create()`)** or **validated constructors**.
+
+#### `IDisposable` and `IAsyncDisposable` Cleanup Pattern
 ```csharp
-public sealed class ReliableFileBuffer : IDisposable
+public sealed class ReliableFileBuffer : IDisposable, IAsyncDisposable
 {
-    private SafeFileHandle? _fileHandle;
+    private readonly FileStream _stream;
     private bool _disposed;
 
     public ReliableFileBuffer(string path)
     {
-        _fileHandle = File.OpenHandle(path, FileMode.OpenOrCreate, FileAccess.ReadWrite);
+        ArgumentException.ThrowIfNullOrWhiteSpace(path);
+        _stream = new FileStream(path, FileMode.OpenOrCreate, FileAccess.ReadWrite, FileShare.None, bufferSize: 4096, useAsync: true);
+    }
+
+    public async ValueTask WriteAsync(ReadOnlyMemory<byte> bytes, CancellationToken ct)
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        await _stream.WriteAsync(bytes, ct);
     }
 
     public void Dispose()
     {
         if (_disposed) return;
-
-        _fileHandle?.Dispose();
-        _fileHandle = null;
+        _stream.Dispose();
         _disposed = true;
     }
 
-    public void Write(ReadOnlySpan<byte> bytes)
+    public async ValueTask DisposeAsync()
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
-        RandomAccess.Write(_fileHandle!, bytes, 0);
+        if (_disposed) return;
+        await _stream.DisposeAsync();
+        _disposed = true;
     }
 }
 ```
 
-#### Immutability Mechanics
-- **Shallow Immutability:** The object's own fields cannot be changed after instantiation, but referenced objects may remain mutable.
-- **Deep Immutability:** The object and its entire transitive object graph are completely immutable.
+#### Immutability Mechanics & Non-Destructive Mutation (`with`)
+- **Shallow Immutability:** The object's own fields cannot be changed after instantiation, but referenced objects (such as a `List<string>` property) may remain mutable.
+- **Deep Immutability:** The object and its entire transitive object graph are completely immutable (e.g., `ImmutableArray<T>` or `ImmutableList<T>`).
+- **Non-Destructive Mutation (`with` expressions):** On `record` types, `var updated = original with { Status = OrderStatus.Paid };` clones the instance via the compiler-generated copy constructor and applies property overrides without mutating `original`. Note that `with` performs a **shallow copy** and bypasses validation inside positional constructors unless enforced inside property `init` accessors!
 
 ```csharp
 // Shallow immutability warning:
 public record Team(string Name, List<string> Members); // Members list can be modified externally!
 
 // Deep immutability:
-public record ImmutableTeam(string Name, ImmutableList<string> Members);
+public sealed record ImmutableTeam(string Name, ImmutableArray<string> Members);
 ```
 
 ---
@@ -643,7 +736,7 @@ public record ImmutableTeam(string Name, ImmutableList<string> Members);
 3. **Domain Entity Equality:** Do two distinct objects represent the same business entity regardless of memory address or mutated properties? Defined by unique domain identifier (e.g., `CustomerId`).
 
 #### The Invariant Contract of `GetHashCode`
-If two objects are equal according to `Equals`, their `GetHashCode` **must return the exact same integer**.
+If two objects are equal according to `Equals`, their `GetHashCode` **must return the exact same integer** ([Microsoft Learn: `Object.GetHashCode`](https://learn.microsoft.com/dotnet/api/system.object.gethashcode)).
 If `GetHashCode` changes while an object is stored as a key in a `Dictionary<TKey, TValue>` or `HashSet<T>`, the entry is permanently orphaned and cannot be retrieved.
 
 ```csharp
@@ -691,7 +784,7 @@ public sealed class NormalizedTaxCodeComparer : IEqualityComparer<TaxRegistratio
         if (x is null || y is null) return false;
 
         return string.Equals(x.CountryIso, y.CountryIso, StringComparison.OrdinalIgnoreCase)
-            && Normalize(x.RawIdentifier).SequenceEqual(Normalize(y.RawIdentifier));
+            && NormalizedEquals(x.RawIdentifier, y.RawIdentifier);
     }
 
     public int GetHashCode(TaxRegistrationCode obj)
@@ -711,19 +804,30 @@ public sealed class NormalizedTaxCodeComparer : IEqualityComparer<TaxRegistratio
         return hash.ToHashCode();
     }
 
-    private static string Normalize(string input) =>
-        string.Create(input.Length, input, static (span, src) =>
+    // Zero-allocation two-pointer comparison: avoids allocating temporary strings during Dictionary bucket probing!
+    // In .NET 9+, pair this with IAlternateEqualityComparer<ReadOnlySpan<char>, T> and GetAlternateLookup for span lookups:
+    // https://learn.microsoft.com/dotnet/api/system.collections.generic.dictionary-2.getalternatelookup
+    private static bool NormalizedEquals(ReadOnlySpan<char> left, ReadOnlySpan<char> right)
+    {
+        int i = 0, j = 0;
+        while (true)
         {
-            int idx = 0;
-            foreach (char c in src)
-            {
-                if (char.IsLetterOrDigit(c))
-                    span[idx++] = char.ToUpperInvariant(c);
-            }
-        }).TrimEnd('\0');
+            while (i < left.Length && !char.IsLetterOrDigit(left[i])) i++;
+            while (j < right.Length && !char.IsLetterOrDigit(right[j])) j++;
+
+            if (i == left.Length || j == right.Length)
+                return i == left.Length && j == right.Length;
+
+            if (char.ToUpperInvariant(left[i]) != char.ToUpperInvariant(right[j]))
+                return false;
+
+            i++;
+            j++;
+        }
+    }
 }
 
-// Usage: "de-123 456" and "DE123-456" resolve to the exact same dictionary bucket and key!
+// Usage: "de-123 456" and "DE123-456" resolve to the exact same dictionary bucket and key with zero heap allocations!
 var registry = new Dictionary<TaxRegistrationCode, string>(NormalizedTaxCodeComparer.Instance);
 ```
 
@@ -754,11 +858,15 @@ var registry = new Dictionary<TaxRegistrationCode, string>(NormalizedTaxCodeComp
 ### 2.1 Single Responsibility Principle (SRP)
 
 #### Fundamentals & Internal Mechanics
-> *"A class should have one, and only one, reason to change."* — Robert C. Martin.
+> *"A module should be responsible to one, and only one, actor."* — [Robert C. Martin, *"The Single Responsibility Principle"* (2014)](https://blog.cleancoder.com/uncle-bob/2014/05/08/SingleReponsibilityPrinciple.html); *Clean Architecture* (2017, Ch. 7).
 
-SRP is not about making classes tiny or limiting them to one method. It is about **coupling to business actors**.
-A "reason to change" corresponds to a stakeholder or business department requiring a modification:
+*(Earlier phrasing: "A class should have one, and only one, reason to change", *Agile Software Development, Principles, Patterns, and Practices*, 2002; rooted in [David Parnas's 1972 modularization paper](https://dl.acm.org/doi/10.1145/361598.361623).)*
+
+SRP is not about making classes tiny or limiting them to one method. It is about **coupling to business actors** (stakeholders or user roles):
+- A "reason to change" corresponds to a specific actor or business department requesting a modification.
 - If a change requested by the Accounting team (e.g., tax calculation) breaks a feature used by the Logistics team (e.g., shipping slip generation), the class violates SRP.
+
+**Cohesion vs. Fragmentation Trap:** Misreading SRP as *"one method per class"* splits a single actor's cohesive logic across a dozen tiny files. When that actor requests a feature change, engineers suffer **Shotgun Surgery**—editing 10 classes that always change together. Group operations that belong to the **same actor and rate of change**; separate operations that serve **different actors**.
 
 #### Anti-Pattern: The God Class
 ```csharp
@@ -794,9 +902,14 @@ public sealed class SqlOrderRepository : IOrderRepository
 ### 2.2 Open/Closed Principle (OCP)
 
 #### Fundamentals & Internal Mechanics
-> *"Software entities should be open for extension, but closed for modification."*
+> *"Software entities (classes, modules, functions, etc.) should be open for extension, but closed for modification."* — Originally formulated by Bertrand Meyer (*Object-Oriented Software Construction*, 1988, via implementation inheritance) and adapted to polymorphic abstractions by Robert C. Martin (*"The Open-Closed Principle"*, C++ Report, 1996).
 
 You should be able to introduce new business behavior into a system without altering existing, tested source code. In C#, this is achieved via polymorphism, strategy patterns, decorators, and delegate injection.
+
+#### Trade-Off: Polymorphism vs Exhaustive Pattern Matching (The Expression Problem)
+Philip Wadler formalized the fundamental tension between OOP extensibility and functional data modeling as [**The Expression Problem** (1998)](https://homepages.inf.ed.ac.uk/wadler/papers/expression/expression.txt):
+- **OOP Subtype Polymorphism (`IPaymentGateway`):** Makes adding **new types** (PayPal, Adyen, Apple Pay) trivial without editing existing classes, *but* adding a **new operation** (`RefundAsync`, `CaptureAsync`) forces modifying the interface and every implementer. Ideal when the set of operations is stable and variants grow.
+- **Closed Sum Types / [C# Pattern Matching `switch` expressions](https://learn.microsoft.com/dotnet/csharp/fundamentals/functional/pattern-matching):** Makes adding **new operations** over an existing closed hierarchy trivial while giving compile-time exhaustiveness checks, *but* adding a **new type** requires updating every `switch`. Ideal when domain variants are fixed (e.g., `OrderStatus` states or AST nodes) and new workflows/queries keep appearing.
 
 #### Enterprise Scenario: Payment Processing Gateway
 ```csharp
@@ -835,13 +948,14 @@ public sealed class PaymentService(IEnumerable<IPaymentGateway> gateways)
 ### 2.3 Liskov Substitution Principle (LSP)
 
 #### Fundamentals & Internal Mechanics
-> *"If $S$ is a subtype of $T$, then objects of type $T$ may be replaced with objects of type $S$ without altering any of the desirable properties of the program."* — Barbara Liskov (1987).
+> *"If for each object $o_1$ of type $S$ there is an object $o_2$ of type $T$ such that for all programs $P$ defined in terms of $T$, the behavior of $P$ is unchanged when $o_1$ is substituted for $o_2$, then $S$ is a subtype of $T$."* — [Barbara Liskov (1987 OOPSLA Keynote)](https://dl.acm.org/doi/10.1145/62138.62141); formalized with Jeannette Wing in [*"A Behavioral Notion of Subtyping"* (ACM TOPLAS, 1994)](https://dl.acm.org/doi/10.1145/197320.197383).
 
 LSP defines behavioral subtyping. Syntactic inheritance is insufficient; the subtype must conform to the **behavioral contract** of the base type:
 1. **Preconditions cannot be strengthened:** Derived methods cannot demand more strict input conditions than the base.
 2. **Postconditions cannot be weakened:** Derived methods must guarantee at least everything the base guaranteed.
 3. **Invariants must be preserved:** Subtypes cannot allow the object to enter states forbidden by the base.
-4. **No new unexpected exceptions:** Derived methods must not throw exceptions that callers of the base type are unprepared to handle.
+4. **History Constraint (Liskov & Wing, 1994):** A subtype cannot allow state mutations across time that the base type forbids (e.g., mutating `Square.Width` secretly mutates `Height`, violating `Rectangle`'s independent-axis guarantee; or adding a `SetCapacity()` mutator on a subtype of an `ImmutableBuffer`).
+5. **No new unexpected exceptions:** Derived methods must not throw exceptions outside the base type's documented exception contract.
 
 #### The Classic Violation: ReadOnly Collection Subtyping
 ```csharp
@@ -855,7 +969,7 @@ public class CustomCollection<T> : IList<T>
 *Correction:* Segregate interfaces. A read-only collection must implement `IReadOnlyList<T>`, not `IList<T>`.
 
 #### Return Covariance (`out T`) and Parameter Contravariance (`in T`)
-Liskov Substitution governs how generic interfaces and delegates preserve subtyping across type arguments:
+Liskov Substitution governs how generic interfaces and delegates preserve subtyping across type arguments ([Microsoft Learn: Covariance and Contravariance in Generics](https://learn.microsoft.com/dotnet/standard/generics/covariance-and-contravariance)):
 1. **Covariance (`out T` — Producer / Return Position):**
    If `Derived` is a subtype of `Base` ($\text{Derived} \le \text{Base}$), a generic interface `IFoo<out T>` preserves the subtyping direction: `IFoo<Derived>` is substitutable for `IFoo<Base>`.
    - **Rule:** `T` can **only** appear in output (return) positions.
@@ -902,7 +1016,7 @@ IEnumerable<DomainEvent> baseEvents = shippedEvents;
 ### 2.4 Interface Segregation Principle (ISP)
 
 #### Fundamentals & Internal Mechanics
-> *"Clients should not be forced to depend upon interfaces that they do not use."*
+> *"Clients should not be forced to depend upon interfaces that they do not use."* — Robert C. Martin (*"The Interface Segregation Principle"*, C++ Report, Aug 1996).
 
 Large "header interfaces" (interfaces with dozens of methods representing everything a service can possibly do) couple callers to irrelevant methods. When an interface changes, all implementing classes and consumer test suites must be recompiled and re-tested.
 
@@ -929,6 +1043,7 @@ public interface IOrderReportingService
 ```
 
 #### Role Interfaces vs Header Interfaces
+*(Terminology: [Martin Fowler, *RoleInterface*](https://martinfowler.com/bliki/RoleInterface.html) vs [*HeaderInterface*](https://martinfowler.com/bliki/HeaderInterface.html).)*
 - A **header interface** mirrors every public method of one implementation class (`IOrderService` mirrors `OrderService`, method for method). It's shaped by the *implementer*.
 - A **role interface** describes exactly what one *client* needs (`IOrderReader`, `IClock`, `IEmailSender`). It's shaped by the *consumer*.
 
@@ -949,6 +1064,7 @@ ISP is really a rule about **who designs the interface**: the client does. One i
 ### 2.5 Dependency Inversion Principle (DIP)
 
 #### Fundamentals & Internal Mechanics
+*(Formulated by Robert C. Martin, *"The Dependency Inversion Principle"*, C++ Report, May 1996; *Clean Architecture*, 2017, Ch. 11.)*
 1. **High-level modules should not depend on low-level modules.** Both should depend on abstractions.
 2. **Abstractions should not depend on details.** Details should depend on abstractions.
 
@@ -969,19 +1085,19 @@ The "inversion" is not about having an interface. It's about **which assembly ow
 A quick test: **if you deleted the Infrastructure project, would the Application project still compile?** If not, DIP isn't applied.
 
 #### The Composition Root
-Something still has to connect abstractions to implementations. That place is the **Composition Root**: the one location (in ASP.NET Core, `Program.cs` or extension methods it calls) that references *every* project and builds the object graph:
+Something still has to connect abstractions to implementations. That place is the [**Composition Root**](https://blog.ploeh.dk/2011/07/28/CompositionRoot/) (Mark Seemann & Steven van Deursen, *Dependency Injection Principles, Practices, and Patterns*, 2019): the single application entry location (in ASP.NET Core, `Program.cs` or modular extension methods it calls) that references *every* layer and wires the object graph:
 
 ```csharp
 // Program.cs — the ONLY place that knows both the port and the adapter
 builder.Services.AddScoped<IOrderRepository, SqlOrderRepository>();
-builder.Services.AddSingleton(TimeProvider.System);          // the clock is a volatile dependency too
+builder.Services.AddSingleton(TimeProvider.System);          // .NET 8+ time abstraction: https://learn.microsoft.com/dotnet/standard/datetime/timeprovider-overview
 builder.Services.AddHttpClient<IPaymentGateway, StripePaymentGateway>();
 ```
 
-Business classes must never call `serviceProvider.GetService<T>()` themselves. That's the **Service Locator** anti-pattern: it hides dependencies from the constructor signature and turns missing registrations into runtime failures.
+Business classes must never call `serviceProvider.GetService<T>()` themselves. That's the **Service Locator** anti-pattern ([Mark Seemann, *"Service Locator is an Anti-Pattern"*](https://blog.ploeh.dk/2010/02/03/ServiceLocatorisanAnti-Pattern/)): it hides dependencies from the constructor signature and turns missing registrations into runtime failures.
 
 #### Which Dependencies Deserve Inversion?
-Mark Seemann's distinction between **stable** and **volatile** dependencies keeps DIP from turning into "an interface for everything":
+Mark Seemann's distinction between **stable** and **volatile** dependencies (*Dependency Injection Principles, Practices, and Patterns*, 2019) keeps DIP from turning into "an interface for everything":
 
 | Volatile (invert these) | Stable (depend on them directly) |
 |---|---|
@@ -1031,11 +1147,15 @@ If none apply, a `sealed` concrete class is the better choice. It's simpler to r
 ## Section 3 — Clean Code, Readability & Expressiveness at Scale
 
 ### 3.1 Cognitive Load and Readability
-Code is read far more often than it is written. Clean code minimizes **extraneous cognitive load**—the mental overhead required to parse convoluted syntax, cryptic naming, and deep nesting that is unrelated to the actual business problem.
+Code is read far more often than it is written. Drawing on [John Sweller's Cognitive Load Theory (1988)](https://doi.org/10.1207/s15516709cog1202_4), working memory is sharply bounded when reasoning about unfamiliar code:
+- **Intrinsic Cognitive Load:** The irreducible complexity inherent to the business domain itself (e.g., multi-currency VAT reverse-charge rules).
+- **Extraneous Cognitive Load:** Self-inflicted mental overhead caused by cryptic naming, deep nesting, hidden side effects, or excessive pass-through abstractions.
+
+Clean code minimizes extraneous cognitive load and leverages **Deep Modules** (John Ousterhout, *A Philosophy of Software Design*, 2nd ed., 2021)—components with simple, narrow interfaces hiding substantial implementation complexity, rather than dozens of "shallow" wrapper classes whose interface ceremony approaches the size of their logic.
 
 ### 3.2 Naming as Architecture
 
-A useful name communicates a domain concept, its units, and its observable contract. `Process()` hides the business action; `ReserveInventory()` tells the reader what must become true. `timeoutMilliseconds` prevents a unit mistake that `timeout` invites. Prefer the vocabulary used by domain experts over interchangeable suffixes such as `Helper`, `Manager`, and `Processor`.
+A useful name communicates a domain concept, its units, and its observable contract using the team's [**Ubiquitous Language**](https://martinfowler.com/bliki/UbiquitousLanguage.html) (Eric Evans, *Domain-Driven Design*, 2003; Robert C. Martin, *Clean Code*, 2008; [Microsoft .NET Naming Guidelines](https://learn.microsoft.com/dotnet/standard/design-guidelines/naming-guidelines)). `Process()` hides the business action; `ReserveInventory()` tells the reader what must become true. `timeoutMilliseconds` prevents a unit mistake that `timeout` invites (or better yet, accept `TimeSpan timeout`). Prefer the vocabulary used by domain experts over interchangeable suffixes such as `Helper`, `Manager`, and `Processor`.
 
 Names also expose missing decisions:
 - `GetCustomerAsync` versus `FindCustomerAsync`: document whether absence throws, returns `null`, or produces a typed not-found result. Naming alone is not enforcement.
@@ -1045,7 +1165,7 @@ Names also expose missing decisions:
 **Review technique:** Read the public signatures without their implementations. Can a caller predict side effects, units, failure cases, and ownership? If not, improve the contract rather than merely making the name longer.
 
 ### 3.3 Method Design & Single Level of Abstraction Principle (SLAP)
-A method should do one conceptual thing at one consistent level of abstraction. A high-level orchestration method should not mix high-level business workflow steps with raw byte manipulation, string splitting, or low-level SQL connection handling.
+A method should do one conceptual thing at one consistent level of abstraction (Kent Beck, *Smalltalk Best Practice Patterns*, 1997; Neal Ford, *The Productive Programmer*, 2008). A high-level orchestration method should not mix high-level business workflow steps with raw byte manipulation, string splitting, or low-level SQL connection handling.
 
 ```csharp
 // BAD: Violates SLAP (Mixes high-level checkout flow with raw string parsing and SQL queries)
@@ -1071,7 +1191,7 @@ public async Task CheckoutAsync(CartId cartId, CancellationToken ct)
 ```
 
 #### Command-Query Separation (CQS)
-Methods should either:
+Coined by Bertrand Meyer (*Object-Oriented Software Construction*, 1988; [Martin Fowler, *CommandQuerySeparation*](https://martinfowler.com/bliki/CommandQuerySeparation.html)), methods should either:
 - **Execute a Command:** Mutate state, returning `void` (or `Task`).
 - **Execute a Query:** Return data without observable side effects.
 
@@ -1080,21 +1200,39 @@ Invoking a getter or query method should never alter database state or increment
 **Where the heuristic bends:** A command may reasonably return the identifier it created, an outcome, or the item atomically removed from a queue. Splitting `TryDequeue` into `Peek` followed by `Remove` would introduce a race. The important property is that callers can predict mutation, not that every mutating method returns `void`. CQS is a method-design heuristic; CQRS is the larger architectural separation covered in Module 04.
 
 #### Functional Core, Imperative Shell
+*(Pattern coined by Gary Bernhardt, ["Boundaries", SCNA 2012](https://www.destroyallsoftware.com/talks/boundaries).)*
 
 Keep deterministic decisions separate from orchestration when it makes the rule easier to understand and test. For example, a pricing function can accept an immutable order snapshot, a tax policy, and an explicit effective date, then return a price breakdown. The application handler loads that snapshot, supplies the clock value, and persists the result.
 
 This does not require replacing the whole domain model with functions. An aggregate can protect its state while delegating a calculation to a pure function. The payoff is being able to test rounding and policy boundaries without a database, clock, or mock framework. The shell still needs integration tests: a correct calculation can be persisted twice or applied to stale state.
 
-### 3.4 Control Flow: Guard Clauses over Arrow Anti-Patterns
-Avoid nested `if/else` ladders (the "Arrow Anti-pattern") by checking failure conditions early and returning immediately:
+#### Parameter Count, Flag Arguments & Parameter Objects
+Functions taking more than 3–4 positional arguments or boolean flag arguments ([Martin Fowler, *FlagArgument*](https://martinfowler.com/bliki/FlagArgument.html)) force readers to perform mental mapping at every call site (`CreateShipment(id, true, false, 3, null)`). Group cohesive parameters into a **Parameter Object** (`record`) and split flag-driven behaviors into explicit methods:
+
+```csharp
+// BAD: Long parameter list + boolean flag arguments (control coupling)
+Task<ShipmentId> CreateShipmentAsync(
+    Guid orderId, bool isExpedited, bool requireSignature, int maxRetries, string? carrierCode, CancellationToken ct);
+
+// GOOD: Parameter Object + explicit intent
+public sealed record ShipmentDispatchOptions(
+    OrderId OrderId,
+    ShippingTier Tier,
+    DeliveryVerification Verification,
+    CarrierCode? PreferredCarrier = null);
+
+Task<ShipmentId> DispatchShipmentAsync(ShipmentDispatchOptions options, CancellationToken ct);
+```
+
+### 3.4 Control Flow: Guard Clauses & Railway-Oriented Programming
+Unlike [Thomas J. McCabe's Cyclomatic Complexity (1976)](https://doi.org/10.1109/TSE.1976.233837)—which counts linear branch paths equally—[G. Ann Campbell's Cognitive Complexity (2017)](https://www.sonarsource.com/resources/cognitive-complexity/) penalizes **nesting depth** super-linearly because humans must hold every enclosing condition in working memory. Avoid nested `if/else` ladders (the "Arrow Anti-pattern") by checking failure conditions early with guard clauses and returning immediately:
 
 ```csharp
 // GOOD: Flat, legible guard clauses
 public void ProcessRefund(Order order, decimal amount)
 {
     ArgumentNullException.ThrowIfNull(order);
-    if (amount <= 0)
-        throw new ArgumentOutOfRangeException(nameof(amount), "Refund must be positive.");
+    ArgumentOutOfRangeException.ThrowIfNegativeOrZero(amount);
 
     if (order.Status != OrderStatus.Paid)
         throw new InvalidOperationException("Can only refund paid orders.");
@@ -1107,12 +1245,46 @@ public void ProcessRefund(Order order, decimal amount)
 }
 ```
 
-### 3.5 Error Handling: Result Pattern vs Exceptions
-In modern high-throughput C# systems, **Exceptions should be reserved for exceptional, unrecoverable circumstances** (network timeouts, database connection drops, hardware failure). Using exceptions for regular business validation (e.g., `InvalidEmailException`) introduces severe performance penalties (stack unwinding costs) and encourages unstructured goto-like control flow.
+#### Railway-Oriented Programming (ROP)
+Popularized by [Scott Wlaschin (*"Railway Oriented Programming"*, 2014)](https://fsharpforfunandprofit.com/rop/), multi-step business workflows that can fail at each stage can be modeled as a two-track pipeline (**Success track** vs **Failure track**). Once any step returns `Failure`, subsequent `Bind` / `Map` transformations short-circuit and propagate the error cleanly without nested `if (!result.IsSuccess)` boilerplate:
+
+```csharp
+public static class ResultExtensions
+{
+    public static Result<TOut> Map<TIn, TOut>(this Result<TIn> result, Func<TIn, TOut> mapper) =>
+        result.IsSuccess ? Result<TOut>.Success(mapper(result.Value)) : Result<TOut>.Failure(result.Error);
+
+    public static Result<TOut> Bind<TIn, TOut>(this Result<TIn> result, Func<TIn, Result<TOut>> binder) =>
+        result.IsSuccess ? binder(result.Value) : Result<TOut>.Failure(result.Error);
+
+    public static TOut Match<TIn, TOut>(this Result<TIn> result, Func<TIn, TOut> onSuccess, Func<Error, TOut> onFailure) =>
+        result.IsSuccess ? onSuccess(result.Value) : onFailure(result.Error);
+}
+
+// Flat, linear railway pipeline: zero nested `if` statements
+Result<OrderSummary> summaryResult = EmailAddress.Create(rawEmail)
+    .Bind(email => FindActiveCustomer(email))
+    .Bind(customer => ValidateCreditLimit(customer, orderTotal))
+    .Map(approvedOrder => new OrderSummary(approvedOrder.Id, approvedOrder.Total));
+```
+
+### 3.5 Error Handling: Result Pattern, Exceptions & Rethrow Semantics
+In modern high-throughput C# systems, **Exceptions should be reserved for truly exceptional, unrecoverable circumstances** (network timeouts, database connection drops, invariant-corrupting bugs)—aligning with [Microsoft Learn: Best practices for exceptions](https://learn.microsoft.com/dotnet/standard/exceptions/best-practices-for-exceptions) and Krzysztof Cwalina & Brad Abrams (*Framework Design Guidelines*, 3rd ed., 2020, Ch. 7). Using exceptions for routine domain validation (e.g., `InvalidEmailException`) incurs significant stack-trace capture overhead and conceals expected failure modes from method signatures.
+
+#### Essential Exception Mechanics in Senior .NET
+1. **Never swallow or truncate stack traces (`CA2200`):** Always use `throw;` to rethrow inside a `catch` block—never `throw ex;`, which overwrites the original stack trace ([CA2200: Rethrow to preserve stack details](https://learn.microsoft.com/dotnet/fundamentals/code-analysis/quality-rules/ca2200)). When capturing an exception across threads or `async` boundaries to rethrow later, use [`ExceptionDispatchInfo.Capture(ex).Throw()`](https://learn.microsoft.com/dotnet/api/system.runtime.exceptionservices.exceptiondispatchinfo).
+2. **Use C# Exception Filters (`when`) over `catch`-and-rethrow:** Evaluating `catch (HttpRequestException ex) when (ex.StatusCode == HttpStatusCode.TooManyRequests)` inspects the predicate *before* unwinding the stack, preserving local frames and crash dumps if the filter evaluates to `false`.
+3. **Catch only what you can meaningfully handle:** Wrap infrastructure exceptions at architectural boundaries (e.g., translating `SqlException` into a transient retry or domain failure) rather than writing broad `catch (Exception)` blocks that mask `OutOfMemoryException` or cancel tokens (`OperationCanceledException`).
+4. **Discriminated Unions (`OneOf<T0, T1, ...>`):** When an operation has multiple distinct domain outcomes (e.g., `OneOf<Order, NotFound, InsufficientInventory>`), libraries like [`OneOf`](https://github.com/mcintyre321/OneOf) provide exhaustive `.Match(...)` handling at compile time without inventing custom result wrappers per method.
 
 #### Idiomatic Result Pattern
 ```csharp
 public readonly record struct Error(string Code, string Message);
+
+public readonly record struct Unit
+{
+    public static readonly Unit Value = new();
+}
 
 public readonly struct Result<TValue>
 {
@@ -1146,7 +1318,7 @@ public readonly struct Result<TValue>
 #### Nullable Reference Types (NRT) & Roslyn Static Flow Analysis
 In modern .NET (`<Nullable>enable</Nullable>`), reference types are non-nullable by default (`Customer` vs `Customer?`). Crucially, **NRT is a compile-time static flow analysis feature, not a runtime guarantee** (`Customer` and `Customer?` compile to the exact same IL metadata type, annotated with `[Nullable]`). If external callers (or JSON deserializers) pass `null` into a non-nullable reference parameter, the runtime does not automatically block it unless your public boundary enforces `ArgumentNullException.ThrowIfNull(arg)`.
 
-To make custom `Try*` and validation methods integrate seamlessly with the compiler's flow analyzer, use `System.Diagnostics.CodeAnalysis` null-state attributes:
+To make custom `Try*` and validation methods integrate seamlessly with the compiler's flow analyzer, use [`System.Diagnostics.CodeAnalysis` null-state attributes](https://learn.microsoft.com/dotnet/csharp/language-reference/attributes/nullable-analysis):
 - `[NotNullWhen(true)]`: Informs the compiler that if the method returns `true`, the `out` or input parameter is guaranteed non-null.
 - `[MaybeNullWhen(false)]`: Allows generic `TryGetValue<T>(out T value)` signatures to output `default` when returning `false`, even if `T` is a non-nullable reference type.
 - `[NotNullIfNotNull(nameof(input))]`: Expresses that the return value is non-null whenever the named input argument is non-null.
@@ -1246,10 +1418,10 @@ Comments are not compiled or executed by the test suite; consequently, they deca
 ### 4.1 DRY (Don't Repeat Yourself)
 
 #### Fundamentals & Internal Mechanics
-> *"Every piece of knowledge must have a single, unambiguous, authoritative representation within a system."* — Andy Hunt and Dave Thomas (*The Pragmatic Programmer*).
+> *"Every piece of knowledge must have a single, unambiguous, authoritative representation within a system."* — Andy Hunt and Dave Thomas (*The Pragmatic Programmer*, 20th Anniversary Ed., 2019).
 
 DRY is frequently misunderstood as a purely syntactic rule: "never write the same block of code twice."
-That is a dangerous misinterpretation. DRY applies to **duplication of knowledge and business rules**, not structural coincidences.
+That is a dangerous misinterpretation. DRY applies to **duplication of knowledge and business rules**, not structural coincidences. As [Sandi Metz famously observed (*"The Wrong Abstraction"*, 2016)](https://sandimetz.com/blog/2016/1/20/the-wrong-abstraction), *"duplication is far cheaper than the wrong abstraction."* Once two divergent callers are forced through a single parameterized base method, every new requirement piles conditional flags onto the shared abstraction until nobody dares edit it.
 
 #### Accidental Duplication vs Knowledge Duplication
 - **Knowledge Duplication (True DRY violation):** The algorithm for calculating sales tax is copied across both the billing service and the reporting pipeline. When tax laws change, one system is updated while the other is forgotten, creating financial discrepancies.
@@ -1283,28 +1455,62 @@ public sealed class CustomerEntity
 ### 4.2 KISS (Keep It Simple, Stupid) & YAGNI (You Aren't Gonna Need It)
 
 #### Fundamentals & Internal Mechanics
-- **KISS:** Software design should favor simplicity over cleverness. A straightforward, explicit solution that is easy to reason about is vastly superior to an elaborate, meta-programmed framework.
-- **YAGNI:** Never implement speculative features or abstractions based on hypothetical future requirements. Future requirements almost always arrive with different shapes, assumptions, and constraints than anticipated. The code written "just in case" carries ongoing maintenance costs, bugs, and comprehension taxes.
+- **Essential vs. Accidental Complexity ([Frederick P. Brooks Jr., *"No Silver Bullet"*, 1987](https://doi.org/10.1109/MC.1987.1663532)):** **Essential complexity** is inherent to the problem domain (e.g., regulatory tax treaties). **Accidental complexity** is complexity we manufacture ourselves through bloated frameworks, reflection magic, and premature abstractions.
+- **KISS:** Software design should favor explicit simplicity over cleverness. A straightforward, readable implementation is vastly superior to an opaque meta-programmed engine.
+- **YAGNI (Kent Beck, *Extreme Programming Explained*, 1999; [Martin Fowler, *"Yagni"* (2015)](https://martinfowler.com/bliki/Yagni.html)):** Never implement speculative features or extension frameworks for hypothetical future requirements. Fowler identifies four distinct costs of building speculative code early:
+  1. **Cost of Build:** Time spent writing and testing code nobody asked for.
+  2. **Cost of Delay:** Delaying the real feature that actually generates customer feedback and revenue.
+  3. **Cost of Carry:** Ongoing maintenance, CI execution, and cognitive load on every engineer reading the codebase.
+  4. **Cost of Repair:** When the real requirement finally arrives in a different shape, you must first tear out or work around your wrong guess.
 
 #### The Indirection Tax
 Every layer of abstraction (generic base repositories, dynamic reflection dispatchers, custom expression visitors) adds cognitive overhead and debugging friction.
 A senior engineer asks: *"Does this abstraction solve an existing, concrete problem, or does it merely flatter our architectural ego?"*
+
+```csharp
+// OVER-ENGINEERED (YAGNI): Speculative plugin registry with reflection for 1 active exporter
+public interface IExportFormatter { string Key { get; } byte[] Format(object payload); }
+// ...plus ExportFormatterFactory, ExportPipelineOptions, Attribute scanning...
+
+// PRAGMATIC (KISS/YAGNI): Simple, sealed concrete service; easy to refactor into an interface if a 2nd/3rd format arrives
+public sealed class CsvInvoiceExporter
+{
+    public ReadOnlyMemory<byte> Export(IReadOnlyList<InvoiceLine> lines) => /* Direct, testable serialization */;
+}
+```
 
 ---
 
 ### 4.3 Separation of Concerns (SoC) & Single Source of Truth (SSOT)
 
 #### Fundamentals & Internal Mechanics
-- **Separation of Concerns:** Distinct concerns (e.g., authorization, data validation, database transactions, domain math, telemetry) must be modularized into independent constructs.
-- **Single Source of Truth:** Every distinct state value (e.g., an order balance, a user's subscription status) must have exactly one authoritative storage owner.
+- **Separation of Concerns ([Edsger W. Dijkstra, EWD 447, 1974](https://www.cs.utexas.edu/~EWD/transcriptions/EWD04xx/EWD447.html)):** Focus on one distinct aspect of a problem at a time—modularizing authorization, input validation, database transactions, domain math, and telemetry into independent constructs.
+- **Single Source of Truth (SSOT):** Every authoritative business fact must have **one** canonical owner; secondary representations must be derived (or explicitly marked as eventually consistent read projections).
 
-In distributed cloud architectures, violating SSOT by caching state in local server memory without synchronization leads to split-brain scenarios and data corruption.
+In distributed cloud architectures, violating SSOT by caching mutable state in local server memory without synchronization—or persisting duplicate derived totals that drift out of sync with underlying ledger rows—leads to split-brain bugs and silent financial corruption:
+
+```csharp
+// BAD: Dual source of truth — CachedBalance can silently drift from _entries!
+public sealed class BrokenWallet
+{
+    public decimal CachedBalance { get; set; }
+    public List<decimal> LedgerEntries { get; } = [];
+}
+
+// GOOD: Single Source of Truth — Balance is derived deterministically from authoritative ledger entries
+public sealed class AuthoritativeWallet
+{
+    private readonly List<LedgerEntry> _entries = [];
+    public Money Balance => _entries.Aggregate(Money.Zero("USD"), (sum, e) => sum.Add(e.SignedAmount));
+}
+```
 
 ---
 
 ### 4.4 Law of Demeter (Principle of Least Knowledge)
 
 #### Fundamentals & Internal Mechanics
+*(Formulated by [Karl J. Lieberherr & Ian M. Holland, *"Assuring Good Style for Object-Oriented Programs"*, IEEE Software, 1989](https://doi.org/10.1109/52.35588).)*
 > *"Only talk to your immediate friends."*
 
 An object method should invoke only:
@@ -1313,9 +1519,9 @@ An object method should invoke only:
 3. Methods on objects it instantiates directly.
 4. Methods on its own direct instance fields.
 
-It must **never navigate object graphs** (the "Train Wreck" anti-pattern):
+It must **never navigate unrelated structural object graphs** (the "Train Wreck" anti-pattern), and instead apply [**Tell, Don't Ask**](https://martinfowler.com/bliki/TellDontAsk.html):
 ```csharp
-// VIOLATION: Train wreck navigation
+// VIOLATION: Train wreck navigation coupling caller to 4 internal classes
 var zipCode = order.GetCustomer().GetPrimaryAddress().GetPostalCode().Value;
 
 // If Customer changes Address to a collection, this line and 40 other files break!
@@ -1324,27 +1530,44 @@ var zipCode = order.GetCustomer().GetPrimaryAddress().GetPostalCode().Value;
 var zipCode = order.GetDestinationPostalCode();
 ```
 
+**Senior Distinction — Fluent Chains & LINQ Do NOT Violate the Law of Demeter:**
+Calling `orders.Where(o => o.IsPaid).OrderByDescending(o => o.CreatedAt).Take(10)` or `new StringBuilder().Append("A").Append("B")` looks syntactically similar (`a.B().C().D()`), but it is **not** a Law of Demeter violation. Fluent builders and LINQ operators transform and return the *same uniform abstraction* (`IEnumerable<T>`, `StringBuilder`) rather than reaching into the private internal structure of four different domain entities.
+
 ---
 
 ### 4.5 Fail-Fast & Defensive Programming
 
 #### Fundamentals & Internal Mechanics
-- **Fail-Fast:** Detect and report an invalid assumption near its source; reject the affected operation before it causes further damage. Invalid client input should not terminate an otherwise healthy service.
-- **Defensive Programming:** Anticipating edge cases, network blips, and untrusted inputs by providing robust fallbacks and defensive assertions.
+- **Fail-Fast ([Jim Shore, *"Fail Fast"*, IEEE Software, 2004](https://www.jamesshore.com/v2/projects/nullables/fail-fast)):** Surface broken invariants, illegal configurations, and invalid assumptions immediately at their source rather than returning sentinel defaults (`-1`, `""`, `null`) that cause silent corruption three services downstream.
+- **Defensive Programming:** Anticipating edge cases, network blips, and untrusted inputs by enforcing explicit boundary validation and resilience strategies.
 
-**The Golden Rule:** Be strict and fail-fast at system ingestion boundaries (API endpoints, message queue deserialization). Inside trusted domain models, rely on strict type constructors and invariants rather than cluttering internal business methods with hundreds of redundant `if (x is null)` checks.
+**The Golden Rule:** Be strict and fail-fast at system ingestion boundaries using modern .NET 8+ guard helpers (`ArgumentNullException.ThrowIfNull`, `ArgumentException.ThrowIfNullOrWhiteSpace`, `ArgumentOutOfRangeException.ThrowIfNegativeOrZero`). Inside trusted domain models, rely on validated Value Objects and type invariants rather than cluttering internal business methods with redundant `if (x is null)` checks.
 
 ---
 
 ### 4.6 Principle of Least Astonishment (POLA)
 
-- **Principle of Least Astonishment:** A component, method, or API must behave in a manner that will not surprise a developer using it.
-  - Property getters must never trigger expensive database queries or mutate internal state.
-  - A method named `FindCustomer()` should not modify the customer's last-active timestamp.
+*(Reference: Jerome H. Saltzer & M. Frans Kaashoek, Principles of Computer System Design, 2009.)*
+- **Principle of Least Astonishment:** A component, method, or API must behave in a manner consistent with what an experienced caller reasonably expects from its signature and naming:
+  - Property getters must never trigger expensive I/O queries or mutate internal state.
+  - Collection-returning methods should return an empty collection (`[]` / `Array.Empty<T>()`) rather than `null`, preventing `NullReferenceException` surprises.
+  - Query methods (`FindCustomer()`) must never mutate state (e.g., updating `LastViewedAt`).
+
+```csharp
+// ASTONISHING: Property getter mutates state and performs hidden I/O!
+public IReadOnlyList<Order>? RecentOrders
+{
+    get { _accessCount++; return _db.LoadOrders() is { Count: 0 } ? null : _db.LoadOrders(); }
+}
+
+// PREDICTABLE (POLA): Explicit async query method returning non-null empty collection when none exist
+public Task<IReadOnlyList<Order>> GetRecentOrdersAsync(CustomerId id, CancellationToken ct);
+```
 
 ### 4.7 Rule of Three
 
-Wait for enough concrete examples to understand the shared rule before extracting an abstraction. Three is a reminder to gather evidence, not a mandatory threshold. Centralize a critical rounding policy immediately if two copies must always agree; keep three similar workflows separate if they change for unrelated reasons.
+*(Origin: Don Roberts, cited in Martin Fowler, Refactoring, 1999 / 2nd ed. 2018.)*
+Wait for enough concrete examples to understand the shared rule before extracting an abstraction: **duplicate once, evaluate on the second occurrence, refactor into a shared abstraction on the third**. Three is a reminder to gather evidence, not a rigid quota. Centralize a regulated rounding policy immediately if two copies must always agree; keep three structurally similar workflows separate if they belong to different business actors and evolve independently.
 
 **Decision exercise:** Two teams both validate a ten-character reference today. One is a regulated invoice reference; the other is a marketing campaign code. Explain why identical code does not yet establish a shared domain rule, and what evidence would justify extraction later.
 
@@ -1371,7 +1594,7 @@ Wait for enough concrete examples to understand the shared rule before extractin
 ### 5.1 Dimensions & Architectural Metrics of Coupling
 
 Coupling is the degree of interdependence between software modules.
-In Robert C. Martin's package architecture metrics:
+In Robert C. Martin's package architecture metrics (*Clean Architecture*, 2017, Ch. 14):
 - **Afferent Coupling ($C_a$):** The number of classes *outside* this module that depend on classes *inside* this module (incoming dependencies; measures responsibility).
 - **Efferent Coupling ($C_e$):** The number of classes *inside* this module that depend on classes *outside* this module (outgoing dependencies; measures instability).
 
@@ -1386,18 +1609,37 @@ $$\text{Distance from the Main Sequence } (D) = |A + I - 1|$$
 - The **Zone of Pain** ($A\approx 0, I\approx 0$): Highly concrete, highly stable. Changing this module creates massive change propagation (e.g., a massive concrete utility library used everywhere).
 - The **Zone of Uselessness** ($A\approx 1, I\approx 1$): Highly abstract, but nobody depends on it. Pure overhead.
 
+**Governing Component Principles (Martin, 2017, Ch. 14):**
+1. **Acyclic Dependencies Principle (ADP):** Allow no cycles in the component dependency graph.
+2. **Stable Dependencies Principle (SDP):** Depend in the direction of stability (unstable volatile modules depend on stable modules, never vice versa).
+3. **Stable Abstractions Principle (SAP):** A component should be as abstract as it is stable so it can be extended without breaking downstream consumers.
+
 **Interpretation, not a target:** A package with $C_a=8$ and $C_e=2$ has $I=0.2$: many consumers make changes expensive. This says nothing about its runtime reliability or actual change frequency. With no incoming or outgoing dependencies, the ratio is undefined; tools may use a convention. An immutable, widely reused `Money` type can sensibly be concrete and stable. Do not create interfaces solely to improve a metric; inspect change history and dependency direction first.
 
 ---
 
 ### 5.2 Forms of Coupling
 
+*(Taxonomy rooted in Glenford J. Myers, Composite/Structured Design, 1978, and Edward Yourdon & Larry L. Constantine, Structured Design, 1979.)*
+
 1. **Compile-Time Coupling:** Module A directly references the assembly of Module B. Any interface change in B requires recompilation of A.
 2. **Runtime Coupling:** Module A invokes Module B over in-process virtual dispatch, reflection, or HTTP/gRPC.
 3. **Control Coupling:** Module A passes a flag, boolean, or enum to Module B to dictate which internal branches Module B executes.
-4. **Data Coupling:** Modules share simple primitive data values (ideal, lowest coupling).
-5. **Stamp Coupling:** Module A passes an entire complex object (e.g., a 40-field `Customer` entity) to Module B when Module B only requires a single integer `CustomerId`.
+4. **Data Coupling:** Modules pass only the exact primitive or minimal Value Object data required (lowest, cleanest form of coupling).
+5. **Stamp Coupling:** Module A passes an entire composite object (e.g., `HttpContext` or a 40-property `CustomerEntity`) to Module B when Module B only inspects two fields. This forces callers and unit tests to construct huge object graphs just to invoke one pure calculation.
 6. **Temporal Coupling:** Module A requires that methods on Module B be called in a strict chronological sequence without enforcing this requirement via compile-time types.
+
+```csharp
+// BAD: Stamp Coupling — caller and unit tests must fake an entire CustomerAggregate + Address graph
+public decimal CalculateShippingSurcharge(CustomerAggregate customer, Order order) =>
+    customer.PrimaryAddress.CountryIso == "US" && order.TotalWeightGrams > 5000 ? 15m : 0m;
+
+// GOOD: Data Coupling — minimal, explicit inputs; trivial to reuse and test without mock builders
+public Money CalculateShippingSurcharge(CountryCode destinationCountry, Weight totalWeight) =>
+    destinationCountry == CountryCode.US && totalWeight > Weight.FromKilograms(5)
+        ? new Money(15m, "USD")
+        : Money.Zero("USD");
+```
 
 ---
 
@@ -1447,8 +1689,15 @@ Circular dependencies:
 - Lead to deadlocks in static constructors and DI container instantiation.
 
 #### Breaking Circular Dependencies
-1. **Apply the Dependency Inversion Principle:** Extract an interface into a shared domain contracts layer.
-2. **Apply the Mediator / Event-Driven Pattern:** Replace direct synchronous method invocation with an in-process or out-of-process event publish/subscribe mechanism.
+1. **Apply the Dependency Inversion Principle:** Extract an interface into a shared domain contracts layer (or into the upstream caller module) so both dependencies point inward toward an abstraction rather than at each other.
+2. **Apply the Mediator / Event-Driven Pattern:** Replace direct synchronous reverse calls with an in-process or out-of-process domain event (`OrderConfirmedEvent`).
+
+```text
+BEFORE (Cycle):  [Ordering] <=======> [Billing]   (Cannot compile or deploy independently)
+
+AFTER (DIP):     [Ordering] ---> [IInvoiceIssuer (Ordering.Contracts)] <--- [Billing]
+AFTER (Event):   [Ordering] ---> (publishes OrderConfirmedEvent) ---> [Billing subscribes]
+```
 
 ---
 
@@ -1489,7 +1738,7 @@ Replacing a method call with an event is not automatically an improvement. If ch
 
 ### 6.1 The Spectrum of Cohesion
 
-Cohesion measures how closely related the responsibilities of a single module, class, or package are.
+Cohesion measures how closely related the responsibilities of a single module, class, or package are (Edward Yourdon & Larry L. Constantine, *Structured Design*, 1979; Steve McConnell, *Code Complete*, 2nd ed., 2004).
 Ranked from worst to best:
 
 1. **Coincidental Cohesion (Worst):** Elements are bundled arbitrarily with no meaningful relationship (e.g., `GeneralHelper`, `CommonUtils`).
@@ -1527,16 +1776,71 @@ public sealed class VatCalculator
 
 ---
 
-### 6.3 Module and Package Cohesion: CCP and CRP
+### 6.3 Module and Package Cohesion: REP, CCP, CRP & Vertical Slices
 
-- **Common Closure Principle (CCP):** Classes that change together for the same business reasons should be packaged together. If an accounting regulation changes, the updates should touch only one project/assembly, not ripple across ten projects.
-- **Common Reuse Principle (CRP):** Classes that are not reused together should not be packaged together. If a consumer only needs your domain math, they should not be forced to take a dependency on your EF Core database provider or Azure SDK.
+Robert C. Martin (*Clean Architecture*, 2017, Ch. 13) defines the **Package Cohesion Triad**—three forces that pull against each other when slicing modules and NuGet packages:
+- **Reuse/Release Equivalence Principle (REP):** The granule of reuse is the granule of release. Reusable libraries must be versioned and released as cohesive units.
+- **Common Closure Principle (CCP):** Classes that change together for the same business reasons should be packaged together. If an accounting regulation changes, the updates should touch only one module/folder, not ripple across ten projects. *(This is SRP elevated to the package level.)*
+- **Common Reuse Principle (CRP):** Classes that are not reused together should not be packaged together. If a consumer only needs your domain math, they should not be forced to take a dependency on your EF Core database provider or Azure SDK. *(This is ISP elevated to the package level.)*
+
+#### Technical Layers (Horizontal Slicing) vs. Vertical Slice Architecture
+*(Reference: [Jimmy Bogard, *"Vertical Slice Architecture"* (2018)](https://www.jimmybogard.com/vertical-slice-architecture/).)*
+
+Traditional N-tier horizontal folders optimize for **technical similarity** (grouping all Controllers together, all Services together), which violates CCP: implementing one business change forces edits across 4 separate folders. **Vertical Slice Architecture** organizes code by **feature/use-case**, maximizing CCP so everything changing for one business capability lives side by side:
+
+```text
+// HORIZONTAL LAYERS (Low CCP: 1 feature edit touches 4+ directories)
+├── Controllers/OrdersController.cs
+├── Services/OrderService.cs
+├── Validators/ConfirmOrderValidator.cs
+└── Repositories/OrderRepository.cs
+
+// VERTICAL SLICES (High CCP: 1 feature edit stays inside 1 cohesive slice)
+└── Features/Orders/
+    ├── ConfirmOrder/
+    │   ├── ConfirmOrderEndpoint.cs
+    │   ├── ConfirmOrderCommand.cs
+    │   ├── ConfirmOrderValidator.cs
+    │   └── ConfirmOrderHandler.cs
+    └── CancelOrder/ ...
+```
 
 ---
 
 ### 6.4 Identifying Misplaced Responsibilities
 
-**Feature envy** appears when a method repeatedly extracts another object's fields to make decisions that belong to that object. A refund handler checking invoice status, paid balance, and every earlier refund is a candidate for an `Invoice.RequestRefund` operation. Move the rule with the state it protects; keep HTTP calls and persistence orchestration outside the invoice.
+**Feature envy** (Martin Fowler, *Refactoring*, 2018) appears when a method repeatedly extracts another object's fields to make decisions that belong to that object. A refund handler checking invoice status, paid balance, and every earlier refund is a candidate for an `Invoice.RequestRefund` operation. Move the rule with the state it protects; keep HTTP calls and persistence orchestration outside the invoice:
+
+```csharp
+// BAD: Feature Envy in external handler reading 4 properties off Invoice to make Invoice's decision
+public async Task<Result<Refund>> HandleAsync(InvoiceId id, Money amount, CancellationToken ct)
+{
+    var invoice = await _repo.GetByIdAsync(id, ct);
+    if (invoice.Status != InvoiceStatus.Paid) return Result<Refund>.Failure(...);
+    var alreadyRefunded = invoice.Refunds.Sum(r => r.Amount.Amount);
+    if (amount.Amount > invoice.Total.Amount - alreadyRefunded) return Result<Refund>.Failure(...);
+    var refund = new Refund(amount, _clock.GetUtcNow());
+    invoice.Refunds.Add(refund);
+    return Result<Refund>.Success(refund);
+}
+
+// GOOD: Invariant and behavior live inside Invoice; handler only orchestrates I/O
+public sealed class Invoice
+{
+    // ...
+    public Result<Refund> RequestRefund(Money amount, DateTimeOffset utcNow)
+    {
+        if (Status != InvoiceStatus.Paid)
+            return Result<Refund>.Failure(new Error("Invoice.NotPaid", "Only paid invoices can be refunded."));
+        if (amount.Amount <= 0 || amount.Amount > RemainingRefundableBalance().Amount)
+            return Result<Refund>.Failure(new Error("Invoice.ExceedsBalance", "Refund exceeds refundable balance."));
+
+        var refund = new Refund(amount, utcNow);
+        _refunds.Add(refund);
+        return Result<Refund>.Success(refund);
+    }
+}
+```
 
 **Inappropriate intimacy** is broader: two classes rely on each other's private representation or lifecycle. Bidirectional navigation alone is not proof, but a small representation change requiring coordinated edits in both classes is evidence.
 
@@ -1566,7 +1870,7 @@ Use three questions before moving behavior:
 
 ### 7.1 Levels of Abstraction and Contract Stability
 
-An abstraction is a simplified model of an underlying complex reality. In software engineering, abstractions exist in a strict hierarchy:
+Rooted in [Barbara Liskov & Stephen Zilles (*"Programming with Abstract Data Types"*, 1974)](https://dl.acm.org/doi/10.1145/942572.807045) and John Ousterhout (*A Philosophy of Software Design*, 2021), an abstraction is a simplified contract hiding underlying implementation complexity. In software engineering, abstractions exist in a strict hierarchy:
 - **Level 3 (Business Policy):** High-level rules, workflows, orchestration (e.g., `OrderFulfillmentPolicy`).
 - **Level 2 (Domain Operations):** Entities, value objects, domain events (e.g., `Order.Confirm()`, `Money`).
 - **Level 1 (Application Services & Ports):** Interface contracts (e.g., `IPaymentGateway`, `IOrderRepository`).
@@ -1578,11 +1882,11 @@ A senior engineer ensures that dependencies flow strictly downward, and that Lev
 
 ### 7.2 Leaky Abstractions: Mechanics and Mitigation
 
-> *"All non-trivial abstractions, to some degree, are leaky."* — Joel Spolsky (The Law of Leaky Abstractions).
+> *"All non-trivial abstractions, to some degree, are leaky."* — [Joel Spolsky, *"The Law of Leaky Abstractions"* (2002)](https://www.joelonsoftware.com/2002/11/11/the-law-of-leaky-abstractions/).
 
 An abstraction is **leaky** when the consumer must understand the underlying technical implementation details to use it safely or correctly.
 
-#### The Classic .NET Leaky Abstraction: `IQueryable<T>` across Service Boundaries
+#### Leak 1: `IQueryable<T>` across Service Boundaries
 Developers often expose `IQueryable<T>` from repositories to avoid writing specific query methods:
 ```csharp
 // BAD: Catastrophic Leaky Abstraction!
@@ -1597,6 +1901,26 @@ public interface IOrderRepository
 3. **N+1 Query Explosions:** Callers inadvertently trigger hundreds of round-trips to the database without realizing it because lazy-loading or missing `.Include()` calls are hidden behind the collection interface.
 4. **Transaction Boundary Leakage:** Database locking hints, query timeouts, and isolation semantics bleed into the presentation or application layer.
 
+#### Leak 2: Infrastructure Exceptions Bleeding Across Domain Ports
+If an EF Core `SqlOrderRepository` lets `DbUpdateConcurrencyException` or PostgreSQL/SQL Server error numbers (`SqlException` error `2627` unique violation) bubble straight into an Application handler or HTTP controller, the caller is forced to import EF Core or `Microsoft.Data.SqlClient` just to handle a conflict! **Translate infrastructure exceptions inside the adapter** into domain-meaningful `Result` errors or typed domain exceptions:
+
+```csharp
+// GOOD: Adapter catches vendor-specific database exceptions and translates into domain contracts
+public async Task<Result<Unit>> SaveAsync(Order order, CancellationToken ct)
+{
+    try
+    {
+        _dbContext.Orders.Update(order);
+        await _dbContext.SaveChangesAsync(ct);
+        return Result<Unit>.Success(Unit.Value);
+    }
+    catch (DbUpdateConcurrencyException)
+    {
+        return Result<Unit>.Failure(new Error("Order.ConcurrentConflict", "Order was modified by another request."));
+    }
+}
+```
+
 #### The Encapsulated Solution
 Expose explicit, task-focused asynchronous methods that return materialized results or domain aggregates:
 ```csharp
@@ -1604,7 +1928,7 @@ public interface IOrderRepository
 {
     Task<Order?> GetByIdAsync(OrderId id, CancellationToken ct);
     Task<IReadOnlyList<OrderSummaryDto>> GetRecentOrdersForCustomerAsync(CustomerId customerId, int limit, CancellationToken ct);
-    Task SaveAsync(Order order, CancellationToken ct);
+    Task<Result<Unit>> SaveAsync(Order order, CancellationToken ct);
 }
 ```
 
@@ -1630,14 +1954,28 @@ Every abstraction introduces a cognitive and runtime **Indirection Tax**. While 
 
 ### 7.4 Information Hiding: David Parnas's Criteria (1972)
 
-David Parnas established the true criterion for decomposing systems into modules:
-**A module should be designed to hide a secret.**
-What secrets should a module hide?
-1. **Volatile Business Rules:** Tax formulas, discount tier algorithms.
-2. **Data Representation Secrets:** Whether an order's lines are stored in a contiguous array, a linked list, or a document table.
-3. **Hardware / Vendor Integration Secrets:** SendGrid API specifics, Stripe payload shapes, Azure Service Bus connection strings.
+In his seminal 1972 paper [*"On the Criteria To Be Used in Decomposing Systems into Modules"* (Communications of the ACM, Vol. 15, No. 12)](https://dl.acm.org/doi/10.1145/361598.361623), David L. Parnas compared two modularizations of a Key Word in Context (KWIC) indexing system:
+1. **Decomposition by Flowchart / Execution Step** (`ReadLines` $\to$ `CircularShift` $\to$ `Alphabetize` $\to$ `Print`): Every module reads and mutates a shared global array structure, so changing how lines are stored in memory breaks *every* module.
+2. **Decomposition by Information Hiding (Parnas's Criterion):** **Every module is designed to hide a volatile design decision (a "secret")** behind an unchanging interface:
+   - **Volatile Business Rules:** Tax formulas, discount tier algorithms.
+   - **Data Representation Secrets:** Whether an order's lines or index entries are stored in a flat `Span<byte>`, a compressed array, or a database table.
+   - **Hardware / Vendor Integration Secrets:** SendGrid API specifics, Stripe payload shapes, Azure Service Bus connection strings.
 
-If a vendor changes its JSON payload format, exactly one adapter class in your infrastructure layer should change. If your domain entities change as a result, your information hiding has failed.
+If a vendor changes its JSON payload format or an internal storage structure switches from `List<T>` to a ring buffer, **exactly one module** changes. If callers break as a result, your information hiding has failed.
+
+```csharp
+// Information Hiding: Callers depend only on stable behavioral queries, never the internal array/encoding secret
+public sealed class RingLineBuffer
+{
+    private readonly string[] _slots; // Representation secret: could change to MemoryMappedFile without breaking callers
+    private int _head;
+    private int _count;
+
+    public RingLineBuffer(int capacity) => _slots = new string[capacity];
+    public void Append(string line) { /* Hidden circular buffer indexing */ }
+    public IEnumerable<string> ReadLatest() { /* ... */ yield break; }
+}
+```
 
 ---
 
@@ -1655,9 +1993,9 @@ If a vendor changes its JSON payload format, exactly one adapter class in your i
 
 ## Section 8 — Maintainability, Technical Debt & Evolution
 
-### 8.1 Technical Debt Taxonomy: The Debt Quadrant
+### 8.1 Technical Debt Taxonomy: The Debt Quadrant & Hotspot Prioritization
 
-Martin Fowler categorizes technical debt along two axes: **Intentionality** (Deliberate vs Inadvertent) and **Discipline** (Prudent vs Reckless):
+Ward Cunningham introduced the **technical debt** metaphor in his [1992 OOPSLA Experience Report (*"The WyCash Portfolio Management System"*)](http://c2.com/doc/oopsla92.html) to describe shipping immature code structure early to learn faster, paying "interest" until refactored. [Martin Fowler (*"TechnicalDebtQuadrant"*, 2009)](https://martinfowler.com/bliki/TechnicalDebtQuadrant.html) categorizes technical debt along two axes: **Intentionality** (Deliberate vs Inadvertent) and **Discipline** (Prudent vs Reckless):
 
 | | Prudent | Reckless |
 |---|---|---|
@@ -1665,6 +2003,14 @@ Martin Fowler categorizes technical debt along two axes: **Intentionality** (Del
 | **Inadvertent** | "Now that we have processed 10 million transactions, we understand our domain much better and realize our initial aggregate boundaries need refactoring." | "What are design principles? We just write code until it compiles." |
 
 A Senior Software Engineer recognizes that **prudent, deliberate technical debt is a valid strategic tool**, whereas reckless debt is engineering malpractice.
+
+#### Prioritizing Remediation: Behavioral Hotspot Analysis & DORA Impact
+Not all messy code deserves refactoring. Following Adam Tornhill ([*Your Code as a Crime Scene*, 2nd ed.](https://pragprog.com/titles/atcrime2/your-code-as-a-crime-scene-second-edition/) and *Software Design X-Rays*, 2018), prioritize remediation by combining **Git change frequency (churn)** with **code complexity**:
+
+$$\text{Hotspot Priority} \propto \text{Commit Churn Frequency} \times \text{Code Complexity}$$
+
+- **High Complexity + Low Churn (Stable Legacy):** Leave it alone behind an abstraction seam; refactoring code nobody touches yields near-zero business ROI and risks introducing regressions.
+- **High Complexity + High Churn (Hotspot):** Every sprint touches this file, inflating **Lead Time for Changes** and **Change Failure Rate** (the core delivery metrics identified in Nicole Forsgren, Jez Humble, & Gene Kim, *Accelerate* / [DORA Research](https://dora.dev/)). Invest refactoring sprints here first.
 
 ---
 
@@ -1682,7 +2028,7 @@ Following Martin Fowler and Kent Beck's refactoring taxonomy, structural code sm
 | **5. Couplers** | Feature Envy, Inappropriate Intimacy, Message Chains, Middle Man | **Feature Envy:** A method in `InvoiceCalculator` accesses 9 properties of `CustomerTier` to compute a discount $\to$ Move the method onto `CustomerTier`. |
 
 #### Enforcing Architectural Hygiene via `.editorconfig` and Roslyn Analyzers
-Senior engineers do not rely on human willpower during code reviews to catch nullability bypasses, unused values, or async pitfalls; they fail the CI build deterministically using `.NET SDK AnalysisLevel` and `.editorconfig`:
+Senior engineers do not rely on human willpower during code reviews to catch nullability bypasses, unused values, or async pitfalls; they fail the CI build deterministically using [Microsoft .NET Code Analysis (`AnalysisLevel`)](https://learn.microsoft.com/dotnet/fundamentals/code-analysis/overview) and `.editorconfig`:
 
 ```ini
 # .editorconfig — Enterprise Senior Engineering Baseline
@@ -1701,13 +2047,45 @@ dotnet_diagnostic.CS8602.severity = error      # Dereference of a possibly null 
 
 ---
 
-### 8.3 Safe Refactoring Strategies for Legacy Code (Michael Feathers)
+### 8.3 Safe Refactoring Strategies for Legacy Code (Feathers & Mikado Method)
 
-When modifying legacy systems without existing automated test coverage:
-1. **Find a Seam:** A seam is a place where you can alter program behavior without editing the source code in place (e.g., an interface, a virtual method, a DI registration).
-2. **Write Characterization Tests:** Write automated tests that capture the *current, actual behavior* of the legacy code (including bugs and quirks) to establish a safety net.
-3. **Sprout Method / Sprout Class:** Instead of editing a 2,000-line legacy method, write your new feature in a completely separate, clean, unit-tested class, and invoke it via a single-line call from the legacy method.
-4. **Wrap Method / Wrap Class:** Wrap the legacy call inside a decorator that handles new pre- and post-conditions (e.g., logging, validation, metrics) without tampering with the internal legacy spaghetti.
+Michael Feathers defines *legacy code* simply as **code without tests** (*Working Effectively with Legacy Code*, 2004). When modifying untested systems:
+1. **Find a Seam:** A seam is a place where you can alter program behavior without editing the source code in place (e.g., an Object Seam via an injected interface, a protected virtual method, or a DI registration).
+2. **Write Characterization Tests:** Write automated tests that capture the *current, actual behavior* of the legacy code (including bugs and quirks) to establish a regression safety net.
+3. **Sprout Method / Sprout Class:** Instead of editing a 2,000-line legacy method, write your new feature in a separate, unit-tested class and invoke it via a single call from the legacy method.
+4. **Wrap Method / Wrap Class (Decorator):** Wrap the legacy call inside a decorator that adds new cross-cutting behavior (logging, validation, metrics) without tampering with the legacy implementation.
+
+```csharp
+// Legacy class refactored safely with an Object Seam + Sprout Class:
+public interface IInvoiceTaxSprout { decimal ComputeAdjustedTax(decimal subtotal, string country); }
+
+public sealed class LegacyBillingEngine(IInvoiceTaxSprout taxSprout) // Constructor Seam
+{
+    public decimal ComputeLegacyTotal(decimal subtotal, string country, bool applyNewRule)
+    {
+        // Sprout Class invoked cleanly without rewriting the surrounding 1,500 lines:
+        decimal tax = applyNewRule ? taxSprout.ComputeAdjustedTax(subtotal, country) : subtotal * 0.15m;
+        return subtotal + tax;
+    }
+}
+```
+
+#### The Mikado Method for Large-Scale Refactoring
+*(Reference: Ola Ellnestam & Daniel Brolund, [The Mikado Method, Manning, 2014](https://www.manning.com/books/the-mikado-method).)*
+
+When attempting a sweeping architectural refactoring (e.g., breaking a circular dependency or replacing a static singleton across 120 files), naive edits often leave the build broken for days. The **Mikado Method** keeps the codebase continuously green and deployable:
+
+```text
+[1. Write Goal on Mikado Graph] --> [2. Attempt Naive Change] --> (Compiles & Tests Pass?)
+                                                                      |             |
+                                                                    [Yes]          [No]
+                                                                      v             v
+                                                             [Commit & Next]  [3. Record prerequisites as child nodes
+                                                                               4. `git reset --hard` to green state
+                                                                               5. Repeat on leaf nodes bottom-up]
+```
+
+By reverting broken experiments immediately and executing leaf prerequisites first, every single commit leaves `main` compiling and passing CI.
 
 ---
 
@@ -1752,13 +2130,25 @@ public sealed class FraudEvaluationPipeline(IEnumerable<IFraudDetectionRule> rul
 
 ### 8.5 Backwards Compatibility & Versioning in C#
 
-In enterprise libraries and shared NuGet packages:
+Following [**Semantic Versioning 2.0.0 (`MAJOR.MINOR.PATCH`)**](https://semver.org/) and Microsoft's [**.NET Library Breaking Change Rules**](https://learn.microsoft.com/dotnet/core/compatibility/library-change-rules), enterprise library and NuGet maintainers distinguish three compatibility dimensions:
 - **Binary Compatibility:** Existing compiled consumer DLLs can run against the new assembly without recompilation.
 - **Source Compatibility:** Existing consumer code recompiles against the new assembly without compile errors.
 - **Behavioral Compatibility:** The code compiles and links, but runtime behavior (e.g., ordering, side effects, exception types) remains consistent.
 
 **Breaking Change Warning in C#:**
-Adding an optional parameter with a default value (`void Process(int id, bool flag = false)`) is **source compatible**, but **binary incompatible**! The C# compiler bakes the default value `false` directly into the calling assembly's call site IL. If the consumer does not recompile, a `MissingMethodException` crashes the process at runtime!
+Adding an optional parameter with a default value (`void Process(int id, bool flag = false)`) is **source compatible**, but **binary incompatible**! The C# compiler bakes the default value `false` directly into the calling assembly's call site IL. If a downstream DLL does not recompile, a `MissingMethodException` crashes the process at runtime!
+
+```csharp
+// SAFE BINARY & SOURCE EVOLUTION: Add a new overload instead of modifying the existing signature!
+public sealed class BillingClient
+{
+    // Original binary signature preserved intact for un-recompiled callers
+    public void Process(int invoiceId) => Process(invoiceId, applyNewAudit: false);
+
+    // New overload added in MINOR release
+    public void Process(int invoiceId, bool applyNewAudit) { /* ... */ }
+}
+```
 
 ---
 
@@ -1778,10 +2168,16 @@ Adding an optional parameter with a default value (`void Process(int id, bool fl
 
 ### 9.1 Dependency Injection in ASP.NET Core: Service Lifetimes & Traps
 
+*(Reference: [Microsoft Learn: .NET Dependency Injection Guidelines](https://learn.microsoft.com/dotnet/core/extensions/dependency-injection-guidelines).)*
+
 The built-in .NET DI container (`Microsoft.Extensions.DependencyInjection`) provides three service lifetimes:
-1. **Transient (`AddTransient`):** Created every single time they are requested. Ideal for lightweight, stateless utility operations.
+1. **Transient (`AddTransient`):** Created every single time they are requested. Ideal for lightweight, stateless utility operations. **Pitfall:** Never register an `IDisposable` service as `Transient` if resolved from the root container—the root container holds references until process shutdown, creating a memory leak.
 2. **Scoped (`AddScoped`):** Created once per logical operation scope (e.g., once per incoming HTTP request in ASP.NET Core). Essential for stateful request contexts like EF Core `DbContext`.
 3. **Singleton (`AddSingleton`):** Created once at application startup and shared across all threads and requests throughout the process lifetime. Must be strictly thread-safe.
+
+#### Startup Validation & .NET 8+ Keyed Services
+- **Fail-Fast Container Validation:** Enable both `ValidateScopes = true` (detects captive dependencies) and `ValidateOnBuild = true` (verifies every registered service graph can be constructed at startup rather than crashing on the first HTTP request) in `Host.UseDefaultServiceProvider`—or run in `Development` where ASP.NET Core enables both automatically.
+- **Keyed Services (.NET 8+):** Eliminate boilerplate factory dictionaries when multiple concrete implementations share a contract using `builder.Services.AddKeyedScoped<IPaymentGateway, StripeGateway>("stripe")` and `[FromKeyedServices("stripe")] IPaymentGateway gateway`.
 
 #### The Captive Dependency Bug (Critical Senior Failure Mode)
 A **Captive Dependency** occurs when a service with a longer lifetime captures a service with a shorter lifetime.
@@ -1802,20 +2198,27 @@ public sealed class BackgroundMetricsReporter(IServiceScopeFactory scopeFactory)
 {
     public async Task ReportMetricsAsync(CancellationToken ct)
     {
-        using var scope = scopeFactory.CreateScope();
+        await using var scope = scopeFactory.CreateAsyncScope();
         var dbContext = scope.ServiceProvider.GetRequiredService<AppDbContext>();
 
         var count = await dbContext.Orders.CountAsync(ct);
-        // Scope ends; DbContext cleanly disposed!
+        // Scope ends; DbContext cleanly disposed asynchronously!
     }
 }
 ```
 
 ---
 
-### 9.2 Encapsulating Domain Models in Entity Framework Core
+### 9.2 Domain Modeling vs Persistence Modeling in Entity Framework Core
 
-A common senior challenge is keeping domain entities encapsulated (private setters, read-only collections) while allowing EF Core to map and track data without public exposure.
+*(Reference: [EF Core Backing Fields](https://learn.microsoft.com/ef/core/modeling/backing-field) and [EF Core 8 Complex Types](https://learn.microsoft.com/ef/core/what-is-new/ef-core-8.0/whatsnew#value-objects-using-complex-types).)*
+
+Enterprise .NET teams choose between two persistence-boundary strategies depending on domain complexity and schema divergence:
+
+| Strategy | How It Works | Best Fit & Trade-Offs |
+|---|---|---|
+| **Pattern A: Rich EF Core-Mapped Domain Model** | Domain entities (`Order`) are mapped directly via Fluent API (`IEntityTypeConfiguration<T>`), using private parameterless constructors, `PropertyAccessMode.Field` for `_lines`, value converters (`OrderId`), and EF Core 8 `ComplexProperty` for Value Objects. | **Best fit for 80% of rich enterprise domains:** Zero duplicate mapping classes while preserving full encapsulation. Trade-off: domain entities carry minor ORM accommodations (private parameterless constructor, non-`readonly` collections). |
+| **Pattern B: Separate Persistence Entities (`OrderRow`) + Pure Domain Model** | Infrastructure defines anemic persistence records (`OrderRow`) mapped to SQL tables and translates them to/from pure domain aggregates inside the repository adapter. | **Best fit when legacy DB schemas diverge sharply from domain structure** (e.g., 80-column flat mainframe tables or strict Hexagonal isolation). Trade-off: manual change tracking and explicit mapping boilerplate. |
 
 ```csharp
 public sealed class OrderConfiguration : IEntityTypeConfiguration<Order>
@@ -1847,7 +2250,7 @@ public sealed class OrderConfiguration : IEntityTypeConfiguration<Order>
 ### 9.3 Middleware Pipeline Architecture
 
 #### Chain of Responsibility in ASP.NET Core
-The ASP.NET Core HTTP pipeline is a canonical implementation of the **Chain of Responsibility** and **Russian Doll (Decorator)** patterns. Each middleware component wraps the next `RequestDelegate` in the pipeline, executing pre-processing logic on the inbound pass, awaiting `next(context)`, and executing post-processing logic on the outbound pass—or **short-circuiting** the pipeline by returning early without invoking `next`.
+The [ASP.NET Core HTTP middleware pipeline](https://learn.microsoft.com/aspnet/core/fundamentals/middleware/) is a canonical implementation of the **Chain of Responsibility** and **Russian Doll (Decorator)** patterns. Each middleware component wraps the next `RequestDelegate` in the pipeline, executing pre-processing logic on the inbound pass, awaiting `next(context)`, and executing post-processing logic on the outbound pass—or **short-circuiting** the pipeline by returning early without invoking `next`.
 
 #### Convention-Based Middleware vs Factory-Activated `IMiddleware`
 | Characteristic | Convention-Based Middleware | `IMiddleware` (Factory-Activated) |
@@ -1916,7 +2319,7 @@ public sealed class TenantResolutionMiddleware : IMiddleware
 Whether using Minimal APIs (`MapPost` with `IEndpointFilter`) or Controllers, an HTTP endpoint's **sole responsibility** is protocol translation:
 1. Bind and validate transport input (via an `IEndpointFilter` or MediatR validation behavior).
 2. Dispatch a command/query to the application/domain layer.
-3. Translate the `Result<TValue>` into an HTTP status code or **RFC 9457 `ProblemDetails`** payload.
+3. Translate the `Result<TValue>` into an HTTP status code or [**RFC 9457 `ProblemDetails`**](https://www.rfc-editor.org/rfc/rfc9457.html) payload.
 
 ```csharp
 public sealed class ValidationEndpointFilter<TRequest>(IValidator<TRequest> validator) : IEndpointFilter
@@ -1964,6 +2367,8 @@ public static class OrderProblemMapper
 ### 9.5 Enterprise Integration Boundaries
 
 #### Hexagonal Architecture (Ports & Adapters) and the Anti-Corruption Layer (ACL)
+*(References: [Alistair Cockburn, *"Hexagonal Architecture"* (2005)](https://alistair.cockburn.us/hexagonal-architecture/); Eric Evans, Domain-Driven Design, 2003, Ch. 14.)*
+
 When integrating with a legacy ERP or external payment provider whose data model is cryptic, unstable, or anemic, allowing external SDK types (`Stripe.Charge`, `LegacySapInvoiceXml`) to enter your domain model couples your core business logic to third-party volatility.
 
 - **Port (Domain Interface):** Defined inside your Application/Domain project using pure Ubiquitous Language (`ICreditBureauPort`).
@@ -2002,6 +2407,52 @@ public sealed class EquifaxAntiCorruptionAdapter(ILegacySoapClient soapClient) :
 
         var limit = new Money(raw.CentsLimit / 100m, "USD");
         return Result<CreditAssessment>.Success(new CreditAssessment(customerId, rating, limit));
+    }
+}
+```
+
+#### Transactional Outbox Pattern for Reliable Domain Event Dispatching
+*(Reference: Chris Richardson, [Microservices Patterns: Transactional Outbox](https://microservices.io/patterns/data/transactional-outbox.html), 2018; see Module 07 for distributed delivery semantics.)*
+
+A classic distributed failure mode is **Dual-Write Inconsistency**: committing an `Order` to SQL Server and immediately calling `_bus.PublishAsync(orderConfirmedEvent)`. If the process crashes or the broker times out after `SaveChangesAsync`, the database updates while downstream billing/shipping never hear about it. Instead, persist domain events into an `OutboxMessages` table inside the **exact same ACID database transaction** via an EF Core [`SaveChangesInterceptor`](https://learn.microsoft.com/ef/core/logging-events-diagnostics/interceptors), and publish asynchronously from a background relay:
+
+```csharp
+public interface IDomainEvent { Guid EventId { get; } DateTimeOffset OccurredAtUtc { get; } }
+public interface IHasDomainEvents { IReadOnlyCollection<IDomainEvent> DequeueDomainEvents(); }
+
+public sealed class OutboxMessage
+{
+    public Guid Id { get; init; }
+    public string EventType { get; init; } = default!;
+    public string PayloadJson { get; init; } = default!;
+    public DateTimeOffset OccurredAtUtc { get; init; }
+    public DateTimeOffset? ProcessedAtUtc { get; set; }
+}
+
+public sealed class OutboxDomainEventsInterceptor : SaveChangesInterceptor
+{
+    public override ValueTask<InterceptionResult<int>> SavingChangesAsync(
+        DbContextEventData eventData, InterceptionResult<int> result, CancellationToken ct = default)
+    {
+        if (eventData.Context is not { } dbContext)
+            return base.SavingChangesAsync(eventData, result, ct);
+
+        var outboxEntries = dbContext.ChangeTracker
+            .Entries<IHasDomainEvents>()
+            .SelectMany(entry => entry.Entity.DequeueDomainEvents())
+            .Select(evt => new OutboxMessage
+            {
+                Id = evt.EventId,
+                EventType = evt.GetType().FullName!,
+                PayloadJson = JsonSerializer.Serialize(evt, evt.GetType()),
+                OccurredAtUtc = evt.OccurredAtUtc
+            })
+            .ToList();
+
+        if (outboxEntries.Count > 0)
+            dbContext.Set<OutboxMessage>().AddRange(outboxEntries); // Atomically saved in the same SQL transaction!
+
+        return base.SavingChangesAsync(eventData, result, ct);
     }
 }
 ```
@@ -2080,11 +2531,85 @@ public class InvoiceService
 ```
 
 #### Senior Code Review Feedback:
-1. **P0 (Concurrency & Correctness):** Instantiating `new HttpClient()` in a method causes socket exhaustion under high load. Inject `IHttpClientFactory`.
-2. **P0 (Encapsulation):** `Invoice` is an anemic domain model with magic strings (`"Draft"`, `"Processed"`). Business logic for calculating totals and updating status should reside inside an encapsulated `Invoice.Process()` method.
-3. **P1 (Control Coupling):** The parameter `bool isUrgent = false` is control coupling. Split into dedicated business flows or command handlers.
-4. **P1 (Reliability):** Generic `throw new Exception("Not found")` hides errors. Use a typed domain exception or `Result<T>` pattern.
-5. **P1 (Async & Cancellation):** Missing `CancellationToken ct` parameter propagation across all asynchronous database and HTTP calls.
+1. **P0 (Socket Exhaustion & Reliability):** Instantiating `new HttpClient()` per call causes ephemeral TCP port exhaustion (`TIME_WAIT` accumulation) and ignores DNS TTL changes. Inject [`IHttpClientFactory`](https://learn.microsoft.com/dotnet/core/extensions/httpclient-factory) inside a dedicated Infrastructure adapter (`IUrgentNotificationPort`).
+2. **P0 (Blocking I/O on Async Path — Thread-Pool Starvation):** Calling synchronous `.FirstOrDefault(...)` inside an `async Task` method blocks an ASP.NET Core thread-pool thread on database I/O; use `await ...FirstOrDefaultAsync(..., ct)`.
+3. **P0 (Dual-Write / Non-Atomic Side Effect):** Sending the urgent SMS HTTP POST *before* `await _context.SaveChangesAsync()` creates split-brain inconsistency: if the database commit fails or rolls back due to a concurrency conflict, the SMS was already sent for an invoice still in `Draft`! Dispatch notifications after commit or via the Transactional Outbox.
+4. **P0 (Encapsulation):** `Invoice` is an anemic domain model with magic strings (`"Draft"`, `"Processed"`). Total calculation and status transitions belong inside an encapsulated `Invoice.Process(...)` domain method.
+5. **P1 (Control Coupling & Clean Contracts):** `bool isUrgent = false` is control coupling; model priority explicitly as a domain decision/type (`InvoicePriority`). Replace generic `throw new Exception("Not found")` with `Result<T>` and propagate `CancellationToken ct` across every async boundary.
+
+#### Refactored Senior-Grade Implementation:
+```csharp
+public enum InvoiceStatus { Draft, Processed }
+public enum InvoicePriority { Standard, Urgent }
+public readonly record struct InvoiceId(Guid Value);
+public sealed record InvoiceLine(int Quantity, Money UnitPrice)
+{
+    public Money Subtotal => new(UnitPrice.Amount * Quantity, UnitPrice.Currency);
+}
+public sealed record UrgentInvoiceAlertedEvent(Guid EventId, DateTimeOffset OccurredAtUtc, InvoiceId InvoiceId) : IDomainEvent;
+
+public sealed class Invoice : IHasDomainEvents
+{
+    private readonly List<InvoiceLine> _lines = [];
+    private readonly List<IDomainEvent> _domainEvents = [];
+
+    public Invoice(InvoiceId id, string currency)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(currency);
+        Id = id;
+        Currency = currency;
+        Status = InvoiceStatus.Draft;
+        Total = new Money(0m, currency);
+    }
+
+    public InvoiceId Id { get; }
+    public string Currency { get; }
+    public InvoiceStatus Status { get; private set; }
+    public InvoicePriority Priority { get; private set; }
+    public Money Total { get; private set; }
+
+    public Result<Unit> Process(InvoicePriority priority, DateTimeOffset utcNow)
+    {
+        if (Status != InvoiceStatus.Draft)
+            return Result<Unit>.Failure(new Error("Invoice.InvalidState", $"Cannot process invoice in '{Status}' status."));
+        if (_lines.Count == 0)
+            return Result<Unit>.Failure(new Error("Invoice.Empty", "Cannot process an invoice with zero lines."));
+
+        Total = _lines.Aggregate(new Money(0m, Currency), (acc, line) => acc.Add(line.Subtotal));
+        Priority = priority;
+        Status = InvoiceStatus.Processed;
+
+        if (priority == InvoicePriority.Urgent)
+            _domainEvents.Add(new UrgentInvoiceAlertedEvent(Guid.CreateVersion7(), utcNow, Id));
+
+        return Result<Unit>.Success(Unit.Value);
+    }
+
+    public IReadOnlyCollection<IDomainEvent> DequeueDomainEvents()
+    {
+        var copy = _domainEvents.ToArray();
+        _domainEvents.Clear();
+        return copy;
+    }
+}
+
+public sealed class ProcessInvoiceHandler(IInvoiceRepository repository, TimeProvider timeProvider)
+{
+    public async Task<Result<Unit>> HandleAsync(InvoiceId invoiceId, InvoicePriority priority, CancellationToken ct)
+    {
+        var invoice = await repository.GetByIdAsync(invoiceId, ct);
+        if (invoice is null)
+            return Result<Unit>.Failure(new Error("Invoice.NotFound", $"Invoice '{invoiceId.Value}' was not found."));
+
+        var outcome = invoice.Process(priority, timeProvider.GetUtcNow());
+        if (!outcome.IsSuccess)
+            return outcome;
+
+        // Outbox interceptor commits both invoice state AND UrgentInvoiceAlertedEvent atomically!
+        return await repository.SaveAsync(invoice, ct);
+    }
+}
+```
 
 ---
 
@@ -2098,12 +2623,12 @@ In senior and staff interviews, there are no universally "correct" architectures
 4. **Accepted Downsides & Mitigation:** Acknowledge what your design sacrifices and how you monitor or bound that risk.
 
 ### 10.4 Refactoring Legacy Systems: Strangler Fig & Branch by Abstraction
-Never propose a "Big Bang" 12-month freeze-and-rewrite of a revenue-generating production system. Instead, migrate incrementally in production using the **Strangler Fig Pattern**:
+Never propose a "Big Bang" 12-month freeze-and-rewrite of a revenue-generating production system. Instead, migrate incrementally in production using the [**Strangler Fig Pattern**](https://martinfowler.com/bliki/StranglerFigApplication.html) (Martin Fowler, 2004) combined with [**Branch by Abstraction**](https://martinfowler.com/bliki/BranchByAbstraction.html) (Fowler, 2014):
 
 1. **Introduce an Abstraction Seam (Proxy / Router / `IFulfillmentEngine`):** Place an interception point in front of the legacy subsystem.
 2. **Dark Launching & Shadow Traffic (Verification Phase):** Execute the new refactored domain logic in parallel with the legacy path (in a fire-and-forget shadow background task), comparing the outputs of `LegacyEngine` and `ModernEngine` and logging discrepancies to telemetry without affecting user responses.
 3. **Canary Rollout via Feature Flags:** Route 1% $\to$ 10% $\to$ 50% $\to$ 100% of live traffic (by `TenantId` or `OrderId` hash) to `ModernEngine`, with an instant kill-switch fallback to `LegacyEngine` if error rates spike.
-4. **Expand-and-Contract Database Schema Migration:**
+4. **Expand-and-Contract Database Schema Migration ([Danilo Sato, *Parallel Change*, 2014](https://martinfowler.com/bliki/ParallelChange.html)):**
    - *Expand:* Add nullable new columns/tables alongside legacy columns; deploy dual-write code that populates both.
    - *Backfill:* Migrate historical rows in idempotent background batches.
    - *Switch Reads:* Point application reads to the new schema.
@@ -2229,17 +2754,70 @@ You are asked in an interview:
 
 # Part IV — References
 
-1. **Microsoft Learn C# Documentation:**
-   - [Structure of Value Types and Reference Types](https://learn.microsoft.com/dotnet/csharp/language-reference/builtin-types/value-types)
+1. **Official Microsoft Learn & .NET Runtime Documentation:**
+   - [.NET Book of the Runtime (BOTR): Type System & Object Layout](https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/type-system.md)
+   - [.NET Book of the Runtime (BOTR): Virtual Stub Dispatch](https://github.com/dotnet/runtime/blob/main/docs/design/coreclr/botr/virtual-stub-dispatch.md)
+   - [Structure of Value Types and Reference Types (`struct`)](https://learn.microsoft.com/dotnet/csharp/language-reference/builtin-types/struct)
+   - [Write Safe and Efficient C# Code (`readonly` structs & defensive copies)](https://learn.microsoft.com/dotnet/csharp/write-safe-efficient-code#use-readonly-structs-to-avoid-defensive-copies)
    - [Records and Value Equality in C#](https://learn.microsoft.com/dotnet/csharp/fundamentals/types/records)
-   - [Dependency Injection in ASP.NET Core](https://learn.microsoft.com/aspnet/core/fundamentals/dependency-injection)
-   - [Entity Framework Core In-Depth Mapping & Value Objects](https://learn.microsoft.com/ef/core/modeling/)
-2. **Foundational Books & Papers:**
-   - Martin, Robert C. *Clean Architecture: A Craftsman's Guide to Software Structure and Design*. Prentice Hall, 2017.
-   - Martin, Robert C. *Agile Software Development, Principles, Patterns, and Practices*. Pearson, 2002.
+   - [Static Abstract Members in Interfaces](https://learn.microsoft.com/dotnet/csharp/whats-new/tutorials/static-virtual-interface-members)
+   - [Covariance and Contravariance in Generics](https://learn.microsoft.com/dotnet/standard/generics/covariance-and-contravariance)
+   - [Dynamic Profile-Guided Optimization (PGO) in .NET 8+](https://learn.microsoft.com/dotnet/core/whats-new/dotnet-8#dynamic-profile-guided-optimization-pgo)
+   - [Framework Design Guidelines: Choosing Between Class and Interface](https://learn.microsoft.com/dotnet/standard/design-guidelines/choosing-between-class-and-interface)
+   - [Implement `Dispose` and `DisposeAsync`](https://learn.microsoft.com/dotnet/standard/garbage-collection/implementing-disposeasync)
+   - [Best Practices for Exceptions in .NET](https://learn.microsoft.com/dotnet/standard/exceptions/best-practices-for-exceptions) & [`CA2200` Stack Trace Preservation](https://learn.microsoft.com/dotnet/fundamentals/code-analysis/quality-rules/ca2200)
+   - [Attributes for Null-State Static Analysis](https://learn.microsoft.com/dotnet/csharp/language-reference/attributes/nullable-analysis)
+   - [.NET Dependency Injection Guidelines](https://learn.microsoft.com/dotnet/core/extensions/dependency-injection-guidelines) & [ASP.NET Core Middleware](https://learn.microsoft.com/aspnet/core/fundamentals/middleware/)
+   - [`IHttpClientFactory` Usage Guidelines](https://learn.microsoft.com/dotnet/core/extensions/httpclient-factory)
+   - [Entity Framework Core Backing Fields](https://learn.microsoft.com/ef/core/modeling/backing-field), [Complex Types (.NET 8+)](https://learn.microsoft.com/ef/core/what-is-new/ef-core-8.0/whatsnew#value-objects-using-complex-types), and [Interceptors](https://learn.microsoft.com/ef/core/logging-events-diagnostics/interceptors)
+   - [.NET Library Breaking Change Rules](https://learn.microsoft.com/dotnet/core/compatibility/library-change-rules) & [.NET Code Analysis Overview](https://learn.microsoft.com/dotnet/fundamentals/code-analysis/overview)
+2. **Industry Standards & Specifications:**
+   - Nottingham, M., Wilde, E., & Dalal, S. [*RFC 9457: Problem Details for HTTP APIs*](https://www.rfc-editor.org/rfc/rfc9457.html). IETF, July 2023.
+   - Preston-Werner, Tom. [*Semantic Versioning 2.0.0*](https://semver.org/).
+   - Ecma International. [*ECMA-335: Common Language Infrastructure (CLI)*](https://ecma-international.org/publications-and-standards/standards/ecma-335/).
+3. **Seminal Computer Science Papers & Engineering Articles:**
+   - Parnas, David L. [*"On the Criteria To Be Used in Decomposing Systems into Modules"*](https://dl.acm.org/doi/10.1145/361598.361623). *Communications of the ACM*, Vol. 15, No. 12, Dec 1972.
+   - Dijkstra, Edsger W. [*"On the role of scientific thought"* (EWD 447)](https://www.cs.utexas.edu/~EWD/transcriptions/EWD04xx/EWD447.html). 1974.
+   - Liskov, Barbara, & Zilles, Stephen. [*"Programming with Abstract Data Types"*](https://dl.acm.org/doi/10.1145/942572.807045). *ACM SIGPLAN Notices*, 1974.
+   - McCabe, Thomas J. [*"A Complexity Measure"*](https://doi.org/10.1109/TSE.1976.233837). *IEEE Transactions on Software Engineering*, 1976.
+   - Brooks, Frederick P., Jr. [*"No Silver Bullet — Essence and Accidents of Software Engineering"*](https://doi.org/10.1109/MC.1987.1663532). *IEEE Computer*, Apr 1987.
+   - Liskov, Barbara. [*"Data Abstraction and Hierarchy"* (OOPSLA Keynote)](https://dl.acm.org/doi/10.1145/62138.62141). 1987; formalized with Jeannette Wing in [*"A Behavioral Notion of Subtyping"*](https://dl.acm.org/doi/10.1145/197320.197383), *ACM TOPLAS*, 1994.
+   - Sweller, John. [*"Cognitive Load During Problem Solving: Effects on Learning"*](https://doi.org/10.1207/s15516709cog1202_4). *Cognitive Science*, 1988.
+   - Lieberherr, Karl J., & Holland, Ian M. [*"Assuring Good Style for Object-Oriented Programs"*](https://doi.org/10.1109/52.35588). *IEEE Software*, 1989.
+   - Cunningham, Ward. [*"The WyCash Portfolio Management System"*](http://c2.com/doc/oopsla92.html). *OOPSLA Experience Report*, 1992.
+   - Wadler, Philip. [*"The Expression Problem"*](https://homepages.inf.ed.ac.uk/wadler/papers/expression/expression.txt). Java Genericity Mailing List, 1998.
+   - Spolsky, Joel. [*"The Law of Leaky Abstractions"*](https://www.joelonsoftware.com/2002/11/11/the-law-of-leaky-abstractions/). *Joel on Software*, 2002.
+   - Shore, Jim. [*"Fail Fast"*](https://www.jamesshore.com/v2/projects/nullables/fail-fast). *IEEE Software*, Sept/Oct 2004.
+   - Cockburn, Alistair. [*"Hexagonal Architecture (Ports and Adapters)"*](https://alistair.cockburn.us/hexagonal-architecture/). 2005.
+   - Fowler, Martin. [*AnemicDomainModel*](https://martinfowler.com/bliki/AnemicDomainModel.html) (2003), [*StranglerFigApplication*](https://martinfowler.com/bliki/StranglerFigApplication.html) (2004), [*TechnicalDebtQuadrant*](https://martinfowler.com/bliki/TechnicalDebtQuadrant.html) (2009), [*BranchByAbstraction*](https://martinfowler.com/bliki/BranchByAbstraction.html) (2014), [*Yagni*](https://martinfowler.com/bliki/Yagni.html) (2015), [*RoleInterface*](https://martinfowler.com/bliki/RoleInterface.html), [*TellDontAsk*](https://martinfowler.com/bliki/TellDontAsk.html).
+   - Seemann, Mark. [*Composition Root*](https://blog.ploeh.dk/2011/07/28/CompositionRoot/) (2011) & [*Service Locator is an Anti-Pattern*](https://blog.ploeh.dk/2010/02/03/ServiceLocatorisanAnti-Pattern/) (2010).
+   - Bernhardt, Gary. [*"Boundaries"* (Functional Core, Imperative Shell)](https://www.destroyallsoftware.com/talks/boundaries). SCNA, 2012.
+   - Sato, Danilo. [*Parallel Change (Expand and Contract)*](https://martinfowler.com/bliki/ParallelChange.html). 2014.
+   - Wlaschin, Scott. [*"Railway Oriented Programming"*](https://fsharpforfunandprofit.com/rop/). *F# for Fun and Profit*, 2014.
+   - Metz, Sandi. [*"The Wrong Abstraction"*](https://sandimetz.com/blog/2016/1/20/the-wrong-abstraction). 2016.
+   - Campbell, G. Ann. [*Cognitive Complexity: A New Way of Measuring Understandability*](https://www.sonarsource.com/resources/cognitive-complexity/). SonarSource, 2017.
+   - Bogard, Jimmy. [*"Vertical Slice Architecture"*](https://www.jimmybogard.com/vertical-slice-architecture/). 2018.
+   - Teplyakov, Sergey. [*"The 'in'-modifier and the readonly structs in C#"*](https://devblogs.microsoft.com/premier-developer/the-in-modifier-and-the-readonly-structs-in-c/). Microsoft Developer Blog, 2018.
+   - King, Alexis. [*"Parse, don't validate"*](https://lexi-lambda.github.io/blog/2019/11/05/parse-dont-validate/). 2019.
+4. **Foundational Software Engineering Books:**
+   - Martin, Robert C. *Clean Architecture: A Craftsman's Guide to Software Structure and Design*. Prentice Hall, 2017; *Clean Code*, 2008; *Agile Software Development, Principles, Patterns, and Practices*, 2002.
+   - Evans, Eric. *Domain-Driven Design: Tackling Complexity in the Heart of Software*. Addison-Wesley, 2003.
    - Fowler, Martin. *Refactoring: Improving the Design of Existing Code* (2nd ed.). Addison-Wesley, 2018.
    - Feathers, Michael. *Working Effectively with Legacy Code*. Prentice Hall, 2004.
    - Ousterhout, John. *A Philosophy of Software Design* (2nd ed.). Yaknyam Press, 2021.
-   - Liskov, Barbara; Wing, Jeannette. "A Behavioral Notion of Subtyping". *ACM Transactions on Programming Languages and Systems (TOPLAS)*, 1994.
-   - Parnas, David L. "On the Criteria To Be Used in Decomposing Systems into Modules". *Communications of the ACM*, 1972.
-   - Spolsky, Joel. "The Law of Leaky Abstractions". *Joel on Software*, 2002.
+   - Gamma, E., Helm, R., Johnson, R., & Vlissides, J. *Design Patterns: Elements of Reusable Object-Oriented Software*. Addison-Wesley, 1994.
+   - Seemann, Mark, & van Deursen, Steven. *Dependency Injection Principles, Practices, and Patterns*. Manning, 2019.
+   - Kokosa, Konrad. *Pro .NET Memory Management*. Apress, 2018.
+   - Cwalina, Krzysztof, & Abrams, Brad. *Framework Design Guidelines* (3rd ed.). Addison-Wesley, 2020.
+   - Khorikov, Vladimir. *Unit Testing Principles, Practices, and Patterns*. Manning, 2020.
+   - Hunt, Andrew, & Thomas, David. *The Pragmatic Programmer* (20th Anniversary Ed.). Addison-Wesley, 2019.
+   - Ellnestam, Ola, & Brolund, Daniel. [*The Mikado Method*](https://www.manning.com/books/the-mikado-method). Manning, 2014.
+   - Tornhill, Adam. [*Your Code as a Crime Scene* (2nd ed.)](https://pragprog.com/titles/atcrime2/your-code-as-a-crime-scene-second-edition/). Pragmatic Bookshelf, 2024; *Software Design X-Rays*, 2018.
+   - Forsgren, Nicole, Humble, Jez, & Kim, Gene. *Accelerate: The Science of Lean Software and DevOps* ([DORA Research](https://dora.dev/)). IT Revolution, 2018.
+   - Richardson, Chris. *Microservices Patterns* ([Microservices.io Transactional Outbox](https://microservices.io/patterns/data/transactional-outbox.html)). Manning, 2018.
+   - Szyperski, Clemens. *Component Software: Beyond Object-Oriented Programming*. Addison-Wesley, 1998.
+   - Bloch, Joshua. *Effective Java* (3rd ed.). Addison-Wesley, 2018.
+   - McConnell, Steve. *Code Complete* (2nd ed.). Microsoft Press, 2004.
+   - Yourdon, Edward, & Constantine, Larry L. *Structured Design*. Prentice Hall, 1979.
+   - Myers, Glenford J. *Composite/Structured Design*. Van Nostrand Reinhold, 1978.
+   - Saltzer, Jerome H., & Kaashoek, M. Frans. *Principles of Computer System Design*. Morgan Kaufmann / MIT Press, 2009.
